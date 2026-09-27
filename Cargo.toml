@@ -238,3 +238,7 @@ cubek = { version = "0.2.0", default-features = false }
 
 [profile.dev]
 debug = 1 # Speed up compilation time and not necessary.
+
+[patch.crates-io]
+# khronos-egl 6.0.0 without the libc crate. std::ffi provides the same C types.
+khronos-egl = { git = "https://github.com/Lyamc/khronos-egl", rev = "d21c89724708ff3d6ed2e4755a36a5032acb5a42" }
