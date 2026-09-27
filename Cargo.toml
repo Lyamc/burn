@@ -17,6 +17,7 @@ exclude = [
     "examples/notebook",
     "examples/raspberry-pi-pico",
     "examples/dqn-agent",         # gym-rs
+    "vendor/zip",
 ]
 
 [workspace.package]
@@ -116,7 +117,8 @@ tracing-appender = "0.2.3"
 tracing-core = { version = "0.1.36", default-features = false }
 tracing-opentelemetry = "0.32.0"
 tracing-subscriber = "0.3.23"
-zip = "8.6.0"
+# Vendored zip uses ruzstd instead of the C zstd crate.
+zip = { path = "vendor/zip", version = "8.6.0" }
 
 # Persist related
 memmap2 = { version = "0.9" }
