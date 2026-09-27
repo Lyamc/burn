@@ -1,3 +1,7 @@
+This is a fork of Burn 0.21.0, kept for [cabin](https://github.com/Lyamc/cabin).
+
+`burn-store`'s PyTorch loader reads `.pt` files through the `zip` crate, and that crate's default `zstd` feature compiled the C library (`zstd-sys`, via `cc`). This fork vendors `zip` 8.6.0 and keeps the same `zstd` feature, with encoding and decoding done by [ruzstd](https://github.com/KillingSpark/zstd-rs). It also points the workspace at [Lyamc/khronos-egl](https://github.com/Lyamc/khronos-egl), so the GLES bindings no longer depend on the `libc` crate. Safetensors loading is unchanged.
+
 <div align="center">
 <img src="https://raw.githubusercontent.com/tracel-ai/burn/main/assets/logo-burn-neutral.webp" width="350px"/>
 
