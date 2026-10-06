@@ -3,27 +3,26 @@ use crate::FloatTensor;
 use super::Backend;
 use burn::{
     backend::wgpu::{
-        BoolElement, CubeBackend, CubeTensor, FloatElement, IntElement, KernelSource, SourceKernel,
-        SourceTemplate, WgpuRuntime, build_info, into_contiguous, kernel_source,
+        CubeBackend, CubeTensor, KernelSource, SourceKernel, SourceTemplate, build_info,
+        into_contiguous, kernel_source,
     },
-    tensor::Shape,
+    tensor::DType,
 };
 use cubecl::{CubeCount, CubeDim, prelude::KernelId, server::KernelArguments};
 use derive_new::new;
-use std::marker::PhantomData;
 
 // Source the kernel written in WGSL.
 kernel_source!(FusedMatmulAddReluRaw, "./kernel.wgsl");
 
 // Define our kernel type with cube information.
 #[derive(new, Debug)]
-struct FusedMatmulAddRelu<E: FloatElement> {
+struct FusedMatmulAddRelu {
     cube_dim: CubeDim,
-    _elem: PhantomData<E>,
+    dtype: DType,
 }
 
 // Implement the dynamic kernel trait for our kernel type.
-impl<E: FloatElement> KernelSource for FusedMatmulAddRelu<E> {
+impl KernelSource for FusedMatmulAddRelu {
     fn source(&self) -> SourceTemplate {
         // Extend our raw kernel with cube size information using the
         // `SourceTemplate` trait.
@@ -31,26 +30,32 @@ impl<E: FloatElement> KernelSource for FusedMatmulAddRelu<E> {
             .source()
             .register("workgroup_size_x", self.cube_dim.x.to_string())
             .register("workgroup_size_y", self.cube_dim.y.to_string())
-            .register("elem", E::type_name())
+            .register("elem", self.dtype.name())
             .register("int", "i32")
     }
 
     fn id(&self) -> KernelId {
         KernelId::new::<Self>().info(self.cube_dim)
     }
+
+    // `kernel.wgsl` is WGSL, so this runs on a wgpu build that compiles to WGSL. A build whose
+    // `AutoCompiler` picks SPIR-V or MSL instead rejects the kernel rather than mis-reading it.
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
 }
 
-/// Implement our custom backend trait for the existing backend `WgpuBackend`.
-impl<F: FloatElement, I: IntElement, BT: BoolElement> Backend
-    for CubeBackend<WgpuRuntime, F, I, BT>
-{
+/// Implement our custom backend trait for the cubecl backend. The WGSL source below only
+/// compiles on the wgpu runtime, which is the one this example's device selects.
+impl Backend for CubeBackend {
     fn fused_matmul_add_relu(
         lhs: FloatTensor<Self>,
         rhs: FloatTensor<Self>,
         bias: FloatTensor<Self>,
     ) -> FloatTensor<Self> {
+        let dtype = lhs.dtype;
         // Define cube dim, hardcoded for simplicity.
-        let cube_dim = CubeDim { x: 16, y: 16, z: 1 };
+        let cube_dim = CubeDim::new_3d(16, 16, 1);
 
         lhs.assert_is_on_same_device(&rhs);
         lhs.assert_is_on_same_device(&bias);
@@ -65,21 +70,13 @@ impl<F: FloatElement, I: IntElement, BT: BoolElement> Backend
         let num_rows = lhs.meta.shape()[ndims - 2];
         let num_cols = rhs.meta.shape()[ndims - 1];
 
-        // Compute shape of output, while tracking number of batches.
-        let mut num_batches = 1;
-        let mut shape_out = vec![0; ndims];
-        for i in shape_out.clone().into_iter().take(ndims - 2) {
-            shape_out[i] = usize::max(lhs.meta.shape()[i], rhs.meta.shape()[i]);
-            num_batches *= shape_out[i];
-        }
-        shape_out[ndims - 2] = num_rows;
-        shape_out[ndims - 1] = num_cols;
-        let shape_out = Shape::from(shape_out);
+        assert_eq!(lhs.dtype, rhs.dtype, "matrix dtypes must match");
+        assert_eq!(lhs.dtype, bias.dtype, "bias dtype must match");
+        let shape_out = crate::output_shape(lhs.meta.shape(), rhs.meta.shape(), bias.meta.shape());
+        let num_batches: usize = (0..ndims - 2).map(|i| shape_out[i]).product();
 
         // Create a buffer for the output tensor.
-        let buffer = lhs
-            .client
-            .empty(shape_out.num_elements() * core::mem::size_of::<F>());
+        let buffer = lhs.client.empty(shape_out.num_elements() * dtype.size());
 
         // Create the output tensor primitive.
         let output = CubeTensor::new_contiguous(
@@ -87,14 +84,14 @@ impl<F: FloatElement, I: IntElement, BT: BoolElement> Backend
             lhs.device.clone(),
             shape_out,
             buffer,
-            F::dtype(),
+            dtype,
         );
 
         // Create the kernel.
-        let kernel = FusedMatmulAddRelu::<F>::new(cube_dim);
+        let kernel = FusedMatmulAddRelu::new(cube_dim, dtype);
 
         // Build info buffer with tensor information needed by the kernel, such as shapes and strides.
-        let info = build_info::<_, F>(&[&lhs, &rhs, &output]);
+        let info = build_info(&[&lhs, &rhs, &output]);
         let info_handle = lhs.client.create_from_slice(bytemuck::cast_slice(&info));
 
         // Declare the wgsl workgroup with the number of cubes in x, y and z.

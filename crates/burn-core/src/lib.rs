@@ -1,10 +1,34 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![recursion_limit = "135"]
 
-//! The core crate of Burn.
+//! The core of Burn: modules, configuration, records and data loading, on top of the tensor API.
+//!
+//! Applications should depend on [`burn`](https://docs.rs/burn), which re-exports everything here
+//! together with neural network layers, optimizers and training. This crate is the dependency for
+//! libraries that only need the core abstractions.
+//!
+//! - [`tensor`]: Burn's tensor API, re-exported from `burn-tensor`.
+//! - [`module`]: the [`Module`](module::Module) trait, implemented with `#[derive(Module)]`, and
+//!   [`Param`](module::Param) for trainable tensors.
+//! - [`config`]: serializable configuration structs with `#[derive(Config)]`.
+//! - [`store`]: module records and the burnpack format.
+//! - [`data`]: datasets, batchers and data loaders (`std` only).
+//! - [`prelude`]: the types most programs import.
+//!
+//! # Feature flags
+//!
+//! Backend features (`wgpu`, `cuda`, `flex`, ...) and the `autodiff`, `fusion`, `remote` and
+//! `capture` features match those of `burn`. Others:
+//!
+//! - `std` (default): standard library support. Without it the crate is `no_std` with `alloc`.
+//! - `dataset`: the dataset library in [`data`]; `vision`, `audio` and `sqlite` add sources.
+//! - `network`: file downloads with a progress bar.
+//! - `tracing`: instrument operations with the `tracing` crate.
 
+// `derive_new` provides the `#[derive(new)]` macro used across the crate; the lint mistakenly
+// reports the `#[macro_use]` as unused.
+#[allow(unused_imports)]
 #[macro_use]
 extern crate derive_new;
 
@@ -21,49 +45,25 @@ pub mod data;
 /// Module for the neural network module.
 pub mod module;
 
-/// Module for the recorder.
-pub mod record;
+/// Module for saving and loading module/optimizer state in the burnpack format.
+pub mod store;
 
 /// Module for the tensor.
 pub mod tensor;
 // Tensor at root: `burn::Tensor`
 pub use tensor::Tensor;
 
+#[cfg(feature = "extension")]
+/// Backend module.
+pub mod backend;
+
 extern crate alloc;
 
-/// Backend for test cases
-#[cfg(all(
-    test,
-    not(feature = "test-tch"),
-    not(feature = "test-wgpu"),
-    not(feature = "test-cuda"),
-    not(feature = "test-rocm")
-))]
-pub type TestBackend = burn_flex::Flex;
-
-#[cfg(all(test, feature = "test-tch"))]
-/// Backend for test cases
-pub type TestBackend = burn_tch::LibTorch<f32>;
-
-#[cfg(all(test, feature = "test-wgpu"))]
-/// Backend for test cases
-pub type TestBackend = burn_wgpu::Wgpu;
-
-#[cfg(all(test, feature = "test-cuda"))]
-/// Backend for test cases
-pub type TestBackend = burn_cuda::Cuda;
-
-#[cfg(all(test, feature = "test-rocm"))]
-/// Backend for test cases
-pub type TestBackend = burn_rocm::Rocm;
-
-/// Backend for autodiff test cases
+// TODO: configurable device priority
 #[cfg(test)]
-pub type TestAutodiffBackend = burn_autodiff::Autodiff<TestBackend>;
-
-#[cfg(all(test, feature = "test-memory-checks"))]
-mod tests {
-    burn_fusion::memory_checks!();
+#[allow(missing_docs)]
+pub fn test_device() -> burn_tensor::Device {
+    burn_tensor::Device::flex()
 }
 
 #[cfg(test)]
@@ -71,18 +71,18 @@ mod test_utils {
     use crate as burn;
     use crate::module::Module;
     use crate::module::Param;
+    use burn_tensor::Device;
     use burn_tensor::Tensor;
-    use burn_tensor::backend::Backend;
 
     /// Simple linear module.
     #[derive(Module, Debug)]
-    pub struct SimpleLinear<B: Backend> {
-        pub weight: Param<Tensor<B, 2>>,
-        pub bias: Option<Param<Tensor<B, 1>>>,
+    pub struct SimpleLinear {
+        pub weight: Param<Tensor<2>>,
+        pub bias: Option<Param<Tensor<1>>>,
     }
 
-    impl<B: Backend> SimpleLinear<B> {
-        pub fn new(in_features: usize, out_features: usize, device: &B::Device) -> Self {
+    impl SimpleLinear {
+        pub fn new(in_features: usize, out_features: usize, device: &Device) -> Self {
             let weight = Tensor::random(
                 [out_features, in_features],
                 burn_tensor::Distribution::Default,
@@ -106,9 +106,8 @@ pub mod prelude {
         config::Config,
         module::Module,
         tensor::{
-            Bool, Device, ElementConversion, Float, Int, Shape, SliceArg, Tensor, TensorData,
-            backend::Backend, cast::ToElement, s,
+            Bool, Device, DeviceIndex, DeviceKind, ElementConversion, Float, Int, Shape, SliceArg,
+            Tensor, TensorData, assert_shape, cast::ToElement, debug_assert_shape, s,
         },
     };
-    pub use burn_std::device::Device as DeviceOps;
 }

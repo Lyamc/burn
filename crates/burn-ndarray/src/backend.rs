@@ -1,17 +1,12 @@
 use crate::rand::NdArrayRng;
 use crate::{NdArrayQTensor, NdArrayTensor};
-use crate::{
-    SharedArray,
-    element::{FloatNdArrayElement, IntNdArrayElement, QuantElement},
-};
 use alloc::string::String;
-use burn_backend::quantization::{QuantLevel, QuantMode, QuantScheme, QuantStore, QuantValue};
+use burn_backend::quantization::{QuantMode, QuantScheme, QuantStore, QuantValue, quantizable};
 use burn_backend::tensor::{BoolTensor, FloatTensor, IntTensor, QuantizedTensor};
-use burn_backend::{Backend, BackendTypes, DType, DeviceId, DeviceOps};
+use burn_backend::{Backend, BackendTypes, DType, DeviceId, DeviceOps, ExecutionError};
 use burn_ir::{BackendIr, HandleKind, TensorHandle};
-use burn_std::BoolStore;
-use burn_std::stub::Mutex;
-use core::marker::PhantomData;
+use burn_std::sync::Mutex;
+use burn_std::{BoolStore, DeviceSettings, QuantConfig};
 use rand::SeedableRng;
 
 pub(crate) static SEED: Mutex<Option<NdArrayRng>> = Mutex::new(None);
@@ -24,7 +19,20 @@ pub enum NdArrayDevice {
     Cpu,
 }
 
-impl DeviceOps for NdArrayDevice {}
+impl DeviceOps for NdArrayDevice {
+    fn defaults(&self) -> DeviceSettings {
+        // E = f32, I = i64
+        DeviceSettings::new(
+            DType::F32,
+            DType::I64,
+            DType::Bool(BoolStore::Native),
+            QuantConfig::new(
+                QuantScheme::default().with_store(QuantStore::Native),
+                Default::default(),
+            ),
+        )
+    }
+}
 
 impl burn_backend::Device for NdArrayDevice {
     fn from_id(_device_id: DeviceId) -> Self {
@@ -44,39 +52,20 @@ impl burn_backend::Device for NdArrayDevice {
 /// This backend is compatible with CPUs and can be compiled for almost any platform, including
 /// `wasm`, `arm`, and `x86`.
 #[derive(Clone, Copy, Default, Debug)]
-pub struct NdArray<E = f32, I = i64, Q = i8>
-where
-    NdArrayTensor: From<SharedArray<E>>,
-    NdArrayTensor: From<SharedArray<I>>,
-{
-    _e: PhantomData<E>,
-    _i: PhantomData<I>,
-    _q: PhantomData<Q>,
-}
-impl<E: FloatNdArrayElement, I: IntNdArrayElement, Q: QuantElement> BackendTypes
-    for NdArray<E, I, Q>
-where
-    NdArrayTensor: From<SharedArray<E>>,
-    NdArrayTensor: From<SharedArray<I>>,
-{
+pub struct NdArray;
+
+impl BackendTypes for NdArray {
     type Device = NdArrayDevice;
 
     type FloatTensorPrimitive = NdArrayTensor;
-    type FloatElem = E;
-
     type IntTensorPrimitive = NdArrayTensor;
-    type IntElem = I;
-
     type BoolTensorPrimitive = NdArrayTensor;
-    type BoolElem = bool;
-
     type QuantizedTensorPrimitive = NdArrayQTensor;
+
+    type GraphPrimitive = burn_backend::GraphUnsupported;
 }
-impl<E: FloatNdArrayElement, I: IntNdArrayElement, Q: QuantElement> Backend for NdArray<E, I, Q>
-where
-    NdArrayTensor: From<SharedArray<E>>,
-    NdArrayTensor: From<SharedArray<I>>,
-{
+
+impl Backend for NdArray {
     fn ad_enabled(_device: &Self::Device) -> bool {
         false
     }
@@ -87,7 +76,7 @@ where
 
     fn seed(_device: &Self::Device, seed: u64) {
         let rng = NdArrayRng::seed_from_u64(seed);
-        let mut seed = SEED.lock().unwrap();
+        let mut seed = SEED.lock();
         *seed = Some(rng);
     }
 
@@ -109,7 +98,6 @@ where
             DType::QFloat(scheme) => {
                 match scheme {
                     QuantScheme {
-                        level: QuantLevel::Tensor | QuantLevel::Block(_),
                         mode: QuantMode::Symmetric,
                         #[cfg(not(feature = "export_tests"))]
                             value: QuantValue::Q8F | QuantValue::Q8S,
@@ -125,7 +113,8 @@ where
                             | QuantValue::Q2S,
                         store: QuantStore::Native,
                         ..
-                    } => burn_backend::DTypeUsage::general(),
+                    // The value and store alone do not say which levels `quantize` will accept.
+                    } if quantizable(&scheme) => burn_backend::DTypeUsage::general(),
                     _scheme => burn_backend::DTypeUsageSet::empty(),
                 }
             }
@@ -135,13 +124,13 @@ where
     fn device_count(_: u16) -> usize {
         1
     }
+
+    fn flush(_device: &Self::Device) -> Result<(), ExecutionError> {
+        Ok(())
+    }
 }
 
-impl<E: FloatNdArrayElement, I: IntNdArrayElement, Q: QuantElement> BackendIr for NdArray<E, I, Q>
-where
-    NdArrayTensor: From<SharedArray<E>>,
-    NdArrayTensor: From<SharedArray<I>>,
-{
+impl BackendIr for NdArray {
     type Handle = HandleKind<Self>;
 
     fn float_tensor(handle: TensorHandle<Self::Handle>) -> FloatTensor<Self> {
@@ -192,12 +181,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn_backend::QTensorPrimitive;
 
     #[test]
     fn should_support_dtypes() {
-        type B = NdArray<f32>;
-        let device = Default::default();
+        type B = NdArray;
+        let device = NdArrayDevice::Cpu;
+        let scheme = device.defaults().quantization.scheme;
 
         assert!(B::supports_dtype(&device, DType::F64));
         assert!(B::supports_dtype(&device, DType::F32));
@@ -211,10 +200,7 @@ mod tests {
         assert!(B::supports_dtype(&device, DType::U16));
         assert!(B::supports_dtype(&device, DType::U8));
         assert!(B::supports_dtype(&device, DType::Bool(BoolStore::Native)));
-        assert!(B::supports_dtype(
-            &device,
-            DType::QFloat(NdArrayQTensor::default_scheme())
-        ));
+        assert!(B::supports_dtype(&device, DType::QFloat(scheme)));
 
         assert!(!B::supports_dtype(&device, DType::F16));
         assert!(!B::supports_dtype(&device, DType::BF16));
@@ -222,6 +208,39 @@ mod tests {
         assert!(!B::supports_dtype(
             &device,
             DType::QFloat(QuantScheme::default())
+        ));
+    }
+
+    /// A scheme this claims and then panics on is worse than one it declines, because the panic
+    /// lands on the first tensor rather than where the scheme was chosen.
+    #[test]
+    fn should_support_the_two_level_schemes_it_can_quantize() {
+        use burn_backend::ops::{FloatTensorOps, QTensorOps};
+        use burn_std::{ScaleDtype, TensorData};
+
+        type B = NdArray;
+        let device = NdArrayDevice::Cpu;
+        let scheme = device
+            .defaults()
+            .quantization
+            .scheme
+            .with_value(QuantValue::Q8S)
+            .per_block([4], ScaleDtype::UE4M3)
+            .per_tensor(ScaleDtype::F32);
+
+        assert!(B::supports_dtype(&device, DType::QFloat(scheme)));
+
+        let tensor = B::float_from_data(
+            TensorData::from([0.1f32, -0.4, 0.2, 0.9, -1.5, 0.3, 0.05, -0.02]),
+            &device,
+        );
+        let quantized = B::quantize_dynamic(tensor, &scheme);
+        assert_eq!(quantized.scheme.num_levels(), 2);
+
+        // Block scales already spanning f32's range are rejected by `quantize`.
+        assert!(!B::supports_dtype(
+            &device,
+            DType::QFloat(scheme.per_block([4], ScaleDtype::F32))
         ));
     }
 }

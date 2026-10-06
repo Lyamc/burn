@@ -1,8 +1,8 @@
 use crate::{
-    CubeRuntime,
     kernel::utils::{address_type, shape_divmod},
     tensor::CubeTensor,
 };
+use burn_backend::cubecl::dtype_to_storage_type;
 use cubecl::{
     calculate_cube_count_elemwise, intrinsic,
     prelude::*,
@@ -12,10 +12,10 @@ use cubecl::{
 #[cube(launch_unchecked, address_type = "dynamic")]
 fn slice_assign_kernel<E: Numeric, N: Size>(
     input: &mut Tensor<Vector<E, N>>,
-    value: &LinearView<Vector<E, N>>,
+    value: LinearView<'_, Vector<E, N>>,
     slice_shape: Sequence<FastDivmod<usize>>,
     slice_offsets: Sequence<usize>,
-    #[define(E)] _dtype: StorageType,
+    #[define(E)] _dtype: ElemType,
 ) {
     if !value.is_in_bounds(ABSOLUTE_POS) {
         terminate!()
@@ -41,19 +41,19 @@ fn slice_assign_kernel<E: Numeric, N: Size>(
     }
 
     // Value tensor is accessed linearly since it's a LinearView
-    input[offset_input / line_size] = value[ABSOLUTE_POS];
+    input[offset_input / line_size] = value.read(ABSOLUTE_POS);
 }
 
 /// Kernel for slice assign with steps
 #[cube(launch_unchecked, address_type = "dynamic")]
 fn slice_assign_with_steps_kernel<E: Numeric>(
     input: &mut Tensor<E>,
-    value: &LinearView<E>,
+    value: LinearView<'_, E>,
     value_shape: Sequence<FastDivmod<usize>>,
     starts: Sequence<usize>,
     ends: Sequence<usize>,
     steps: Sequence<i32>,
-    #[define(E)] _dtype: StorageType,
+    #[define(E)] _dtype: ElemType,
 ) {
     if !value.is_in_bounds(ABSOLUTE_POS) {
         terminate!();
@@ -92,14 +92,14 @@ fn slice_assign_with_steps_kernel<E: Numeric>(
         input_offset += input_idx * input.stride(dim);
     }
 
-    input[input_offset] = value[ABSOLUTE_POS];
+    input[input_offset] = value.read(ABSOLUTE_POS);
 }
 
-pub(crate) fn slice_assign<R: CubeRuntime>(
-    tensor: CubeTensor<R>,
+pub(crate) fn slice_assign(
+    tensor: CubeTensor,
     indices: &[burn_backend::Slice],
-    value: CubeTensor<R>,
-) -> CubeTensor<R> {
+    value: CubeTensor,
+) -> CubeTensor {
     // Check if any slice has non-unit step
     let has_non_unit_step = indices.iter().any(|s| s.step != 1 && s.step != 0);
 
@@ -142,8 +142,8 @@ pub(crate) fn slice_assign<R: CubeRuntime>(
             1
         };
 
-    let mut shape = SequenceArg::<R, FastDivmod<usize>>::new();
-    let mut offsets = SequenceArg::<R, usize>::new();
+    let mut shape = SequenceArg::<FastDivmod<usize>>::new();
+    let mut offsets = SequenceArg::<usize>::new();
 
     for i in 0..ndims {
         let slice = indices.get(i).cloned().unwrap_or(burn_backend::Slice {
@@ -174,7 +174,7 @@ pub(crate) fn slice_assign<R: CubeRuntime>(
             value.into_linear_view(),
             shape,
             offsets,
-            tensor.dtype.into(),
+            dtype_to_storage_type(tensor.dtype),
         )
     };
 
@@ -190,20 +190,20 @@ pub(crate) fn slice_assign<R: CubeRuntime>(
 /// - values[0] goes to index 5
 /// - values[1] goes to index 4
 /// - etc.
-pub(crate) fn slice_assign_with_steps<R: CubeRuntime>(
-    tensor: CubeTensor<R>,
+pub(crate) fn slice_assign_with_steps(
+    tensor: CubeTensor,
     slices: &[burn_backend::Slice],
-    value: CubeTensor<R>,
-) -> CubeTensor<R> {
+    value: CubeTensor,
+) -> CubeTensor {
     let tensor = match tensor.can_mut() && tensor.is_nonoverlapping() {
         true => tensor,
         false => tensor.copy(),
     };
 
     // Prepare sequences for kernel
-    let mut starts = SequenceArg::<R, usize>::new();
-    let mut ends = SequenceArg::<R, usize>::new();
-    let mut steps = SequenceArg::<R, i32>::new();
+    let mut starts = SequenceArg::<usize>::new();
+    let mut ends = SequenceArg::<usize>::new();
+    let mut steps = SequenceArg::<i32>::new();
 
     for (dim, slice) in slices.iter().enumerate() {
         let range = slice.to_range(tensor.meta.shape()[dim]);
@@ -237,7 +237,7 @@ pub(crate) fn slice_assign_with_steps<R: CubeRuntime>(
             starts,
             ends,
             steps,
-            tensor.dtype.into(),
+            dtype_to_storage_type(tensor.dtype),
         );
     }
 

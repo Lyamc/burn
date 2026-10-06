@@ -1,21 +1,19 @@
 use std::sync::Arc;
 
 use burn_core::data::dataloader::Progress;
-use burn_optim::LearningRate;
+use burn_core::tensor::TensorReadError;
+use burn_optim::lr_scheduler::module_lr_scheduler::ModuleLearningRate;
 
 /// Metric metadata that can be used when computing metrics.
 pub struct MetricMetadata {
     /// The current progress.
     pub progress: Progress,
 
-    /// The global progress of the training (e.g. epochs).
-    pub global_progress: Progress,
-
     /// The current iteration.
     pub iteration: Option<usize>,
 
     /// The current learning rate.
-    pub lr: Option<LearningRate>,
+    pub lr: Option<ModuleLearningRate>,
 }
 
 impl MetricMetadata {
@@ -26,10 +24,7 @@ impl MetricMetadata {
             progress: Progress {
                 items_processed: 1,
                 items_total: 1,
-            },
-            global_progress: Progress {
-                items_processed: 0,
-                items_total: 1,
+                unit: Some("items".to_string()),
             },
             iteration: Some(0),
             lr: None,
@@ -60,7 +55,7 @@ pub struct MetricDefinition {
     /// The metric's id.
     pub metric_id: MetricId,
     /// The name of the metric.
-    pub name: String,
+    pub name: MetricName,
     /// The description of the metric.
     pub description: Option<String>,
     /// The attributes of the metric.
@@ -72,7 +67,7 @@ impl MetricDefinition {
     pub fn new<Me: Metric>(metric_id: MetricId, metric: &Me) -> Self {
         Self {
             metric_id,
-            name: metric.name().to_string(),
+            name: metric.name(),
             description: metric.description(),
             attributes: metric.attributes(),
         }
@@ -111,7 +106,23 @@ pub trait Metric: Send + Sync + Clone {
     }
 
     /// Update the metric state and returns the current metric entry.
-    fn update(&mut self, item: &Self::Input, metadata: &MetricMetadata) -> SerializedEntry;
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TensorReadError`] when a tensor read fails. In that case, the metric state
+    /// could hold part or none of this update.
+    fn update(
+        &mut self,
+        item: &Self::Input,
+        metadata: &MetricMetadata,
+    ) -> Result<SerializedEntry, TensorReadError>;
+
+    /// Compute the final metric value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TensorReadError`] when a tensor read fails.
+    fn compute(&mut self) -> Result<SerializedEntry, TensorReadError>;
 
     /// Clear the metric state.
     fn clear(&mut self);
@@ -160,11 +171,25 @@ impl Default for NumericAttributes {
 /// Declare a metric to be numeric.
 ///
 /// This is useful to plot the values of a metric during training.
+///
+/// Some metrics (e.g. accuracy) produce a meaningful value on every batch,
+/// while others (e.g. AUC-PR) only accumulate state per batch and are
+/// computed once all state has been accumulated.. For the latter, [`value`](Self::value)
+/// and [`running_value`](Self::running_value) return `None` until that
+/// epoch-level computation has happened, signaling that no value has been
+/// computed for the current step.
 pub trait Numeric {
-    /// Returns the numeric value of the metric.
-    fn value(&self) -> NumericEntry;
-    /// Returns the current aggregated value of the metric over the global step (epoch).
-    fn running_value(&self) -> NumericEntry;
+    /// Returns the numeric value of the metric, or `None` if this metric has
+    /// no meaningful value yet (e.g. it only accumulates state per batch and
+    /// computes its value once all state has been accumulated).
+    fn value(&self) -> Option<NumericEntry>;
+    /// Returns the current aggregated value of the metric over the global step,
+    /// or `None` if this metric has no meaningful value yet (e.g. it only accumulates state
+    /// per batch and computes its value once all state has been accumulated).
+    fn running_value(&self) -> Option<NumericEntry>;
+    /// Returns the final, authoritative value of the metric for the epoch.
+    /// Only meaningful after [`Metric::compute`] has been called.
+    fn final_value(&self) -> NumericEntry;
 }
 
 /// Serialized form of a metric entry.
@@ -174,6 +199,26 @@ pub struct SerializedEntry {
     pub formatted: String,
     /// The string to be saved.
     pub serialized: String,
+}
+
+impl SerializedEntry {
+    /// Canonical sentinel string for metric values that have no batch-level computation.
+    pub const NOT_AVAILABLE: &'static str = "N/A";
+
+    /// Convenience helper for standard placeholder entries when no valid data is ready.
+    pub fn not_available(unit: Option<&str>) -> Self {
+        let na = Self::NOT_AVAILABLE;
+        let formatted = match unit {
+            Some(u) => format!("epoch {na} {u} - batch {na} {u}"),
+            None => format!("epoch {na} - batch {na}"),
+        };
+        Self::new(formatted, na.to_string())
+    }
+
+    /// Returns whether this entry represents an un-serializable/skipped placeholder.
+    pub fn is_not_available(&self) -> bool {
+        self.serialized == Self::NOT_AVAILABLE || self.serialized.is_empty()
+    }
 }
 
 /// Data type that contains the current state of a metric at a given time.
@@ -207,6 +252,9 @@ pub enum NumericEntry {
         /// The number of entries present in the aggregated value.
         count: usize,
     },
+    /// The final, authoritative value for the epoch; computed once at epoch end
+    /// and logged in addition to the regular per-batch entries.
+    Final(f64),
 }
 
 impl NumericEntry {
@@ -214,6 +262,7 @@ impl NumericEntry {
     pub fn current(&self) -> f64 {
         match self {
             NumericEntry::Value(val) => *val,
+            NumericEntry::Final(val) => *val,
             NumericEntry::Aggregated {
                 aggregated_value, ..
             } => *aggregated_value,
@@ -224,6 +273,7 @@ impl NumericEntry {
     pub fn serialize(&self) -> String {
         match self {
             Self::Value(v) => v.to_string(),
+            Self::Final(v) => format!("{v},final"),
             Self::Aggregated {
                 aggregated_value,
                 count,
@@ -244,17 +294,25 @@ impl NumericEntry {
                 Err(err) => Err(err.to_string()),
             }
         } else if num_values == 2 {
-            // Aggregated numeric (value, number of elements)
-            let (value, numel) = (values[0], values[1]);
-            match value.parse::<f64>() {
-                Ok(value) => match numel.parse::<usize>() {
-                    Ok(numel) => Ok(NumericEntry::Aggregated {
-                        aggregated_value: value,
-                        count: numel,
-                    }),
+            let (v0, v1) = (values[0], values[1]);
+            // Check if it's tagged as an explicit epoch-level final calculation
+            if v1 == "final" {
+                match v0.parse::<f64>() {
+                    Ok(value) => Ok(NumericEntry::Final(value)),
                     Err(err) => Err(err.to_string()),
-                },
-                Err(err) => Err(err.to_string()),
+                }
+            } else {
+                // Aggregated numeric (value, number of elements)
+                match v0.parse::<f64>() {
+                    Ok(value) => match v1.parse::<usize>() {
+                        Ok(numel) => Ok(NumericEntry::Aggregated {
+                            aggregated_value: value,
+                            count: numel,
+                        }),
+                        Err(err) => Err(err.to_string()),
+                    },
+                    Err(err) => Err(err.to_string()),
+                }
             }
         } else {
             Err("Invalid number of values for numeric entry".to_string())

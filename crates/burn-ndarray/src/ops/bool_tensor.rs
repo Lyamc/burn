@@ -12,7 +12,6 @@ use burn_std::{BoolDType, FloatDType, IntDType};
 use ndarray::IntoDimension;
 
 // Current crate
-use crate::element::{FloatNdArrayElement, IntNdArrayElement, QuantElement};
 use crate::{NdArray, execute_with_int_dtype, tensor::NdArrayTensor};
 use crate::{
     NdArrayDevice, SharedArray, execute_with_float_out_dtype, execute_with_int_out_dtype, slice,
@@ -23,14 +22,9 @@ use burn_backend::{Shape, TensorData};
 
 use super::{NdArrayBoolOps, NdArrayOps};
 
-impl<E: FloatNdArrayElement, I: IntNdArrayElement, Q: QuantElement> BoolTensorOps<Self>
-    for NdArray<E, I, Q>
-where
-    NdArrayTensor: From<SharedArray<E>>,
-    NdArrayTensor: From<SharedArray<I>>,
-{
+impl BoolTensorOps<Self> for NdArray {
     fn bool_from_data(data: TensorData, _device: &NdArrayDevice) -> NdArrayTensor {
-        if !data.dtype.is_bool() {
+        if !data.dtype().is_bool() {
             unimplemented!("Unsupported dtype for `bool_from_data`")
         }
         NdArrayTensor::from_data(data)
@@ -59,10 +53,6 @@ where
             I,
             tensor.bool().mapv(|b| b.elem::<I>()).into_shared().into()
         )
-    }
-
-    fn bool_device(_tensor: &NdArrayTensor) -> NdArrayDevice {
-        NdArrayDevice::Cpu
     }
 
     fn bool_empty(shape: Shape, _device: &NdArrayDevice, dtype: BoolDType) -> NdArrayTensor {

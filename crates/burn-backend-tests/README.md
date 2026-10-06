@@ -2,11 +2,11 @@
 
 This crate provides a comprehensive suite of tests for Burn backends, covering:
 
-- Tensor operations: [tests/tensor/](./tests/tensor/)
-- Autodiff: [tests/autodiff/](./tests/autodiff/)
-- (Optional) CubeCL kernels correctness: [tests/cubecl/](./tests/cubecl/)
-- (Optional) Fusion correctness: [tests/fusion/](./tests/fusion/)
-- Benchmarks: [benches/](./benches/)
+- Tensor operations: [tests/tensor/](https://github.com/tracel-ai/burn/tree/main/crates/burn-backend-tests/tests/tensor)
+- Autodiff: [tests/autodiff/](https://github.com/tracel-ai/burn/tree/main/crates/burn-backend-tests/tests/autodiff)
+- (Optional) CubeCL kernels correctness: [tests/cubecl/](https://github.com/tracel-ai/burn/tree/main/crates/burn-backend-tests/tests/cubecl)
+- (Optional) Fusion correctness: [tests/fusion/](https://github.com/tracel-ai/burn/tree/main/crates/burn-backend-tests/tests/fusion)
+- Benchmarks: [benches/](https://github.com/tracel-ai/burn/tree/main/crates/burn-backend-tests/benches)
 
 ## Running Tests
 
@@ -26,7 +26,11 @@ cargo test-wgpu
 cargo test-vulkan
 # Metal
 cargo test-metal
+# Remote
+cargo test-remote
 
+# Flex
+cargo test-flex
 # NdArray
 cargo test-ndarray
 # LibTorch
@@ -43,10 +47,10 @@ cargo test-cuda --no-fail-fast
 
 > [!NOTE]  
 > CubeCL-based backends are tested with `fusion` by default. If you want to run the tests without
-> fusion, just append `-nofuse` to the cargo command. For example:
+> fusion, just append `-no-fusion` to the cargo command. For example:
 >
 > ```sh
-> cargo test-cuda-nofuse
+> cargo test-cuda-no-fusion
 > ```
 
 ## Structure
@@ -118,10 +122,21 @@ cargo bench-metal
 
 # Flex
 cargo bench-flex
+# Flex+Simd
+cargo bench-flex --features flex-simd
+# Flex+Rayon
+cargo bench-flex --features flex-rayon
+# Flex+Simd+Rayon
+cargo bench-flex --features flex-simd,flex-rayon
 # NdArray
 cargo bench-ndarray
 # LibTorch
 cargo bench-tch
+```
+
+Get a more compact output without memory allocations using:
+```sh
+cargo bench-* --features bench-disable-alloc
 ```
 
 Run a single bench file by passing `--bench <name>`:
@@ -150,7 +165,7 @@ diff flex.txt ndarray.txt
 ### GPU sync
 
 GPU backends (cuda, wgpu, rocm, metal, vulkan) dispatch ops asynchronously. Each bench wraps its op
-with `bencher.bench_synced(...)` (defined in [benches/common/mod.rs](./benches/common/mod.rs)),
+with `bencher.bench_synced(...)` (defined in [benches/common/mod.rs](https://github.com/tracel-ai/burn/blob/main/crates/burn-backend-tests/benches/common/mod.rs)),
 which inserts a `Backend::sync` call before returning - so the timed region covers actual execution
 rather than dispatch latency. On CPU backends `sync` is a no-op via the `Backend::sync` default, so
 this costs nothing there.
@@ -158,11 +173,11 @@ this costs nothing there.
 When adding a new bench, use `bench_synced` rather than divan's raw `bench`:
 
 ```rust
-use common::{BencherExt, TestBackend};
+use common::BencherExt;
 
 #[divan::bench]
 fn my_op(bencher: Bencher) {
-    let x = make_tensor::<TestBackend>(SIZE);
+    let x = make_tensor(SIZE);
     bencher.bench_synced(|| some_op(x.clone()));
 }
 ```
@@ -180,9 +195,15 @@ For tensor tests, make sure to add the test to each relevant tensor kind:
 
 **Guidelines:**
 
-Import types with `use super::*;` at the top of each module to use the `TestBackend` and `FloatElem`
-/ `IntElem` types.
+Import types with `use super::*;` at the top of each module to use the `FloatElem` and `IntElem` types.
 
 For autodiff tests, always use `AutodiffDevice::new()` to create the device. Autodiff is enabled on
 the device itself when using the `Dispatch` test backend, ensuring the device supports automatic
 differentiation without modifying the backend type.
+
+<!-- burn-crate-footer -->
+
+---
+
+Part of the [Burn](https://github.com/tracel-ai/burn) deep learning framework. See the
+[Burn Book](https://burn.dev/books/burn/) and the [API documentation](https://docs.rs/burn).

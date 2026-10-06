@@ -1,8 +1,12 @@
 use burn_backend::DType;
-use cubecl::{calculate_cube_count_elemwise, prelude::*, std::tensor::layout::linear::LinearView};
+use burn_backend::cubecl::dtype_to_storage_type;
+use cubecl::{
+    calculate_cube_count_elemwise,
+    prelude::*,
+    std::tensor::layout::linear::{LinearView, LinearViewMut},
+};
 
 use crate::{
-    CubeRuntime,
     kernel::utils::{address_type, broadcast_shape},
     ops::{max_vector_size_many, numeric::empty_device_dtype},
     tensor::CubeTensor,
@@ -10,18 +14,25 @@ use crate::{
 
 #[cube(launch, address_type = "dynamic")]
 fn mask_where_kernel<T: Numeric, B: Int, N: Size>(
-    input: &LinearView<Vector<T, N>>,
-    value: &LinearView<Vector<T, N>>,
-    mask: &LinearView<Vector<B, N>>,
-    output: &mut LinearView<Vector<T, N>, ReadWrite>,
-    #[define(T, B)] _dtypes: [StorageType; 2],
+    input: LinearView<'_, Vector<T, N>>,
+    value: LinearView<'_, Vector<T, N>>,
+    mask: LinearView<'_, Vector<B, N>>,
+    mut output: LinearViewMut<'_, Vector<T, N>>,
+    #[define(T, B)] _dtypes: [ElemType; 2],
 ) {
     let pos = ABSOLUTE_POS;
     if !output.is_in_bounds(pos) {
         terminate!();
     }
 
-    output[pos] = select_many(Vector::cast_from(mask[pos]), value[pos], input[pos]);
+    output.write(
+        pos,
+        select_many(
+            Vector::cast_from(mask.read(pos)),
+            value.read(pos),
+            input.read(pos),
+        ),
+    );
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -40,20 +51,30 @@ pub enum MaskWhereStrategy {
 }
 
 /// Execute the mask where kernel with the given strategy.
-pub fn mask_where<R: CubeRuntime>(
-    input: CubeTensor<R>,
-    mask: CubeTensor<R>,
-    value: CubeTensor<R>,
+pub fn mask_where(
+    input: CubeTensor,
+    mask: CubeTensor,
+    value: CubeTensor,
     strategy: MaskWhereStrategy,
     dtype_bool: DType,
-) -> CubeTensor<R> {
-    let vector_size = max_vector_size_many(&[&input, &mask, &value], input.meta.num_dims() - 1);
+) -> CubeTensor {
+    let out_shape = broadcast_shape(&[&input, &mask, &value]);
 
-    let working_units = input.meta.num_elements() / vector_size as usize;
+    // A zero-sized broadcast output has no elements to compute, and the strategies below assume a
+    // non-empty output. Return the empty output directly.
+    if out_shape.num_elements() == 0 {
+        return empty_device_dtype(
+            input.client.clone(),
+            input.device.clone(),
+            out_shape,
+            input.dtype,
+        );
+    }
+
+    let vector_size = max_vector_size_many(&[&input, &mask, &value], input.meta.num_dims() - 1);
+    let working_units = out_shape.num_elements() / vector_size as usize;
     let cube_dim = CubeDim::new(&input.client, working_units);
     let cube_count = calculate_cube_count_elemwise(&input.client, working_units, cube_dim);
-
-    let out_shape = broadcast_shape(&[&input, &mask, &value]);
 
     let output = match strategy {
         MaskWhereStrategy::Readonly => empty_device_dtype(
@@ -82,7 +103,10 @@ pub fn mask_where<R: CubeRuntime>(
         value.into_linear_view_like(&output),
         mask.into_linear_view_like(&output),
         out,
-        [output.dtype.into(), dtype_bool.into()],
+        [
+            dtype_to_storage_type(output.dtype),
+            dtype_to_storage_type(dtype_bool),
+        ],
     );
 
     output

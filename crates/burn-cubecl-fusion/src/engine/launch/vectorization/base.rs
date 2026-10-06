@@ -4,7 +4,7 @@ use crate::{
 };
 use burn_fusion::stream::Context;
 use burn_ir::{TensorId, TensorIr};
-use cubecl::{Runtime, ir::VectorSize};
+use cubecl::ir::VectorSize;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -50,7 +50,7 @@ impl VectorSizeOverrides {
         self.default = Some(vector_sizes);
     }
 
-    pub fn mapping<R: Runtime>(&self, context: &Context<CubeFusionHandle<R>>) -> Self {
+    pub fn mapping(&self, context: &Context<CubeFusionHandle>) -> Self {
         match &self.state {
             Some(state) => {
                 let mut state_new = BTreeMap::new();
@@ -75,26 +75,20 @@ impl VectorSizeOverrides {
     pub fn tensor(&self, tensor_id: &TensorId) -> Option<&Vec<VectorSize>> {
         let map = match &self.state {
             Some(val) => val,
-            None => match &self.default {
-                Some(val) => return Some(val),
-                None => return None,
-            },
+            None => return self.default.as_ref(),
         };
 
         match map.get(tensor_id) {
             Some(val) => Some(val),
-            None => match &self.default {
-                Some(val) => Some(val),
-                None => None,
-            },
+            None => self.default.as_ref(),
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn vectorization_default<'a, R: Runtime>(
+pub(crate) fn vectorization_default<'a>(
     vectorizations: &mut BTreeMap<TensorId, Vect>,
-    inputs: impl Iterator<Item = VectorizationHandle<'a, R>>,
+    inputs: impl Iterator<Item = VectorizationHandle<'a>>,
     outputs: impl Iterator<Item = &'a TensorIr>,
     reshaped: impl Iterator<Item = (&'a TensorIr, &'a TensorIr, bool)>,
     swapped: impl Iterator<Item = (&'a TensorIr, &'a TensorIr, bool, &'a (usize, usize))>,
@@ -216,8 +210,8 @@ fn multi_reads_vectorization_update(
 
 // The default version uses the last dimension as vectorization axis and assumes a
 // perpendicular contiguous vector.
-fn vectorization_input<R: Runtime>(
-    handle: &CubeFusionHandle<R>,
+fn vectorization_input(
+    handle: &CubeFusionHandle,
     desc: &TensorIr,
     axis: &VectorizationAxis,
     vector_sizes: &[VectorSize],
@@ -387,8 +381,8 @@ fn vectorization_reshape(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn vectorization_swapped<R: Runtime>(
-    handle: &CubeFusionHandle<R>,
+fn vectorization_swapped(
+    handle: &CubeFusionHandle,
     swapped: &TensorIr,
     original: &TensorIr,
     multi_reads: bool,

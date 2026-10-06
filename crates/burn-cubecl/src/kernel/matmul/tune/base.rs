@@ -1,46 +1,98 @@
 use crate::{
-    CubeRuntime, CubeTuneId,
-    kernel::matmul::{launch_matmul, launch_matmul_naive, utils::init_matmul_output},
+    CubeTuneId,
+    kernel::matmul::{
+        launch_matmul, launch_matmul_naive, tune::bounds::with_matmul_bounds,
+        utils::init_matmul_output,
+    },
     tensor::CubeTensor,
 };
 use burn_backend::DType;
+use burn_backend::cubecl::dtype_to_storage_type;
 use cubecl::{
+    client::Client,
     std::tensor::MatrixBatchLayout,
     tune::{LocalTuner, Tunable, TunableSet, TuneGroup, local_tuner},
 };
 use cubek::matmul::{
-    components::tile::TileMatmulKind,
-    definition::MatmulKind,
-    launch::{MatmulAutotuneKey, MatmulGlobalScale, Strategy, should_tune_double_buffering},
-    routines::{
-        BlueprintStrategy, TileSizeSelection, double_buffering::DoubleBufferingArgs,
-        double_unit::DoubleUnitSelectionArgs, ordered_double_buffering::OrderedSelectionArgs,
-        simple::SimpleArgs, simple_unit::SimpleUnitSelectionArgs,
+    definition::{MatmulElems, MatmulGlobalElems, MatmulKind},
+    multi_level::{
+        Strategy,
+        components::tile::TileMatmulKind,
+        definition::adjust_dtypes,
+        routines::{
+            TileSizeSelection,
+            batch::{
+                double_buffering::DoubleBufferingArgs, double_unit::DoubleUnitSelectionArgs,
+                ordered_double_buffering::OrderedSelectionArgs, simple::SimpleArgs,
+                simple_unit::SimpleUnitSelectionArgs,
+            },
+            gemm::GemmStrategy,
+        },
+    },
+    routine::BlueprintStrategy,
+    tiled::{Strategy as TiledStrategy, cpu_gemm::CpuGemmStrategy},
+    tune_key::{
+        MatmulAutotuneKey, MatmulGlobalScale, MatmulProblemDefinition, StorageTileKey,
+        should_tune_double_buffering,
     },
 };
 
-fn matmul_input_gen<R: CubeRuntime>(
-    _key: &MatmulAutotuneKey,
-    (lhs, rhs, out): &(CubeTensor<R>, CubeTensor<R>, CubeTensor<R>),
-) -> (CubeTensor<R>, CubeTensor<R>, CubeTensor<R>) {
+pub(super) type Inputs = (CubeTensor, CubeTensor, CubeTensor);
+
+/// Whether the device can run `tile_matmul` with the element types of the matmul `definition`.
+///
+/// The kernel runs on the *register* types, not the global ones: the selection paths promote
+/// them with [`adjust_dtypes`] when the tile matmul needs an accelerator (f32 to tf32, flex32 to
+/// f16). Without the same promotion here, every f32 problem would look unsupported and the tf32
+/// tensor core path would be lost.
+pub(crate) fn tile_matmul_supported(
+    client: &Client,
+    tile_matmul: TileMatmulKind,
+    definition: &MatmulProblemDefinition,
+) -> bool {
+    let mut elems = MatmulElems::from_globals(&MatmulGlobalElems {
+        lhs: definition.elem_lhs,
+        rhs: definition.elem_rhs,
+        out: definition.elem_out,
+    });
+    adjust_dtypes(client, &mut elems, tile_matmul.requires_accelerator());
+
+    !tile_matmul
+        .supported_sizes(
+            client,
+            elems.lhs_register,
+            elems.rhs_register,
+            elems.acc_register,
+        )
+        .is_empty()
+}
+
+fn matmul_input_gen(_key: &MatmulAutotuneKey, (lhs, rhs, out): &Inputs) -> Inputs {
     (lhs.clone(), rhs.clone(), out.copy())
 }
 
 /// Executes autotune on matmul operations
-pub fn matmul_autotune<R: CubeRuntime>(
-    lhs: CubeTensor<R>,
-    rhs: CubeTensor<R>,
-    out: Option<CubeTensor<R>>,
+pub fn matmul_autotune(
+    lhs: CubeTensor,
+    rhs: CubeTensor,
+    out: Option<CubeTensor>,
     out_dtype: DType,
-) -> CubeTensor<R> {
+) -> CubeTensor {
     let output = out.unwrap_or_else(|| init_matmul_output(&lhs, &rhs, out_dtype));
 
+    // Short-circuit: zero-sized matmul produces a zero-sized output.
+    if lhs.meta.shape().iter().any(|&d| d == 0) || rhs.meta.shape().iter().any(|&d| d == 0) {
+        return output;
+    }
+
     let client = lhs.client.clone();
+    let tune_client = client.clone();
     let num_cpu_cores = client.properties().hardware.num_cpu_cores;
 
     static TUNER: LocalTuner<MatmulAutotuneKey, CubeTuneId> = local_tuner!();
 
-    let tunables = TUNER.init(move || {
+    let tune_id = CubeTuneId::new(&lhs.client, &lhs.device);
+    let tunables = TUNER.init(&tune_id, move || {
         const PRIORITY_MAX: i8 = 3;
         const PRIORITY_HIGH: i8 = 2;
         const PRIORITY_MEDIUM: i8 = 1;
@@ -59,7 +111,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
             //
             // TODO: Actually implement good gemv with fused relayout.
             } else if matches!(key.analysis.kind, MatmulKind::MatVec | MatmulKind::VecMat) {
-                PRIORITY_HIGH
+                PRIORITY_MAX
             } else {
                 PRIORITY_MEDIUM
             }
@@ -76,6 +128,11 @@ pub fn matmul_autotune<R: CubeRuntime>(
         });
 
         let tma = TuneGroup::<MatmulAutotuneKey>::new("tma", |key| {
+            // Zero-sized matmuls cannot use TMA kernels.
+            if key.definition.m == 0 || key.definition.n == 0 || key.definition.k == 0 {
+                return PRIORITY_NEVER;
+            }
+
             // For large matmul, we set the max priority to TMA kernels, higher than any other
             // matmuls, since they are the best kernels no matter what.
             //
@@ -105,11 +162,11 @@ pub fn matmul_autotune<R: CubeRuntime>(
         });
 
         let gemv = TuneGroup::<MatmulAutotuneKey>::new("gemv", move |key| {
-            if num_cpu_cores.is_some() {
-                return PRIORITY_MAX;
-            }
-
             if matches!(key.analysis.kind, MatmulKind::MatVec) {
+                if num_cpu_cores.is_some() {
+                    return PRIORITY_MAX;
+                }
+
                 // LHS is the matrix
                 match key.definition.matrix_layout_lhs {
                     MatrixBatchLayout::Contiguous => PRIORITY_MAX,
@@ -126,6 +183,10 @@ pub fn matmul_autotune<R: CubeRuntime>(
                     MatrixBatchLayout::HighlyPermuted => PRIORITY_MAX,
                 }
             } else if matches!(key.analysis.kind, MatmulKind::VecMat) {
+                if num_cpu_cores.is_some() {
+                    return PRIORITY_MAX;
+                }
+
                 // RHS is the matrix
                 match key.definition.matrix_layout_rhs {
                     // We don't have good algos for row major vecmat.
@@ -149,6 +210,13 @@ pub fn matmul_autotune<R: CubeRuntime>(
             }
         });
 
+        // CPU-only group
+        let cpu =
+            TuneGroup::<MatmulAutotuneKey>::new("cpu", move |_key| match num_cpu_cores.is_some() {
+                true => PRIORITY_MAX,
+                false => PRIORITY_NEVER,
+            });
+
         fn double_buffering_priority(key: &MatmulAutotuneKey, max: i8, min: i8) -> i8 {
             if should_tune_double_buffering(false, key) {
                 max
@@ -157,12 +225,14 @@ pub fn matmul_autotune<R: CubeRuntime>(
             }
         }
 
-        let mut set = TunableSet::new(create_key::<R>, matmul_input_gen::<R>);
+        let mut set = TunableSet::new(create_key, matmul_input_gen);
+
+        set = with_matmul_bounds(set);
 
         // First entry should always work, since it is considered the fallback.
         set = set.with(
             Tunable::new("matmul_naive", |(lhs, rhs, out)| {
-                launch_matmul_naive::<R>(&Strategy::Naive, lhs, rhs, out)
+                launch_matmul_naive::<_>(&Strategy::Naive, lhs, rhs, out)
                     .map_err(|err| std::format!("{err:?}"))
             })
             .group(&unit, |key| {
@@ -187,7 +257,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 false,
             ),
             (
-                Strategy::GemvPlaneParallel(BlueprintStrategy::Inferred(Default::default())),
+                Strategy::Gemm(BlueprintStrategy::Inferred(Default::default())),
                 false,
             ),
             (
@@ -197,7 +267,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
         ] {
             set = set.with(
                 Tunable::new(&strategy.to_string(), move |(lhs, rhs, out)| {
-                    launch_matmul::<R>(&strategy, lhs, rhs, out)
+                    launch_matmul::<_>(&strategy, lhs, rhs, out)
                         .map_err(|err| std::format!("{err:?}"))
                 })
                 .group(&gemv, move |key| match double_buf {
@@ -228,7 +298,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
             ] {
                 set = set.with(
                     Tunable::new(&strategy.to_string(), move |(lhs, rhs, out)| {
-                        launch_matmul::<R>(&strategy, lhs, rhs, out)
+                        launch_matmul::<_>(&strategy, lhs, rhs, out)
                             .map_err(|err| format!("{err:?}"))
                     })
                     .group(&unit, move |key| match double_buf {
@@ -239,8 +309,50 @@ pub fn matmul_autotune<R: CubeRuntime>(
             }
         }
 
+        // Gemm no stage
+        // In unit because not accelerated
+        let gemm_no_stage_strategy = Strategy::Gemm(BlueprintStrategy::Inferred(GemmStrategy {
+            target_num_planes: None,
+        }));
+        set = set.with(
+            Tunable::new(
+                &gemm_no_stage_strategy.to_string(),
+                move |(lhs, rhs, out)| {
+                    launch_matmul::<_>(&gemm_no_stage_strategy, lhs, rhs, out)
+                        .map_err(|err| format!("{err:?}"))
+                },
+            )
+            .group(&unit, move |_key| PRIORITY_MAX),
+        );
+
+        // `Gemm` is not a vector routine, so restricting the gemv group to vector kinds removed
+        // it from general CPU matmuls. Register it independently for those workloads while
+        // keeping the gemv group vector-specific
+        let cpu_gemm_general = Strategy::Gemm(BlueprintStrategy::Inferred(Default::default()));
+        set = set.with(
+            Tunable::new("gemm_cpu_general", move |(lhs, rhs, out)| {
+                launch_matmul::<_>(&cpu_gemm_general, lhs, rhs, out)
+                    .map_err(|err| std::format!("{err:?}"))
+            })
+            .group(&cpu, move |key| match key.analysis.kind {
+                MatmulKind::General => PRIORITY_MAX,
+                _ => PRIORITY_NEVER,
+            }),
+        );
+
+        // CPU GEMM (CPU-only via the `cpu` group; the size limit is specific to this strategy).
+        let cpu_gemm_strategy =
+            TiledStrategy::CpuGemm(BlueprintStrategy::Inferred(CpuGemmStrategy::default()));
+        set = set.with(
+            Tunable::new(&cpu_gemm_strategy.to_string(), move |(lhs, rhs, out)| {
+                launch_matmul::<_>(&cpu_gemm_strategy, lhs, rhs, out)
+                    .map_err(|err| format!("{err:?}"))
+            })
+            .group(&cpu, move |_key| PRIORITY_MAX),
+        );
+
         // Accelerated matmuls
-        for (strategy, double_buf, group_extra, tile_group) in [
+        for (strategy, double_buf, group_extra, tile_group, tile_matmul) in [
             (
                 Strategy::SimpleCyclicCmma(BlueprintStrategy::Inferred(SimpleArgs {
                     multi_rows: false,
@@ -249,6 +361,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 false,
                 None,
                 &accelerated,
+                TileMatmulKind::Cmma,
             ),
             (
                 Strategy::SimpleCyclicMma(BlueprintStrategy::Inferred(SimpleArgs {
@@ -258,6 +371,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 false,
                 None,
                 &accelerated,
+                TileMatmulKind::Mma,
             ),
             (
                 Strategy::SimpleCyclicCmma(BlueprintStrategy::Inferred(SimpleArgs {
@@ -267,6 +381,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 false,
                 None,
                 &accelerated,
+                TileMatmulKind::Cmma,
             ),
             (
                 Strategy::SimpleCyclicMma(BlueprintStrategy::Inferred(SimpleArgs {
@@ -276,6 +391,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 false,
                 None,
                 &accelerated,
+                TileMatmulKind::Mma,
             ),
             (
                 Strategy::OrderedDoubleCmma(BlueprintStrategy::Inferred(OrderedSelectionArgs {
@@ -287,6 +403,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 true,
                 None,
                 &accelerated,
+                TileMatmulKind::Cmma,
             ),
             (
                 Strategy::OrderedDoubleMma(BlueprintStrategy::Inferred(OrderedSelectionArgs {
@@ -298,6 +415,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 true,
                 None,
                 &accelerated,
+                TileMatmulKind::Mma,
             ),
             (
                 Strategy::OrderedDoubleCmma(BlueprintStrategy::Inferred(OrderedSelectionArgs {
@@ -309,6 +427,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 true,
                 None,
                 &accelerated,
+                TileMatmulKind::Cmma,
             ),
             (
                 Strategy::OrderedDoubleMma(BlueprintStrategy::Inferred(OrderedSelectionArgs {
@@ -320,6 +439,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 true,
                 None,
                 &accelerated,
+                TileMatmulKind::Mma,
             ),
             (
                 Strategy::DoubleCyclicCmma(BlueprintStrategy::Inferred(DoubleBufferingArgs {
@@ -329,6 +449,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 true,
                 None,
                 &accelerated,
+                TileMatmulKind::Cmma,
             ),
             (
                 Strategy::DoubleCyclicMma(BlueprintStrategy::Inferred(DoubleBufferingArgs {
@@ -338,6 +459,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 true,
                 None,
                 &accelerated,
+                TileMatmulKind::Mma,
             ),
             (
                 Strategy::DoubleCyclicCmma(BlueprintStrategy::Inferred(DoubleBufferingArgs {
@@ -347,6 +469,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 true,
                 None,
                 &accelerated,
+                TileMatmulKind::Cmma,
             ),
             (
                 Strategy::DoubleCyclicMma(BlueprintStrategy::Inferred(DoubleBufferingArgs {
@@ -356,18 +479,21 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 true,
                 None,
                 &accelerated,
+                TileMatmulKind::Mma,
             ),
             (
                 Strategy::SpecializedCyclicCmma(BlueprintStrategy::Inferred(().into())),
                 true,
                 None,
                 &accelerated,
+                TileMatmulKind::Cmma,
             ),
             (
                 Strategy::SpecializedCyclicMma(BlueprintStrategy::Inferred(().into())),
                 true,
                 None,
                 &accelerated,
+                TileMatmulKind::Mma,
             ),
             (
                 Strategy::SimpleTmaCmma(BlueprintStrategy::Inferred(SimpleArgs {
@@ -377,6 +503,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 false,
                 Some(&tma),
                 &accelerated,
+                TileMatmulKind::Cmma,
             ),
             (
                 Strategy::SimpleTmaMma(BlueprintStrategy::Inferred(SimpleArgs {
@@ -386,6 +513,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 false,
                 Some(&tma),
                 &accelerated,
+                TileMatmulKind::Mma,
             ),
             (
                 Strategy::SimpleTmaCmma(BlueprintStrategy::Inferred(SimpleArgs {
@@ -395,6 +523,7 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 false,
                 Some(&tma),
                 &accelerated,
+                TileMatmulKind::Cmma,
             ),
             (
                 Strategy::SimpleTmaMma(BlueprintStrategy::Inferred(SimpleArgs {
@@ -404,66 +533,92 @@ pub fn matmul_autotune<R: CubeRuntime>(
                 false,
                 Some(&tma),
                 &accelerated,
+                TileMatmulKind::Mma,
             ),
             (
                 Strategy::SpecializedTmaCmma(BlueprintStrategy::Inferred(().into())),
                 true,
                 Some(&tma),
                 &accelerated,
+                TileMatmulKind::Cmma,
             ),
             (
                 Strategy::SpecializedTmaMma(BlueprintStrategy::Inferred(().into())),
                 true,
                 Some(&tma),
                 &accelerated,
+                TileMatmulKind::Mma,
             ),
         ] {
-            let priority_within_group = |key: &MatmulAutotuneKey, double_buf: bool| match double_buf
-            {
-                false => PRIORITY_MAX,
-                true => double_buffering_priority(key, PRIORITY_MAX, PRIORITY_HIGH),
-            };
             let mut tunable = Tunable::new(&strategy.to_string(), move |(lhs, rhs, out)| {
-                launch_matmul::<R>(&strategy, lhs, rhs, out).map_err(|err| format!("{err:?}"))
+                launch_matmul::<_>(&strategy, lhs, rhs, out).map_err(|err| format!("{err:?}"))
             });
 
+            // Accelerated kernels are demoted when the device doesn't support the tile matmul
+            // they are built on, otherwise they would be compiled just to fail. They keep the
+            // minimum priority rather than being discarded, so they remain a last resort and
+            // the tune plan can never end up empty.
+            let accelerated_priority = move |key: &MatmulAutotuneKey, client: &Client| {
+                if !tile_matmul_supported(client, tile_matmul, &key.definition) {
+                    return PRIORITY_MIN;
+                }
+
+                match double_buf {
+                    false => PRIORITY_MAX,
+                    true => double_buffering_priority(key, PRIORITY_MAX, PRIORITY_HIGH),
+                }
+            };
+
             // tile group
+            let client_tile = tune_client.clone();
             tunable = tunable.group(tile_group, move |key| {
-                priority_within_group(key, double_buf)
+                accelerated_priority(key, &client_tile)
             });
 
             // extra group
             if let Some(group) = group_extra {
-                tunable = tunable.group(group, move |key| priority_within_group(key, double_buf));
+                let client_extra = tune_client.clone();
+                tunable = tunable.group(group, move |key| accelerated_priority(key, &client_extra));
             }
             set = set.with(tunable);
         }
 
+        // A storage-tiled operand is read only by the tiled cmma routine, which stages to its
+        // tiles; every other candidate refuses it. The candidate joins the plan for such a
+        // problem alone, so a plain one tunes as before.
+        let tiled_cmma = TiledStrategy::Cmma(BlueprintStrategy::Inferred(Default::default()));
+        set = set.with(
+            Tunable::new(&tiled_cmma.to_string(), move |(lhs, rhs, out)| {
+                launch_matmul::<_>(&tiled_cmma, lhs, rhs, out).map_err(|err| format!("{err:?}"))
+            })
+            .group(&accelerated, |key| {
+                match (&key.definition.lhs_storage, &key.definition.rhs_storage) {
+                    (StorageTileKey::Plain, StorageTileKey::Plain) => PRIORITY_NEVER,
+                    _ => PRIORITY_MAX,
+                }
+            }),
+        );
+
         set
     });
 
-    TUNER.execute(
-        &CubeTuneId::new(&lhs.client, &lhs.device),
-        &client,
-        tunables,
-        (lhs, rhs, output.clone()),
-    );
+    TUNER.execute(&tune_id, &client, tunables, (lhs, rhs, output.clone()));
 
     output
 }
 
-fn create_key<R: CubeRuntime>(
-    (lhs, rhs, out): &(CubeTensor<R>, CubeTensor<R>, CubeTensor<R>),
-) -> MatmulAutotuneKey {
+fn create_key((lhs, rhs, out): &Inputs) -> MatmulAutotuneKey {
     MatmulAutotuneKey::generate(
         &lhs.client,
         lhs.meta.shape(),
         rhs.meta.shape(),
         lhs.meta.strides(),
         rhs.meta.strides(),
-        lhs.dtype.into(),
-        rhs.dtype.into(),
-        out.dtype.into(),
+        lhs.meta.tiling,
+        rhs.meta.tiling,
+        dtype_to_storage_type(lhs.dtype),
+        dtype_to_storage_type(rhs.dtype),
+        dtype_to_storage_type(out.dtype),
         lhs.try_scheme(),
         rhs.try_scheme(),
     )

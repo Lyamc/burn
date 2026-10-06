@@ -1,19 +1,19 @@
 use std::marker::PhantomData;
 
 use burn_backend::{
-    DeviceId,
-    distributed::{CollectiveTensor, DistributedBackend, ReduceOperation},
+    DeviceId, ExecutionError,
+    distributed::{CollectiveTensor, DistributedOps, ReduceOperation},
     tensor::{Device, FloatTensor},
 };
 use burn_ir::{AllReduceOpIr, DistributedOperationIr, HandleContainer, OperationIr};
 
 use crate::{
     Fusion, FusionBackend, get_client,
-    stream::{Operation, OperationStreams},
+    stream::{Operation, StreamId},
 };
 use burn_ir::OperationOutput;
 
-impl<B: FusionBackend + DistributedBackend> DistributedBackend for Fusion<B> {
+impl<B: FusionBackend> DistributedOps<Self> for Fusion<B> {
     fn all_reduce(
         tensor: FloatTensor<Self>,
         op: ReduceOperation,
@@ -27,20 +27,30 @@ impl<B: FusionBackend + DistributedBackend> DistributedBackend for Fusion<B> {
             _b: PhantomData<B>,
         }
 
-        impl<B: FusionBackend + DistributedBackend> Operation<B::FusionRuntime> for AllReduceOps<B> {
-            fn execute(&self, handles: &mut HandleContainer<B::Handle>) {
+        impl<B: FusionBackend> Operation<B::FusionRuntime> for AllReduceOps<B> {
+            fn execute(
+                &self,
+                handles: &mut HandleContainer<B::Handle>,
+            ) -> Result<(), ExecutionError> {
                 let tensor = handles.get_float_tensor::<B>(&self.desc.tensor);
                 let output = B::all_reduce(tensor, self.op, self.device_ids.clone());
                 handles.register_float_tensor::<B>(&self.desc.out.id, unsafe {
                     output.assume_resolved()
                 });
+
+                Ok(())
             }
         }
 
-        let streams = OperationStreams::with_inputs([&tensor]);
+        let streams = StreamId::current();
 
         let client = tensor.client.clone();
-        let desc = AllReduceOpIr::create(tensor.into_ir(), || client.create_empty_handle());
+        let desc = AllReduceOpIr::create(
+            tensor.into_ir(),
+            op,
+            device_ids.iter().map(|id| (*id).into()).collect(),
+            || client.create_empty_handle(),
+        );
 
         let output = client
             .register(
@@ -48,8 +58,7 @@ impl<B: FusionBackend + DistributedBackend> DistributedBackend for Fusion<B> {
                 OperationIr::Distributed(DistributedOperationIr::AllReduce(desc.clone())),
                 AllReduceOps::<B>::new(desc, op, device_ids.clone()),
             )
-            .output()
-            .into();
+            .output();
 
         client.ensure_collective_init::<B>(device_ids);
 

@@ -1,10 +1,9 @@
-use crate::{BasicOps, Shape, Slice, Tensor, backend::Backend, cast::ToElement};
+use crate::bridge::{BasicOps, Ordered};
+use crate::{DType, Shape, Slice, Tensor, cast::ToElement};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use burn_backend::tensor::Ordered;
-use burn_std::DType;
 
 /// The struct should always be used with the [check](crate::check) macro.
 ///
@@ -40,10 +39,10 @@ pub(crate) enum TensorCheck {
 
 impl TensorCheck {
     /// Checks device and shape compatibility for element wise binary operations.
-    pub(crate) fn binary_ops_ew<B: Backend, const D: usize, K: BasicOps<B>>(
+    pub(crate) fn binary_ops_ew<const D: usize, K: BasicOps>(
         ops: &str,
-        lhs: &Tensor<B, D, K>,
-        rhs: &Tensor<B, D, K>,
+        lhs: &Tensor<D, K>,
+        rhs: &Tensor<D, K>,
     ) -> Self {
         Self::Ok
             .binary_ops_device(ops, &lhs.device(), &rhs.device())
@@ -61,20 +60,6 @@ impl TensorCheck {
                         "Current tensor has {} elements",
                         shape.num_elements()
                     )),
-            );
-        }
-
-        check
-    }
-
-    pub(crate) fn dim_ops<const D: usize>(ops: &str, dim: usize) -> Self {
-        let mut check = Self::Ok;
-
-        if dim >= D {
-            check = check.register(
-                ops,
-                TensorError::new("Given dimension is higher than the tensor rank.")
-                    .details(format!("Tensor rank: '{D}', given dimension: '{dim}'.")),
             );
         }
 
@@ -103,8 +88,8 @@ impl TensorCheck {
         check
     }
 
-    pub(crate) fn narrow<B: Backend, const D: usize, K: BasicOps<B>>(
-        tensor: &Tensor<B, D, K>,
+    pub(crate) fn narrow<const D: usize, K: BasicOps>(
+        tensor: &Tensor<D, K>,
         dim: usize,
         start: usize,
         length: usize,
@@ -138,42 +123,6 @@ impl TensorCheck {
                     "Can't narrow at dimension {dim}, start + length exceeds the size of the tensor \
                      along this dimension (Size={})",
                     tensor.shape()[dim]
-                )),
-            );
-        }
-
-        check
-    }
-
-    pub(crate) fn movedim_args_usize<const D: usize>(dim: usize) -> Self {
-        let mut check = Self::Ok;
-
-        if dim >= D {
-            check = check.register(
-                "Movedim",
-                TensorError::new(
-                    "The given dimension exceeds the number of dimensions of the current tensor.",
-                )
-                .details(format!(
-                    "Current tensor has {D} dimensions, but the given dimension is {dim}.",
-                )),
-            );
-        }
-
-        check
-    }
-
-    pub(crate) fn movedim_args_i32<const D: usize>(dim: i32) -> Self {
-        let mut check = Self::Ok;
-
-        if dim < -(D as i32) || dim >= D as i32 {
-            check = check.register(
-                "Movedim",
-                TensorError::new(
-                    "The given dimension is out of bounds for the current tensor dimensions.",
-                )
-                .details(format!(
-                    "Current tensor has {D} dimensions, but the given dimension is {dim}.",
                 )),
             );
         }
@@ -328,7 +277,11 @@ impl TensorCheck {
         if dim_indices.len() >= current_dims.len() {
             check = check.register(
                 "Squeeze",
-                TensorError::new("Attempted to squeeze too many dimensions!"),
+                TensorError::new("Attempted to squeeze too many dimensions!").details(format!(
+                    "Got {} dims, tensor has {}",
+                    dim_indices.len(),
+                    current_dims.len()
+                )),
             );
         }
 
@@ -420,16 +373,32 @@ impl TensorCheck {
         check
     }
 
-    pub(crate) fn one_hot_tensor<B: Backend, const D: usize, K: Ordered<B>>(
-        index_tensor: Tensor<B, D, K>,
+    /// Checks that an operation which doesn't support quantized inputs isn't given one.
+    pub(crate) fn quantized_unsupported(ops: &str, dtype: DType) -> Self {
+        let mut check = Self::Ok;
+
+        if let DType::QFloat(scheme) = dtype {
+            check = check.register(
+                ops,
+                TensorError::new("Quantized tensors are not supported by this operation.").details(
+                    format!("Got dtype QFloat({scheme:?}). Dequantize the tensor first."),
+                ),
+            );
+        }
+
+        check
+    }
+
+    pub(crate) fn one_hot_tensor<const D: usize, K: Ordered>(
+        index_tensor: Tensor<D, K>,
         num_classes: usize,
     ) -> Self {
         let mut check = Self::Ok;
         if index_tensor
             .clone()
-            .greater_equal_elem(num_classes as i32)
+            .greater_equal_scalar(num_classes as i32)
             .any()
-            .into_scalar()
+            .into_scalar::<i64>()
             .to_bool()
         {
             check = check.register(
@@ -461,29 +430,13 @@ impl TensorCheck {
         check
     }
 
-    pub(crate) fn swap_dims<const D: usize>(dim1: usize, dim2: usize) -> Self {
-        let mut check = Self::Ok;
-
-        if dim1 > D || dim2 > D {
-            check = check.register(
-                "Swap Dims",
-                TensorError::new("The swap dimensions must be smaller than the tensor dimension")
-                    .details(format!(
-                        "Swap dims ({dim1}, {dim2}) on tensor with ({D}) dimensions."
-                    )),
-            );
-        }
-
-        check
-    }
-
     pub(crate) fn permute<const D: usize>(axes: [usize; D]) -> Self {
         let check = Self::Ok;
 
         // Check if the axes are within the tensor dimensions
         if let Some(axis) = axes.iter().find(|&x| *x >= D) {
             return check.register(
-                "permute",
+                "Permute",
                 TensorError::new("The axes must be smaller than the tensor dimension.")
                     .details(format!("The '{axis}' axis is greater than {D} dimensions.")),
             );
@@ -494,7 +447,7 @@ impl TensorCheck {
         axes.iter().for_each(|&x| seen[x] = true);
         if seen.iter().any(|&x| !x) {
             return check.register(
-                "permute",
+                "Permute",
                 TensorError::new("The axes must be unique.")
                     .details(format!("The axes '{axes:?}' are not unique.")),
             );
@@ -531,19 +484,21 @@ impl TensorCheck {
         check
     }
 
-    pub(crate) fn matmul<B: Backend, const D: usize, K>(
-        lhs: &Tensor<B, D, K>,
-        rhs: &Tensor<B, D, K>,
-    ) -> Self
+    pub(crate) fn matmul<const D: usize, K>(lhs: &Tensor<D, K>, rhs: &Tensor<D, K>) -> Self
     where
-        K: BasicOps<B>,
+        K: BasicOps,
     {
         let mut check = Self::Ok;
 
         check = check.binary_ops_device("Matmul", &lhs.device(), &rhs.device());
 
         if D < 2 {
-            return check;
+            return check.register(
+                "Matmul",
+                TensorError::new(format!(
+                    "Matmul requires tensors with at least 2 dimensions, but got {D} dimension(s)."
+                )),
+            );
         }
 
         let shape_lhs = lhs.shape();
@@ -566,16 +521,36 @@ impl TensorCheck {
             );
         }
 
+        // Check batch dimension broadcast compatibility. The last two dimensions
+        // are the matrix dimensions (validated above), the remaining leading
+        // dimensions are the batch dimensions and must be broadcast-compatible.
+        for i in 0..D - 2 {
+            let l = shape_lhs[i];
+            let r = shape_rhs[i];
+            if l != r && l != 1 && r != 1 {
+                check = check.register(
+                    "Matmul",
+                    TensorError::new(format!(
+                        "Tensors are not broadcastable along batch dimension {i}: {l} and {r}."
+                    ))
+                    .details(format!(
+                        "Lhs shape {:?}, rhs shape {:?}.",
+                        shape_lhs, shape_rhs
+                    )),
+                );
+            }
+        }
+
         check
     }
 
-    pub(crate) fn cross<B: Backend, const D: usize, K>(
-        lhs: &Tensor<B, D, K>,
-        rhs: &Tensor<B, D, K>,
+    pub(crate) fn cross<const D: usize, K>(
+        lhs: &Tensor<D, K>,
+        rhs: &Tensor<D, K>,
         dim: usize,
     ) -> Self
     where
-        K: BasicOps<B>,
+        K: BasicOps,
     {
         let mut check = Self::Ok;
 
@@ -583,16 +558,6 @@ impl TensorCheck {
 
         let shape_lhs = lhs.shape();
         let shape_rhs = rhs.shape();
-
-        if dim >= D {
-            check = check.register(
-                "Cross",
-                TensorError::new(format!(
-                    "Dimension {dim} is out of bounds for tensors with {D} dimensions."
-                )),
-            );
-            return check;
-        }
 
         let dim_size_lhs = shape_lhs[dim];
         let dim_size_rhs = shape_rhs[dim];
@@ -625,23 +590,11 @@ impl TensorCheck {
         check
     }
 
-    pub(crate) fn stack<B: Backend, const D1: usize, K: BasicOps<B>, const D2: usize>(
-        tensors: &[Tensor<B, D1, K>],
+    pub(crate) fn stack<const D1: usize, K: BasicOps, const D2: usize>(
+        tensors: &[Tensor<D1, K>],
         dim: usize,
     ) -> Self {
         let mut check = Self::Ok;
-
-        if dim > D1 {
-            check = check.register(
-                "Stack",
-                TensorError::new(
-                    "Can't stack tensors on a dim that exceeds the tensors dimension (inclusive)",
-                )
-                .details(format!(
-                    "Trying to concatenate tensors with {D1} dimensions on axis {dim}."
-                )),
-            );
-        }
 
         if D1 == D2 {
             check = check.register(
@@ -679,23 +632,8 @@ impl TensorCheck {
         check
     }
 
-    pub(crate) fn cat<B: Backend, const D: usize, K: BasicOps<B>>(
-        tensors: &[Tensor<B, D, K>],
-        dim: usize,
-    ) -> Self {
-        let mut check = Self::Ok;
-
-        if dim >= D {
-            check = check.register(
-                "Cat",
-                TensorError::new(
-                    "Can't concatenate tensors on a dim that exceeds the tensors dimension",
-                )
-                .details(format!(
-                    "Trying to concatenate tensors with {D} dimensions on axis {dim}."
-                )),
-            );
-        }
+    pub(crate) fn cat<const D: usize, K: BasicOps>(tensors: &[Tensor<D, K>], dim: usize) -> Self {
+        let check = Self::Ok;
 
         if tensors.is_empty() {
             return check.register(
@@ -864,36 +802,6 @@ impl TensorCheck {
         check
     }
 
-    pub(crate) fn check_is_power_of_two<const D: usize>(shape: &Shape, dim: usize) -> Self {
-        let mut check = Self::Ok;
-        let dim_size = shape[dim];
-
-        if !dim_size.is_power_of_two() {
-            check = check.register(
-                "Check Is Power of two",
-                TensorError::new("The provided dimension size must be a power of two.")
-                    .details(format!("The length of dimension {dim} is {dim_size}.")),
-            );
-        }
-
-        check
-    }
-
-    pub(crate) fn check_dim<const D: usize>(dim: usize) -> Self {
-        let mut check = Self::Ok;
-
-        if dim >= D {
-            check = check.register(
-                "Check Dim",
-                TensorError::new("The provided dimension exceeds the tensor dimensions.").details(
-                    format!("Tensor has {D} dimensions, but the provided dimension is {dim}."),
-                ),
-            );
-        }
-
-        check
-    }
-
     pub(crate) fn gather<const D: usize>(dim: usize, shape: &Shape, shape_indices: &Shape) -> Self {
         Self::check_gather_scatter_indices::<D>(Self::Ok, "Gather", dim, shape, shape_indices)
     }
@@ -1043,12 +951,23 @@ impl TensorCheck {
         check
     }
 
-    pub(crate) fn select<const D: usize>(dim: usize) -> Self {
-        Self::check_select_basic::<D>(Self::Ok, "select", dim)
+    pub(crate) fn mask_select(shape: &Shape, shape_mask: &Shape) -> Self {
+        let mut check = Self::Ok;
+
+        if shape != shape_mask {
+            check = check.register(
+                "Mask Select",
+                TensorError::new("The mask must have the same shape as the tensor.").details(
+                    format!("Tensor shape {shape:?}, mask shape {shape_mask:?}."),
+                ),
+            );
+        }
+
+        check
     }
 
-    pub(crate) fn take<const D: usize, const DI: usize, const DO: usize>(dim: usize) -> Self {
-        let mut check = Self::check_select_basic::<D>(Self::Ok, "Take", dim);
+    pub(crate) fn take<const D: usize, const DI: usize, const DO: usize>() -> Self {
+        let mut check = Self::Ok;
 
         // Calculate expected output dimensions
         // DO = D - 1 + DI (remove 1 dim, add DI dims)
@@ -1066,40 +985,12 @@ impl TensorCheck {
         check
     }
 
-    pub(crate) fn diag<const D: usize, const DO: usize>() -> Self {
-        let mut check = Self::Ok;
-
-        if D < 2 {
-            check = check.register(
-                "Diag",
-                TensorError::new(
-                    "Diagonal operations require
-                tensors with at least 2 dimensions.",
-                )
-                .details(format!(
-                    "Got tensor with {D} dimensions,
-                expected at least 2"
-                )),
-            );
-        }
-
-        if DO != D - 1 {
-            check = check.register(
-                "Diag",
-                TensorError::new("Output rank must be input rank minus 1 for diagonal")
-                    .details(format!("Expected output rank {}, got {DO}", D - 1)),
-            );
-        }
-
-        check
-    }
-
     pub(crate) fn select_assign<const D: usize>(
         dim: usize,
         shape_indices: &Shape,
         shape_value: &Shape,
     ) -> Self {
-        let mut check = Self::check_select_basic::<D>(Self::Ok, "Select Assign", dim);
+        let mut check = Self::Ok;
 
         if shape_value[dim] != shape_indices[0] {
             check = check.register(
@@ -1117,18 +1008,6 @@ impl TensorCheck {
         check
     }
 
-    fn check_select_basic<const D: usize>(mut check: Self, ops: &str, dim: usize) -> Self {
-        if dim > D {
-            check = check.register(
-                ops,
-                TensorError::new(format!(
-                    "Can't index a tensor with ({D}) dimensions on axis ({dim})"
-                )),
-            );
-        }
-
-        check
-    }
     fn check_gather_scatter_indices<const D: usize>(
         mut check: Self,
         ops: &str,
@@ -1136,15 +1015,6 @@ impl TensorCheck {
         shape: &Shape,
         shape_indices: &Shape,
     ) -> Self {
-        if dim > D {
-            check = check.register(
-                ops,
-                TensorError::new(format!(
-                    "Can't index a tensor with ({D}) dimensions on axis ({dim})"
-                )),
-            );
-        }
-
         for i in 0..D {
             if i == dim {
                 continue;
@@ -1208,61 +1078,21 @@ impl TensorCheck {
         }
     }
 
-    /// Checks aggregate dimension such as mean and sum.
-    pub(crate) fn aggregate_dim<const D: usize>(ops: &str, dim: usize) -> Self {
-        let mut check = Self::Ok;
-
-        if dim > D {
-            check = check.register(
-                ops,
-                TensorError::new(format!(
-                    "Can't aggregate a tensor with ({D}) dimensions on axis ({dim})"
-                )),
-            );
-        }
-
-        check
-    }
-
-    pub(crate) fn sort_dim<const D: usize>(ops: &str, dim: usize) -> Self {
-        let mut check = Self::Ok;
-
-        if dim > D {
-            check = check.register(
-                ops,
-                TensorError::new(format!(
-                    "Can't sort a tensor with ({D}) dimensions on axis ({dim})"
-                )),
-            );
-        }
-
-        check
-    }
-
     pub(crate) fn split<const D: usize>(
         tensor_dims: &[usize],
         split_size: usize,
         dim: usize,
     ) -> Self {
         let mut check = Self::Ok;
-        let op = "split";
-        let tensor_rank = tensor_dims.len();
+        let op = "Split";
 
-        if dim >= tensor_rank {
+        let tensor_size = tensor_dims[dim];
+        if split_size == 0 && tensor_size != 0 {
             check = check.register(
                 op,
-                TensorError::new("Given dimension is greater than or equal to the tensor rank.")
-                    .details(format!("Tensor rank: '{D}', given dimension: '{dim}'")),
+                TensorError::new("split_size must be greater than 0 unless the tensor size along the dimension is 0.")
+                    .details(format!("split_size: '{split_size}', tensor size along dim '{dim}': '{tensor_size}'.")),
             );
-        } else {
-            let tensor_size = tensor_dims[dim];
-            if split_size == 0 && tensor_size != 0 {
-                check = check.register(
-                    op,
-                    TensorError::new("split_size must be greater than 0 unless the tensor size along the dimension is 0.")
-                        .details(format!("split_size: '{split_size}', tensor size along dim '{dim}': '{tensor_size}'.")),
-                );
-            }
         }
 
         check
@@ -1274,26 +1104,17 @@ impl TensorCheck {
         dim: usize,
     ) -> Self {
         let mut check = Self::Ok;
-        let op = "split_with_sizes";
-        let tensor_rank = tensor_dims.len();
+        let op = "Split With Sizes";
 
-        if dim >= tensor_rank {
+        // Validate split_sizes add up to size of dimension to split along
+        let tensor_size = tensor_dims[dim];
+        let total_split_size: usize = split_sizes.iter().sum();
+        if total_split_size != tensor_size {
             check = check.register(
                 op,
-                TensorError::new("Given dimension is greater than or equal to the tensor rank.")
-                    .details(format!("Tensor rank: '{D}', given dimension: '{dim}'.")),
+                TensorError::new("The sum of split_sizes must equal the tensor size along the specified dimension.")
+                    .details(format!("Sum of split_sizes: '{total_split_size}', tensor size along dim '{dim}': '{tensor_size}'.")),
             );
-        } else {
-            // Validate split_sizes add up to size of dimension to split along
-            let tensor_size = tensor_dims[dim];
-            let total_split_size: usize = split_sizes.iter().sum();
-            if total_split_size != tensor_size {
-                check = check.register(
-                    op,
-                    TensorError::new("The sum of split_sizes must equal the tensor size along the specified dimension.")
-                        .details(format!("Sum of split_sizes: '{total_split_size}', tensor size along dim '{dim}': '{tensor_size}'.")),
-                );
-            }
         }
 
         check
@@ -1372,7 +1193,11 @@ impl TensorCheck {
     }
 
     /// Checks if expand operation is possible for the given shapes.
-    pub fn expand<const D1: usize, const D2: usize>(ops: &str, shape: &Shape, to: &Shape) -> Self {
+    pub(crate) fn expand<const D1: usize, const D2: usize>(
+        ops: &str,
+        shape: &Shape,
+        to: &Shape,
+    ) -> Self {
         let mut check = TensorCheck::Ok;
         let max_dims = core::cmp::max(D1, D2);
 
@@ -1418,7 +1243,7 @@ impl TensorCheck {
     }
 
     /// Checks if unfold operation is possible for the given shapes.
-    pub fn unfold<const D1: usize, const D2: usize>(
+    pub(crate) fn unfold<const D1: usize, const D2: usize>(
         ops: &str,
         _shape: &Shape,
         _dim: usize,
@@ -1441,7 +1266,7 @@ impl TensorCheck {
     }
 
     /// Checks if input is compatible with convolution weights.
-    pub fn conv<const D1: usize, const D2: usize>(
+    pub(crate) fn conv<const D1: usize, const D2: usize>(
         ops: &str,
         x: [usize; D1],
         weight: [usize; D2],
@@ -1479,96 +1304,16 @@ impl TensorCheck {
         check
     }
 
-    /// Check the generic parameters for lu decomposition is valid.
-    pub fn lu_generic_param<const D: usize, const D1: usize>(ops: &str) -> Self {
-        let mut check = TensorCheck::Ok;
-        if D - 1 != D1 {
+    pub(crate) fn topk(op: &str, k: usize, dim: usize, shape: &Shape) -> Self {
+        let mut check = Self::Ok;
+
+        if k > shape[dim] {
             check = check.register(
-                ops,
-                TensorError::new(
-                    "D - 1 = D1 must hold for the generic parameters of LU decomposition.",
-                )
-                .details(format!("Got generic parameters D = {} and D1 = {}", D, D1)),
-            );
-        }
-        check
-    }
-
-    /// Check the input tensor for lu decomposition is valid.
-    pub fn lu_input_tensor<const D: usize>(ops: &str, dims: &[usize], dtype: DType) -> Self {
-        let mut check = TensorCheck::Ok;
-
-        if matches!(dtype, DType::QFloat(_)) {
-            check = check.register(
-                ops,
-                TensorError::new("The input tensor must have a real float dtype")
-                    .details("Got an input tensor with a quantized float dtype".to_string()),
-            );
-        }
-
-        let n_dims = dims.len();
-        if n_dims < 2 {
-            check = check.register(
-                ops,
-                TensorError::new(
-                    "The input tensor for LU decomposition must have at least two dimensions.",
-                )
-                .details(format!("Got input tensor with {} dimensions", n_dims)),
-            );
-        }
-
-        check
-    }
-
-    /// Check if input tensor and generic parameters of `linalg::det()` are valid.
-    pub fn det<const D: usize, const D1: usize, const D2: usize>(
-        dims: [usize; D],
-        dtype: DType,
-    ) -> Self {
-        let mut check = TensorCheck::Ok;
-
-        if matches!(dtype, DType::QFloat(_)) {
-            check = check.register(
-                "det",
-                TensorError::new("The input tensor must have a real float dtype.")
-                    .details("Got an input tensor with a quantized float dtype".to_string()),
-            );
-        }
-
-        if D1 != D - 1 {
-            check = check.register(
-                "det",
-                TensorError::new(
-                    "D - 1 = D1 must hold for the generic parameters of the linalg::det function.",
-                )
-                .details(format!("Got generic parameters D = {D} and D1 = {D1}")),
-            );
-        }
-
-        if D2 != D - 2 {
-            check = check.register(
-                "det",
-                TensorError::new("The output tensor rank must be less than input tensor rank by 2")
-                    .details(format!(
-                        "Got input tensor rank {D} and output tensor rank {D2}"
-                    )),
-            );
-        }
-
-        if D < 3 {
-            check = check.register(
-                "det",
-                TensorError::new(format!(
-                    "The input tensor must have at least 3 dimensions, got {D}"
+                op,
+                TensorError::new("The selected index k is out of range.").details(format!(
+                    "Got k={k} for dimension {dim} with input shape {:?}.",
+                    shape.as_slice(),
                 )),
-            );
-        }
-
-        if dims[D - 1] != dims[D - 2] {
-            check = check.register(
-                "det",
-                TensorError::new("The last two dimensions of the input tensor must be equal")
-                    .details(format!("Got input tensor with shape {:?}", dims)),
             );
         }
 
@@ -1655,6 +1400,20 @@ pub(crate) fn unwrap_shape_reshape(result: Result<Shape, burn_std::MetadataError
     }
 }
 
+#[track_caller]
+pub(crate) fn unwrap_dim_index<E>(result: Result<usize, E>, op: &str) -> usize
+where
+    E: core::fmt::Display,
+{
+    match result {
+        Ok(dim) => dim,
+        Err(error) => {
+            macros::check!({ TensorCheck::Ok.register(op, TensorError::new(error.to_string())) });
+            unreachable!()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1708,23 +1467,6 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn movedim_args_out_of_bounds() {
-        check!(TensorCheck::movedim_args_usize::<3>(5));
-    }
-
-    #[test]
-    fn movedim_args_i32() {
-        check!(TensorCheck::movedim_args_i32::<3>(-3));
-    }
-
-    #[test]
-    #[should_panic]
-    fn movedim_args_too_negative() {
-        check!(TensorCheck::movedim_args_i32::<3>(-4));
-    }
-
-    #[test]
-    #[should_panic]
     fn movedim_args_vec_out_of_bounds() {
         check!(TensorCheck::movedim_args_vec::<3>(&vec![0, 1, 3]));
     }
@@ -1748,5 +1490,11 @@ mod tests {
     #[should_panic]
     fn unsqueeze_dim_same_rank() {
         check!(TensorCheck::unsqueeze_dim::<3, 3>(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "Operation: 'Select'")]
+    fn unwrap_dim_index_uses_operation_origin() {
+        unwrap_dim_index(Err("dimension -3 out of bounds: 0..2"), "Select");
     }
 }

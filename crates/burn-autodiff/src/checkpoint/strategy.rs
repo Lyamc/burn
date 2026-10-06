@@ -1,9 +1,9 @@
 use core::fmt::Debug;
 
 use burn_backend::Backend;
+use burn_std::sync::Arc;
 
 use crate::{graph::ComputingProperty, tensor::AutodiffTensor};
-use alloc::sync::Arc;
 
 use super::{
     builder::{ActionType, CheckpointerBuilder},

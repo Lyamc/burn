@@ -5,8 +5,7 @@ use burn::config::Config;
 use burn::module::Module;
 use burn::module::{Content, DisplaySettings, ModuleDisplay};
 use burn::tensor::Tensor;
-use burn::tensor::backend::Backend;
-use burn::tensor::ops::PadMode;
+use burn::tensor::ops::AvgPoolOptions;
 
 use burn::tensor::module::avg_pool2d;
 
@@ -43,7 +42,7 @@ pub struct AvgPool2dConfig {
 /// legitimate values, and they contribute to the denominator
 /// when calculating the average. This is equivalent to
 /// `torch.nn.AvgPool2d` with `count_include_pad=True`.
-#[derive(Module, Clone, Debug)]
+#[derive(Module, Debug)]
 #[module(custom_display)]
 pub struct AvgPool2d {
     /// Stride of the pooling.
@@ -51,6 +50,7 @@ pub struct AvgPool2d {
     /// Size of the kernel.
     pub kernel_size: [usize; 2],
     /// Padding configuration.
+    #[module(skip)]
     pub padding: PaddingConfig2d,
     /// If the padding is counted in the denominator when computing the average.
     pub count_include_pad: bool,
@@ -67,8 +67,8 @@ impl ModuleDisplay for AvgPool2d {
 
     fn custom_content(&self, content: Content) -> Option<Content> {
         content
-            .add("kernel_size", &alloc::format!("{:?}", &self.kernel_size))
-            .add("stride", &alloc::format!("{:?}", &self.stride))
+            .add("kernel_size", &alloc::format!("{:?}", self.kernel_size))
+            .add("stride", &alloc::format!("{:?}", self.stride))
             .add_debug_attribute("padding", &self.padding)
             .add("count_include_pad", &self.count_include_pad)
             .add("ceil_mode", &self.ceil_mode)
@@ -98,50 +98,30 @@ impl AvgPool2d {
     ///
     /// - input: `[batch_size, channels, height_in, width_in]`
     /// - output: `[batch_size, channels, height_out, width_out]`
-    pub fn forward<B: Backend>(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
+    pub fn forward(&self, input: Tensor<4>) -> Tensor<4> {
         let [_batch_size, _channels_in, height_in, width_in] = input.dims();
-
-        // Calculate padding as pairs - handles Same, Valid, and Explicit uniformly
-        let ((top, bottom), (left, right)) = self.padding.calculate_padding_2d_pairs(
+        let (padding_height, padding_width) = self.padding.calculate_padding_2d_pairs(
             height_in,
             width_in,
             &self.kernel_size,
             &self.stride,
         );
 
-        // TODO: Move asymmetric padding to functional level via PoolOptions
-        // See: https://github.com/tracel-ai/burn/issues/4362
-        // Handle asymmetric padding by applying explicit pad operation first
-        if top != bottom || left != right {
-            // Burn's pad takes (left, right, top, bottom) for the last two dimensions
-            let padded = input.pad((left, right, top, bottom), PadMode::Constant(0.0));
-            // Use zero padding for the pool operation since we already padded
-            avg_pool2d(
-                padded,
-                self.kernel_size,
-                self.stride,
-                [0, 0],
-                self.count_include_pad,
-                self.ceil_mode,
-            )
-        } else {
-            // Symmetric padding
-            avg_pool2d(
-                input,
-                self.kernel_size,
-                self.stride,
-                [top, left],
-                self.count_include_pad,
-                self.ceil_mode,
-            )
-        }
+        avg_pool2d(
+            input,
+            AvgPoolOptions::new(self.kernel_size)
+                .with_stride(self.stride)
+                .with_padding_pairs([padding_height, padding_width])
+                .with_count_include_pad(self.count_include_pad)
+                .with_ceil_mode(self.ceil_mode),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestBackend;
+    use burn::tensor::{Device, TensorData, Tolerance};
     use rstest::rstest;
 
     #[test]
@@ -153,7 +133,7 @@ mod tests {
         let pool = config.init();
 
         // Input: [batch=1, channels=2, height=5, width=5]
-        let input = Tensor::<TestBackend, 4>::ones([1, 2, 5, 5], &device);
+        let input = Tensor::<4>::ones([1, 2, 5, 5], &device);
         let output = pool.forward(input);
 
         // Same padding should preserve spatial dimensions
@@ -195,12 +175,89 @@ mod tests {
         let pool = config.init();
 
         // Input: [batch=1, channels=2, height=4, width=5]
-        let input = Tensor::<TestBackend, 4>::ones([1, 2, 4, 5], &device);
+        let input = Tensor::<4>::ones([1, 2, 4, 5], &device);
         let output = pool.forward(input);
 
         // Height: 4 + 1 + 3 = 8, output = (8 - 3) / 1 + 1 = 6
         // Width: 5 + 2 + 4 = 11, output = (11 - 3) / 1 + 1 = 9
         assert_eq!(output.dims(), [1, 2, 6, 9]);
+    }
+
+    #[test]
+    fn asymmetric_padding_excludes_pad_from_average() {
+        let device = Default::default();
+        let input = Tensor::<1>::from_data(
+            [
+                1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+                16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0,
+            ],
+            &device,
+        )
+        .reshape([1, 1, 5, 5]);
+        let pool = AvgPool2dConfig::new([2, 2])
+            .with_strides([2, 2])
+            .with_padding(PaddingConfig2d::Explicit(0, 0, 1, 1))
+            .with_count_include_pad(false)
+            .init();
+
+        let output = pool.forward(input);
+        let expected =
+            TensorData::from([[[[4.0f32, 6.0, 7.5], [14.0, 16.0, 17.5], [21.5, 23.5, 25.0]]]]);
+
+        output.to_data().assert_eq(&expected, true);
+    }
+
+    #[test]
+    fn fully_padded_windows_are_finite_and_count_flag_is_preserved() {
+        let device = Default::default();
+        let input = Tensor::from_data([[[[4.0f32]]]], &device);
+
+        let include_pad = AvgPool2dConfig::new([2, 2])
+            .with_strides([1, 1])
+            .with_padding(PaddingConfig2d::Explicit(2, 0, 0, 1))
+            .with_count_include_pad(true)
+            .init()
+            .forward(input.clone());
+        include_pad
+            .to_data()
+            .assert_eq(&TensorData::from([[[[0.0f32], [1.0]]]]), true);
+
+        let exclude_pad = AvgPool2dConfig::new([2, 2])
+            .with_strides([1, 1])
+            .with_padding(PaddingConfig2d::Explicit(2, 0, 0, 1))
+            .with_count_include_pad(false)
+            .init()
+            .forward(input);
+        exclude_pad
+            .to_data()
+            .assert_eq(&TensorData::from([[[[0.0f32], [4.0]]]]), true);
+    }
+
+    #[test]
+    fn asymmetric_padding_excludes_pad_from_gradients() {
+        let device = Device::default().autodiff();
+        let input = Tensor::ones([1, 1, 5, 5], &device).require_grad();
+        let pool = AvgPool2dConfig::new([2, 2])
+            .with_strides([2, 2])
+            .with_padding(PaddingConfig2d::Explicit(0, 0, 1, 1))
+            .with_count_include_pad(false)
+            .init();
+
+        let output = pool.forward(input.clone());
+        let gradients = output.sum().backward();
+        let expected = TensorData::from([[[
+            [0.25f32, 0.25, 0.25, 0.25, 0.5],
+            [0.25, 0.25, 0.25, 0.25, 0.5],
+            [0.25, 0.25, 0.25, 0.25, 0.5],
+            [0.25, 0.25, 0.25, 0.25, 0.5],
+            [0.5, 0.5, 0.5, 0.5, 1.0],
+        ]]]);
+
+        input
+            .grad(&gradients)
+            .unwrap()
+            .to_data()
+            .assert_approx_eq::<f32>(&expected, Tolerance::default());
     }
 
     #[test]
@@ -213,7 +270,7 @@ mod tests {
         let pool = config.init();
 
         // Input: [batch=1, channels=2, height=4, width=5]
-        let input = Tensor::<TestBackend, 4>::ones([1, 2, 4, 5], &device);
+        let input = Tensor::<4>::ones([1, 2, 4, 5], &device);
         let output = pool.forward(input);
 
         // Height: 4 + 2 + 2 = 8, output = (8 - 3) / 1 + 1 = 6

@@ -1,8 +1,11 @@
+// This sample exists to validate a burn-tch install, so naming the deprecated crate is the point.
+#![allow(deprecated)]
+
 use burn_backend::{TensorMetadata, ops::FloatTensorOps};
 use burn_tch::{LibTorch, LibTorchDevice};
 
 fn main() {
-    type B = LibTorch<f32>;
+    type B = LibTorch;
     let device = LibTorchDevice::Cpu;
 
     // Creation of two tensors, the first with explicit values and the second one with ones, with the same shape as the first

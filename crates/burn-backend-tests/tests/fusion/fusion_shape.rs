@@ -11,7 +11,6 @@
 
 use super::*;
 use burn_fusion::inspect::{BlockKind, FusionInspector, matchers};
-use burn_tensor::backend::Backend;
 
 /// `a + b` followed by `exp` should collapse into a single element-wise fused kernel.
 #[test]
@@ -25,12 +24,12 @@ fn elementwise_add_then_exp_fuses_into_single_kernel() {
         let a = TestTensor::<2>::ones([4, 4], &device);
         let b = TestTensor::<2>::ones([4, 4], &device);
         let dtype = a.dtype();
-        TestBackend::sync(&device).unwrap();
+        device.sync().unwrap();
 
         let inspector = FusionInspector::install(stream);
         let out = (a + b).exp();
         let _ = out.into_data();
-        TestBackend::sync(&device).unwrap();
+        device.sync().unwrap();
 
         let reports = inspector.drain();
         assert!(!reports.is_empty(), "expected at least one fusion report");
@@ -65,11 +64,11 @@ fn sync_between_ops_splits_into_separate_kernels() {
         let dtype = intermediate.dtype();
 
         // Force materialization of the intermediate.
-        TestBackend::sync(&device).unwrap();
+        device.sync().unwrap();
 
         let out = intermediate.exp();
         let _ = out.into_data();
-        TestBackend::sync(&device).unwrap();
+        device.sync().unwrap();
 
         let reports = inspector.drain();
 
@@ -116,13 +115,13 @@ fn chained_elementwise_ops_fuse_together() {
         let a = TestTensor::<2>::ones([8, 8], &device);
         let b = TestTensor::<2>::ones([8, 8], &device);
         let c = TestTensor::<2>::ones([8, 8], &device);
-        TestBackend::sync(&device).unwrap();
+        device.sync().unwrap();
 
         let inspector = FusionInspector::install(stream);
         // add → mul → exp, all element-wise on the same shape.
         let out = ((a + b) * c).exp();
         let _ = out.into_data();
-        TestBackend::sync(&device).unwrap();
+        device.sync().unwrap();
 
         let reports = inspector.drain();
 
@@ -162,7 +161,7 @@ fn elementwise_and_creation_into_single_kernel() {
 
     // Materialize the base tensor so it doesn't land in the inspector's first report.
     let original = TestTensor::<2>::ones([8, 8], &device);
-    TestBackend::sync(&device).unwrap();
+    device.sync().unwrap();
 
     let inspector = FusionInspector::install(stream);
 
@@ -173,7 +172,7 @@ fn elementwise_and_creation_into_single_kernel() {
     }
 
     let _ = tmp.into_data();
-    TestBackend::sync(&device).unwrap();
+    device.sync().unwrap();
 
     let reports = inspector.drain();
     assert!(!reports.is_empty(), "expected at least one fusion report");
@@ -220,5 +219,59 @@ fn elementwise_and_creation_into_single_kernel() {
         non_drop_ops, expected_ops,
         "expected {expected_ops} non-Drop ops in the fused block, got {non_drop_ops}\n\n{tables}",
     );
+    });
+}
+
+/// A lone view (`swap_dims`) whose original tensor isn't otherwise read must NOT be fused: it runs
+/// eagerly as a cheap shape/stride update, so the following element-wise math reads a clean,
+/// vectorizable layout instead of recomputing the transposed index on every element.
+///
+/// Regression guard for the "view fix": previously the swap-dims was fused into the element-wise
+/// kernel (the original registered as a fresh input, read *through* the transpose), which defeats
+/// vectorization for no benefit when the original is used nowhere else.
+#[test]
+fn lone_view_is_not_fused_into_kernel() {
+    let stream = test_stream();
+    stream.executes(|| {
+        let device = Default::default();
+
+        // Materialize the inputs so their `ones` init ops don't land in the inspected reports.
+        let a = TestTensor::<2>::ones([4, 8], &device);
+        let b = TestTensor::<2>::ones([8, 4], &device);
+        device.sync().unwrap();
+
+        let inspector = FusionInspector::install(stream);
+
+        // `swap_dims` is the only use of `a`.
+        let out = (a.swap_dims(0, 1) + b).exp();
+        let _ = out.into_data();
+        device.sync().unwrap();
+
+        let reports = inspector.drain();
+        let tables: String = reports
+            .iter()
+            .map(|r| r.format_table())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let is_swap = matchers::is_swap_dims();
+
+        // The view must never end up inside a fused kernel.
+        assert!(
+            reports
+                .iter()
+                .flat_map(|r| r.fused_blocks())
+                .all(|blk| !blk.operations.iter().any(|op| is_swap(op))),
+            "swap_dims must not be fused (view fix):\n\n{tables}",
+        );
+
+        // ...and it must actually run, in an un-fused block.
+        assert!(
+            reports
+                .iter()
+                .flat_map(|r| r.unfused_blocks())
+                .any(|blk| blk.operations.iter().any(|op| is_swap(op))),
+            "swap_dims should run eagerly in an un-fused block:\n\n{tables}",
+        );
     });
 }

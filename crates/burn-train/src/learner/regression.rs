@@ -1,46 +1,41 @@
 use crate::metric::processor::ItemLazy;
 use crate::metric::{Adaptor, LossInput};
-use burn_core::tensor::backend::Backend;
-use burn_core::tensor::{Tensor, Transaction};
-use burn_flex::Flex;
+use burn_core::tensor::Tensor;
+use burn_std::ExecutionError;
 
 /// Regression output adapted for the loss metric.
 #[derive(new)]
-pub struct RegressionOutput<B: Backend> {
+pub struct RegressionOutput {
     /// The loss.
-    pub loss: Tensor<B, 1>,
+    pub loss: Tensor<1>,
 
     /// The predicted values. Shape: \[batch_size, num_targets\].
-    pub output: Tensor<B, 2>,
+    pub output: Tensor<2>,
 
     /// The ground truth values. Shape: \[batch_size, num_targets\].
-    pub targets: Tensor<B, 2>,
+    pub targets: Tensor<2>,
 }
 
-impl<B: Backend> Adaptor<LossInput<B>> for RegressionOutput<B> {
-    fn adapt(&self) -> LossInput<B> {
+impl Adaptor<LossInput> for RegressionOutput {
+    fn adapt(&self) -> LossInput {
         LossInput::new(self.loss.clone())
     }
 }
 
-impl<B: Backend> ItemLazy for RegressionOutput<B> {
-    type ItemSync = RegressionOutput<Flex>;
+impl ItemLazy for RegressionOutput {
+    fn sync(self) -> Result<Self, ExecutionError> {
+        // No readback: the metrics compute on the device the tensors live on
+        // and read back only their final scalars. Flushing dispatches the
+        // producing stream's buffered work so the metric thread doesn't wait
+        // on an idle queue; a training item's float tensors come off the
+        // autodiff backend entirely, so the metric thread neither retains the
+        // tape nor pays its dispatch.
+        self.loss.device().flush()?;
 
-    fn sync(self) -> Self::ItemSync {
-        let [output, loss, targets] = Transaction::default()
-            .register(self.output)
-            .register(self.loss)
-            .register(self.targets)
-            .execute()
-            .try_into()
-            .expect("Correct amount of tensor data");
-
-        let device = &Default::default();
-
-        RegressionOutput {
-            output: Tensor::from_data(output, device),
-            loss: Tensor::from_data(loss, device),
-            targets: Tensor::from_data(targets, device),
-        }
+        Ok(RegressionOutput {
+            output: self.output.without_autodiff(),
+            loss: self.loss.without_autodiff(),
+            targets: self.targets.without_autodiff(),
+        })
     }
 }

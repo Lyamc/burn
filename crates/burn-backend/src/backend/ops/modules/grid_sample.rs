@@ -1,5 +1,5 @@
 use crate::{
-    Backend, TensorMetadata, get_device_settings,
+    Backend, TensorMetadata, get_or_init_device_settings,
     ops::{GridSampleOptions, GridSamplePaddingMode, InterpolateMode},
     tensor::FloatTensor,
 };
@@ -52,7 +52,7 @@ fn float_grid_sample_2d_bilinear<B: Backend>(
     let w_out = grid.shape()[2];
     let spatial_in = h_in * w_in;
     let spatial_out = h_out * w_out;
-    let device = B::float_device(&tensor);
+    let device = tensor.device();
 
     // Separate x and y coordinates from grid
     // shape: (N, H_out, W_out, 1)
@@ -131,7 +131,7 @@ fn float_grid_sample_2d_bilinear<B: Backend>(
     let y_frac = B::float_sub(grid_y.clone(), grid_y_floored.clone());
 
     // Convert to integer indices
-    let settings = get_device_settings::<B>(&device);
+    let settings = get_or_init_device_settings::<B>(&device);
     let x0 = B::float_into_int(grid_x_floored.clone(), settings.int_dtype);
     let y0 = B::float_into_int(grid_y_floored.clone(), settings.int_dtype);
     let x1 = B::float_into_int(

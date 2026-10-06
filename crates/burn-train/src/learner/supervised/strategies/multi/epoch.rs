@@ -2,25 +2,21 @@ use crate::learner::base::Interrupter;
 use crate::metric::processor::{EventProcessorTraining, LearnerEvent, TrainingItem};
 use crate::train::MultiDevicesTrainStep;
 use crate::{
-    Learner, LearningComponentsTypes, MultiDeviceOptim, SupervisedTrainingEventProcessor,
-    TrainLoader, TrainingBackend,
+    Learner, LearnerModel, MultiDeviceOptim, SupervisedTrainingEventProcessor, TrainLoader,
 };
 use burn_core::data::dataloader::Progress;
-use burn_core::prelude::DeviceOps;
 use burn_core::tensor::Device;
-use burn_core::tensor::backend::DeviceId;
 use burn_optim::GradientsAccumulator;
 use burn_optim::MultiGradientsParams;
-use std::collections::HashMap;
 
 /// A training epoch.
 #[derive(new)]
-pub struct MultiDeviceTrainEpoch<LC: LearningComponentsTypes> {
-    dataloaders: Vec<TrainLoader<LC>>,
+pub struct MultiDeviceTrainEpoch<M: LearnerModel> {
+    dataloaders: Vec<TrainLoader<M>>,
     grad_accumulation: Option<usize>,
 }
 
-impl<LC: LearningComponentsTypes> MultiDeviceTrainEpoch<LC> {
+impl<M: LearnerModel> MultiDeviceTrainEpoch<M> {
     /// Runs the training epoch on multiple devices.
     ///
     /// # Arguments
@@ -37,11 +33,11 @@ impl<LC: LearningComponentsTypes> MultiDeviceTrainEpoch<LC> {
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
-        learner: &mut Learner<LC>,
+        learner: &mut Learner<M>,
         global_progress: &Progress,
-        event_processor: &mut SupervisedTrainingEventProcessor<LC>,
+        event_processor: &mut SupervisedTrainingEventProcessor<M>,
         interrupter: &Interrupter,
-        devices: Vec<Device<TrainingBackend<LC>>>,
+        devices: Vec<Device>,
         strategy: MultiDeviceOptim,
     ) {
         match strategy {
@@ -64,11 +60,11 @@ impl<LC: LearningComponentsTypes> MultiDeviceTrainEpoch<LC> {
 
     fn run_optim_main(
         &self,
-        learner: &mut Learner<LC>,
+        learner: &mut Learner<M>,
         global_progress: &Progress,
-        event_processor: &mut SupervisedTrainingEventProcessor<LC>,
+        event_processor: &mut SupervisedTrainingEventProcessor<M>,
         interrupter: &Interrupter,
-        devices: Vec<Device<TrainingBackend<LC>>>,
+        devices: Vec<Device>,
     ) {
         let epoch = global_progress.items_processed;
         log::info!(
@@ -87,18 +83,22 @@ impl<LC: LearningComponentsTypes> MultiDeviceTrainEpoch<LC> {
         let mut accumulation_current = 0;
 
         let accumulation = self.grad_accumulation.unwrap_or(1);
-        let step = MultiDevicesTrainStep::<LC>::new(&devices);
+        let step = MultiDevicesTrainStep::<M>::new(&devices);
 
         // The main device is always the first in the list.
         let device_main = devices.first().expect("A minimum of one device.").clone();
 
         loop {
-            let (items, progress) = step.step(iterators.as_mut_slice(), &learner.model());
+            let (items, progress) = match step.step(iterators.as_mut_slice(), &learner.model()) {
+                Ok(result) => result,
+                Err(err) => {
+                    interrupter.fail(err);
+                    break;
+                }
+            };
             if items.is_empty() {
                 break;
             }
-
-            learner.lr_step();
 
             let mut progress_items = Vec::with_capacity(items.len());
             for item in items.into_iter() {
@@ -109,8 +109,9 @@ impl<LC: LearningComponentsTypes> MultiDeviceTrainEpoch<LC> {
 
             accumulation_current += 1;
 
-            if accumulation <= accumulation_current {
+            if accumulation <= accumulation_current || progress.is_completed() {
                 let grads = accumulator.grads();
+                learner.lr_step();
                 learner.optimizer_step(grads);
                 accumulation_current = 0;
             }
@@ -120,29 +121,28 @@ impl<LC: LearningComponentsTypes> MultiDeviceTrainEpoch<LC> {
                 let item = TrainingItem::new(
                     item,
                     progress.clone(),
-                    global_progress.clone(),
                     Some(iteration),
                     Some(learner.lr_current()),
                 );
 
-                event_processor.process_train(LearnerEvent::ProcessedItem(item));
+                interrupter.fail_on_error(
+                    event_processor.process_train(LearnerEvent::ProcessedItem(item)),
+                );
             }
 
             if interrupter.should_stop() {
                 break;
             }
         }
-
-        event_processor.process_train(LearnerEvent::EndEpoch(epoch));
     }
 
     fn run_optim_distr(
         &self,
-        learner: &mut Learner<LC>,
+        learner: &mut Learner<M>,
         global_progress: &Progress,
-        event_processor: &mut SupervisedTrainingEventProcessor<LC>,
+        event_processor: &mut SupervisedTrainingEventProcessor<M>,
         interrupter: &Interrupter,
-        devices: Vec<Device<TrainingBackend<LC>>>,
+        devices: Vec<Device>,
     ) {
         let epoch = global_progress.items_processed;
         log::info!(
@@ -157,41 +157,42 @@ impl<LC: LearningComponentsTypes> MultiDeviceTrainEpoch<LC> {
             .map(|d| d.iter())
             .collect::<Vec<_>>();
         let mut iteration = 0;
-        let mut accumulators = HashMap::<
-            DeviceId,
-            GradientsAccumulator<<LC as LearningComponentsTypes>::TrainingModel>,
-        >::new();
-        for device in devices.iter() {
-            accumulators.insert(device.to_id(), GradientsAccumulator::new());
-        }
+        let mut accumulators: Vec<GradientsAccumulator<_>> = (0..devices.len())
+            .map(|_| GradientsAccumulator::new())
+            .collect();
         let mut accumulation_current = 0;
 
         let accumulation = self.grad_accumulation.unwrap_or(1);
-        let step = MultiDevicesTrainStep::<LC>::new(&devices);
+        let step = MultiDevicesTrainStep::<M>::new(&devices);
 
         loop {
-            let (items, progress) = step.step(iterators.as_mut_slice(), &learner.model());
+            let (items, progress) = match step.step(iterators.as_mut_slice(), &learner.model()) {
+                Ok(result) => result,
+                Err(err) => {
+                    interrupter.fail(err);
+                    break;
+                }
+            };
             if items.is_empty() {
                 break;
             }
 
-            learner.lr_step();
-
             let mut progress_items = Vec::with_capacity(items.len());
             for item in items.into_iter() {
-                let accumulator = accumulators.get_mut(&item.device).unwrap();
+                let accumulator = &mut accumulators[item.device_id];
                 accumulator.accumulate(&learner.model(), item.output.grads);
                 progress_items.push(item.output.item);
             }
 
             accumulation_current += 1;
 
-            if accumulation <= accumulation_current {
+            if accumulation <= accumulation_current || progress.is_completed() {
                 let mut grads = MultiGradientsParams::default();
-                for (device_id, accumulator) in accumulators.iter_mut() {
+                for (device_id, accumulator) in accumulators.iter_mut().enumerate() {
                     let grad = accumulator.grads();
-                    grads.grads.push((grad, *device_id));
+                    grads.grads.push((grad, devices[device_id].clone()));
                 }
+                learner.lr_step();
                 learner.optimizer_step_multi(grads);
                 accumulation_current = 0;
             }
@@ -201,19 +202,18 @@ impl<LC: LearningComponentsTypes> MultiDeviceTrainEpoch<LC> {
                 let item = TrainingItem::new(
                     item,
                     progress.clone(),
-                    global_progress.clone(),
                     Some(iteration),
                     Some(learner.lr_current()),
                 );
 
-                event_processor.process_train(LearnerEvent::ProcessedItem(item));
+                interrupter.fail_on_error(
+                    event_processor.process_train(LearnerEvent::ProcessedItem(item)),
+                );
             }
 
             if interrupter.should_stop() {
                 break;
             }
         }
-
-        event_processor.process_train(LearnerEvent::EndEpoch(epoch));
     }
 }

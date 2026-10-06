@@ -1,5 +1,6 @@
 use super::*;
-use burn_tensor::{TensorData, Tolerance, backend::Backend};
+use burn_fusion::inspect::FusionInspector;
+use burn_tensor::{ElementConversion, TensorData, Tolerance};
 
 #[test]
 fn test_reduce_broadcasted_1() {
@@ -15,7 +16,7 @@ fn test_reduce_broadcasted_1() {
         .float();
 
     // Forces previous tensors to be materialized.
-    TestBackend::sync(&device).unwrap();
+    device.sync().unwrap();
 
     let x = tensor + fused_on_read.clone();
     let x = x.sum_dim(1);
@@ -52,7 +53,7 @@ fn test_reduce_broadcasted_2() {
         .float();
 
     // Forces previous tensors to be materialized.
-    TestBackend::sync(&device).unwrap();
+    device.sync().unwrap();
 
     let x = tensor + fused_on_read.clone();
     let x = x.sum_dim(1);
@@ -60,7 +61,7 @@ fn test_reduce_broadcasted_2() {
     let x = x.mean_dim(1);
 
     let end = x + y;
-    TestBackend::sync(&device).unwrap();
+    device.sync().unwrap();
 
     let actual = end.into_data();
     let expected = TensorData::from([
@@ -70,6 +71,24 @@ fn test_reduce_broadcasted_2() {
         [539.5, 540.5, 541.5, 542.5, 543.5, 544.5, 545.5, 546.5],
     ]);
     actual.assert_approx_eq::<FloatElem>(&expected, Tolerance::default());
+}
+
+#[test]
+fn test_reduce_broadcasted_empty_axis() {
+    let device = Default::default();
+    let tensor = TestTensor::<2>::zeros([4, 0], &device);
+    let fused_on_read = TestTensor::<2>::zeros([4, 0], &device);
+    let fused_on_write =
+        TestTensor::<2>::from_data(TensorData::from([[1.0], [2.0], [3.0], [4.0]]), &device);
+
+    device.sync().unwrap();
+
+    let x = tensor + fused_on_read.clone();
+    let x = x.sum_dim(1);
+    let end = x + fused_on_write;
+
+    let actual = end.into_data();
+    actual.assert_eq(&TensorData::from([[1.0], [2.0], [3.0], [4.0]]), false);
 }
 
 #[test]
@@ -90,7 +109,7 @@ fn test_reduce_broadcasted_3() {
         .float();
 
     // Forces previous tensors to be materialized.
-    TestBackend::sync(&device).unwrap();
+    device.sync().unwrap();
 
     let x = tensor + fused_on_read.clone();
     let x = x.sum_dim(1);
@@ -130,7 +149,7 @@ fn test_reduce_broadcasted_4_reused_partial() {
         .float();
 
     // Forces previous tensors to be materialized.
-    TestBackend::sync(&device).unwrap();
+    device.sync().unwrap();
 
     // In fusion we have to create a global buffer to keep the intermediate data for now.
     let x_previous = tensor + fused_on_read;
@@ -155,4 +174,193 @@ fn test_reduce_broadcasted_4_reused_partial() {
         ],
     ]);
     actual.assert_approx_eq::<FloatElem>(&expected, Tolerance::default());
+}
+
+// ---------------------------------------------------------------------------
+// Regression test [#5201](https://github.com/tracel-ai/burn/issues/5202):
+// A masked softmax fused by `ReduceBroadcastedFuser` was producing wrong values on wgpu.
+// Identical wrong value every run (e.g. row 0 = 59874.13 instead of 1),
+#[test]
+fn test_reduce_broadcasted_masked_softmax() {
+    let device = Default::default();
+    let [d0, q, k] = [6usize, 96, 96];
+    let n = (d0 * q * k) as i64;
+
+    let x = TestTensorInt::<1>::arange(0..n, &device)
+        .reshape([d0, q, k])
+        .float();
+    let x = (x / (n as f32) - 0.5) * 20.0;
+
+    let q_idx = TestTensorInt::<1>::arange(0..q as i64, &device).reshape([q, 1]);
+    let k_idx = TestTensorInt::<1>::arange(0..k as i64, &device).reshape([1, k]);
+    let mask = k_idx.greater(q_idx).reshape([1, q, k]);
+    device.sync().unwrap();
+
+    // Softmax over the last dim of the masked scores.
+    let scores = x.clone().mask_fill(mask, -10000.0);
+    let max = scores.clone().max_dim(2);
+    let e = (scores - max).exp();
+    let sum = e.clone().sum_dim(2);
+    let actual = (e / sum).into_data();
+
+    // Host reference: the same causal-masked softmax, row by row.
+    let xs = x.into_data();
+    let xs = xs.as_slice::<FloatElem>().unwrap();
+    let mut expected = vec![0f32; d0 * q * k];
+    for o in 0..(d0 * q) {
+        let qi = o % q;
+        let row: Vec<f32> = (0..k)
+            .map(|c| {
+                if c > qi {
+                    -10000.0
+                } else {
+                    xs[o * k + c].elem()
+                }
+            })
+            .collect();
+        let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = row.iter().map(|v| (v - m).exp()).collect();
+        let s: f32 = exps.iter().sum();
+        for c in 0..k {
+            expected[o * k + c] = exps[c] / s;
+        }
+    }
+
+    assert!(
+        actual
+            .as_slice::<FloatElem>()
+            .unwrap()
+            .iter()
+            .all(|v| v.is_finite()),
+        "fused masked softmax produced non-finite output at [6, 96, 96]",
+    );
+    actual.assert_approx_eq::<FloatElem>(
+        &TensorData::new(expected, [d0, q, k]),
+        Tolerance::permissive(),
+    );
+}
+
+#[test]
+fn test_reduce_broadcasted_max_nan() {
+    let stream = test_stream();
+    stream.executes(|| {
+        let device = Default::default();
+        let tensor = TestTensor::<2>::zeros([2, 4], &device);
+        let fused_on_read = TestTensor::<2>::from_data(
+            TensorData::from([[1.0, f32::NAN, 3.0, 2.0], [1.0, 4.0, 3.0, 2.0]]),
+            &device,
+        );
+        let fused_on_write = TestTensor::<2>::zeros([2, 1], &device);
+
+        // Materialize the inputs before recording the fused graph.
+        device.sync().unwrap();
+        let inspector = FusionInspector::install(stream);
+
+        let output = tensor + fused_on_read.clone();
+        let output = output.max_dim(1);
+        let output = output + fused_on_write;
+        let output = output + fused_on_read;
+        let output = output + 1.0;
+        let actual = output.into_data();
+        device.sync().unwrap();
+
+        let expected = TensorData::from([
+            [f32::NAN, f32::NAN, f32::NAN, f32::NAN],
+            [6.0, 9.0, 8.0, 7.0],
+        ]);
+        actual.assert_approx_eq::<FloatElem>(&expected, Tolerance::default());
+
+        let reports = inspector.drain();
+        assert!(
+            reports
+                .iter()
+                .flat_map(|report| report.fused_blocks())
+                .any(|block| block.fuser_name() == Some("ReduceBroadcasted")),
+            "expected ReduceBroadcasted fusion, got {reports:#?}"
+        );
+    });
+}
+
+/// Elementwise ops around a reduction, so fusion builds a `Reduce` block.
+fn fused_reduce_graph(rows: usize) -> TestTensor<2> {
+    let device = Default::default();
+    let tensor = TestTensor::<2>::ones([rows, 8], &device);
+
+    // Materialize the inputs so they are not fused into the graph.
+    device.sync().unwrap();
+
+    (tensor * 2.0).sum_dim(1) + 1.0
+}
+
+/// The reduce input is read again after the reduction, so fusion builds a `ReduceBroadcasted`
+/// block.
+fn fused_reduce_broadcasted_graph(rows: usize) -> TestTensor<2> {
+    let device = Default::default();
+    let tensor = TestTensor::<2>::ones([rows, 8], &device);
+    let fused_on_read = TestTensor::<2>::ones([rows, 8], &device);
+    let fused_on_write = TestTensor::<2>::ones([rows, 1], &device);
+
+    device.sync().unwrap();
+
+    let output = tensor + fused_on_read.clone();
+    let output = output.sum_dim(1);
+    let output = output + fused_on_write;
+    let output = output + fused_on_read;
+    output + 1.0
+}
+
+/// Runs `graph` non-empty so fusion caches it, then replays it with a zero-length axis that is
+/// not the reduced one, checking both runs go through the `fuser` block.
+fn assert_fused_graph_handles_empty_output(
+    graph: fn(usize) -> TestTensor<2>,
+    fuser: &str,
+    expected: TensorData,
+    empty_dims: [usize; 2],
+) {
+    let stream = test_stream();
+    stream.executes(|| {
+        let device: burn_tensor::Device = Default::default();
+
+        for rows in [4, 0] {
+            let inspector = FusionInspector::install(stream);
+            let actual = graph(rows).into_data();
+            device.sync().unwrap();
+
+            if rows == 0 {
+                assert_eq!(actual.shape().as_slice(), empty_dims);
+                assert_eq!(actual.num_elements(), 0);
+            } else {
+                actual.assert_eq(&expected, false);
+            }
+
+            let reports = inspector.drain();
+            assert!(
+                reports
+                    .iter()
+                    .flat_map(|report| report.fused_blocks())
+                    .any(|block| block.fuser_name() == Some(fuser)),
+                "expected {fuser} fusion for {rows} rows, got {reports:#?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn test_fused_reduce_empty_output() {
+    assert_fused_graph_handles_empty_output(
+        fused_reduce_graph,
+        "Reduce",
+        TensorData::from([[17.0], [17.0], [17.0], [17.0]]),
+        [0, 1],
+    );
+}
+
+#[test]
+fn test_reduce_broadcasted_empty_output() {
+    assert_fused_graph_handles_empty_output(
+        fused_reduce_broadcasted_graph,
+        "ReduceBroadcasted",
+        TensorData::from([[19.0; 8]; 4]),
+        [0, 8],
+    );
 }

@@ -7,7 +7,7 @@ use crate::engine::codegen::{
 use cubecl::{
     intrinsic,
     prelude::*,
-    quant::scheme::{QuantLevel, QuantScheme},
+    quant::scheme::QuantScheme,
     std::{
         FastDivmod,
         quant::{
@@ -15,18 +15,18 @@ use cubecl::{
             view::{QuantizedView, run_with_quant_type},
         },
         tensor::{
-            View, ViewExpand,
+            View, ViewExpand, ViewMut,
             layout::{Coords1d, Coords2d, VirtualLayout},
         },
     },
 };
 use cubek::{
-    matmul::{
+    matmul::multi_level::{
+        args::{BatchedCoords, MatmulArgs},
         components::global::memory::{
             BatchLayout, BlockScaledLayout, GlobalLayout, GlobalLayoutConfig, GlobalLayoutExpand,
             GlobalScaleLayout, GlobalScaleLayoutExpand, NoopLayout,
         },
-        launch::{BatchedCoords, MatmulArgs},
     },
     std::MatrixLayout,
 };
@@ -121,10 +121,9 @@ impl MatmulArgs for FusedMatmulArgs {
 
     fn view_lhs<Lhs: CubePrimitive, Rhs: CubePrimitive, EO: CubePrimitive>(
         state: &Self::State<Lhs, Rhs, EO>,
-    ) -> View<Lhs, BatchedCoords> {
+    ) -> View<'_, Lhs, BatchedCoords> {
         global_view(
             &state.inputs,
-            &state.locals,
             &state.batch_shape,
             comptime![state.a.clone()],
             comptime![state.config.clone()],
@@ -141,10 +140,9 @@ impl MatmulArgs for FusedMatmulArgs {
 
     fn view_rhs<Lhs: CubePrimitive, Rhs: CubePrimitive, EO: CubePrimitive>(
         state: &Self::State<Lhs, Rhs, EO>,
-    ) -> View<Rhs, BatchedCoords> {
+    ) -> View<'_, Rhs, BatchedCoords> {
         global_view(
             &state.inputs,
-            &state.locals,
             &state.batch_shape,
             comptime![state.b.clone()],
             comptime![state.config.clone()],
@@ -161,12 +159,11 @@ impl MatmulArgs for FusedMatmulArgs {
 
     fn view_acc<Lhs: CubePrimitive, Rhs: CubePrimitive, EO: CubePrimitive>(
         state: &Self::State<Lhs, Rhs, EO>,
-    ) -> ComptimeOption<View<EO, BatchedCoords>> {
+    ) -> ComptimeOption<View<'_, EO, BatchedCoords>> {
         match comptime![state.c.clone()] {
             Some(c) => {
                 let view = global_view(
                     &state.inputs,
-                    &state.locals,
                     &state.batch_shape,
                     c,
                     comptime![state.config.clone()],
@@ -183,15 +180,15 @@ impl MatmulArgs for FusedMatmulArgs {
         batch: usize,
     ) -> usize {
         #[comptime]
-        match state.c_batch {
+        match &state.c_batch {
             ComptimeOption::Some(c_batch) => c_batch.to_source_pos(batch),
             ComptimeOption::None => batch,
         }
     }
 
     fn view_out<Lhs: CubePrimitive, Rhs: CubePrimitive, EO: CubePrimitive>(
-        state: &mut Self::State<Lhs, Rhs, EO>,
-    ) -> View<EO, BatchedCoords, ReadWrite> {
+        state: &Self::State<Lhs, Rhs, EO>,
+    ) -> ViewMut<'_, EO, BatchedCoords> {
         let rank = comptime![state.config.rank];
 
         let shape_row = state.locals.ref_shape[rank - 2] as u32;
@@ -199,6 +196,9 @@ impl MatmulArgs for FusedMatmulArgs {
 
         let stride_row = state.locals.ref_strides[rank - 2];
         let stride_col = state.locals.ref_strides[rank - 1];
+
+        let mut outputs = state.outputs.clone();
+        let mut locals = state.locals.clone();
 
         let layout = GlobalLayout::new(
             VirtualLayout::new::<NoopLayout>(NoopLayout::new()),
@@ -210,14 +210,14 @@ impl MatmulArgs for FusedMatmulArgs {
             1u32,
             state.out_layout_config,
         );
-        let mut buffer = FusedOutput::new(
+        let buffer = FusedOutput::new(
             &state.inputs,
-            &mut state.outputs,
-            &mut state.locals,
+            &mut outputs,
+            &mut locals,
             comptime![state.out.clone()],
             comptime![state.config.clone()],
         );
-        View::new_mut::<FusedOutput, Coords1d>(&mut buffer, layout)
+        ViewMut::new::<FusedOutput, Coords1d>(buffer, layout)
     }
 
     fn batch_out<Lhs: CubePrimitive, Rhs: CubePrimitive, EO: CubePrimitive>(
@@ -237,12 +237,11 @@ impl MatmulArgs for FusedMatmulArgs {
 #[allow(clippy::missing_transmute_annotations)]
 fn global_view<E: CubePrimitive>(
     inputs: &GlobalArgs,
-    locals: &LocalArgs,
     batch_shape: &Sequence<FastDivmod<u32>>,
     #[comptime] arg: MatmulArg,
     #[comptime] config: FuseBlockConfig,
     #[comptime] layout_config: GlobalLayoutConfig,
-) -> View<E, BatchedCoords> {
+) -> View<'static, E, BatchedCoords> {
     let rank = comptime![config.rank];
     let data = comptime![arg.data().clone()];
     let data_tensor = match comptime![data.clone()] {
@@ -285,14 +284,18 @@ fn global_view<E: CubePrimitive>(
         layout_config,
         packing,
     );
-    let data_buf = GlobalInput::new(inputs, locals, data, comptime![config.clone()], None);
+    let data_buf = GlobalInput::new(inputs, data);
 
     match comptime![arg.clone()] {
-        MatmulArg::Normal(_) => View::new::<GlobalInput, Coords1d>(&data_buf, data_layout),
+        MatmulArg::Normal(_) => View::new::<GlobalInput, Coords1d>(data_buf, data_layout),
         MatmulArg::Quantized { scales, scheme, .. } => {
-            let scales_layout = match comptime![scheme.level] {
-                QuantLevel::Tensor => GlobalScaleLayout::new_PerTensor(shape),
-                QuantLevel::Block(block_size) => {
+            comptime!(assert!(
+                burn_std::quantization::global_scale_dtype(&scheme).is_none(),
+                "two-level quantization is not supported in fused matmul yet"
+            ));
+            let scales_layout = match comptime![scheme.block_size()] {
+                None => GlobalScaleLayout::new_PerTensor(shape),
+                Some(block_size) => {
                     let block_size = comptime![block_size.as_dim::<2>()];
 
                     let scales_arg = comptime![MatmulArg::Normal(scales.clone())];
@@ -320,11 +323,11 @@ fn global_view<E: CubePrimitive>(
                     ))
                 }
             };
-            let scales_buf = GlobalInput::new(inputs, locals, scales, config, None);
+            let scales_buf = GlobalInput::new(inputs, scales);
 
             // Redefine because of `Numeric` bound, kinda hacky but I can't figure out a way to
             // assert `Vector<T: Numeric>::Scalar: Numeric`
-            let define!(T) = storage_type_of::<E::Scalar>();
+            let define!(T) = elem_type_of::<E::Scalar>();
             let view = create_quant_view_dynamic::<T, E::Size>(
                 data_buf,
                 data_layout,
@@ -402,7 +405,7 @@ fn global_layout(
 }
 
 struct CreateQuantView<'a, E: Numeric, N: Size> {
-    scope: &'a mut Scope,
+    scope: &'a Scope,
     data_buf: GlobalInputExpand,
     data_layout: GlobalLayoutExpand,
     scales_buf: GlobalInputExpand,
@@ -412,7 +415,7 @@ struct CreateQuantView<'a, E: Numeric, N: Size> {
 }
 
 impl<'a, E: Numeric, N: Size> RunWithQuantType for CreateQuantView<'a, E, N> {
-    type Output = ViewExpand<Vector<E, N>, BatchedCoords>;
+    type Output = ViewExpand<'static, Vector<E, N>, BatchedCoords>;
 
     fn execute<Q: Scalar, S: Scalar>(self) -> Self::Output {
         create_quant_view::expand::<E, N, Q, S>(
@@ -434,7 +437,7 @@ fn create_quant_view_dynamic<E: Numeric, N: Size>(
     scales_buf: GlobalInput,
     scales_layout: GlobalScaleLayout,
     #[comptime] scheme: QuantScheme,
-) -> View<Vector<E, N>, BatchedCoords> {
+) -> View<'static, Vector<E, N>, BatchedCoords> {
     intrinsic!(|scope| {
         let func = CreateQuantView {
             scope,
@@ -456,14 +459,16 @@ fn create_quant_view<E: Numeric, N: Size, Q: Scalar, S: Scalar>(
     scales_buf: GlobalInput,
     scales_layout: GlobalScaleLayout,
     #[comptime] scheme: QuantScheme,
-) -> View<Vector<E, N>, BatchedCoords> {
+) -> View<'static, Vector<E, N>, BatchedCoords> {
     let size!(NQ) = N::value().comptime() / scheme.num_quants();
 
     let data_view: View<Vector<Q, NQ>, BatchedCoords> =
-        View::new::<GlobalInput, Coords1d>(&data_buf, data_layout);
+        View::new::<GlobalInput, Coords1d>(data_buf, data_layout);
     let scales_view: View<S, BatchedCoords> =
-        View::new::<GlobalInput, Coords1d>(&scales_buf, scales_layout);
-    QuantizedView::new(data_view, scales_view, scheme).view()
+        View::new::<GlobalInput, Coords1d>(scales_buf, scales_layout);
+    // One binding: two-level schemes are rejected where the scale layout is built, so there is
+    // never a per-tensor scale to fold in here.
+    QuantizedView::new(data_view, scales_view, ComptimeOption::new_None(), scheme).view()
 }
 
 #[derive(CubeType)]

@@ -1,3 +1,6 @@
+// This sample exists to validate a burn-tch install, so naming the deprecated crate is the point.
+#![allow(deprecated)]
+
 use burn_backend::{TensorMetadata, ops::FloatTensorOps};
 use burn_tch::{LibTorch, LibTorchDevice};
 
@@ -7,7 +10,7 @@ fn main() {
         "Could not detect valid CUDA configuration"
     );
 
-    type B = LibTorch<f32>;
+    type B = LibTorch;
     let device = LibTorchDevice::Cuda(0);
 
     // Creation of two tensors, the first with explicit values and the second one with ones, with the same shape as the first

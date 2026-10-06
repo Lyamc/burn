@@ -1,38 +1,62 @@
+use burn_backend::cubecl::dtype_to_storage_type;
 use burn_backend::ops::ConvOptions;
 use burn_std::Shape;
 use cubecl::{
-    ir::StorageType,
+    ir::ElemType,
     tune::{LocalTuner, Tunable, TunableSet, anchor, local_tuner},
 };
 use cubek::convolution::AcceleratedTileKind;
 
 use crate::{
-    CubeAutotuneKey, CubeRuntime, CubeTuneId,
+    CubeAutotuneKey, CubeTuneId,
     kernel::conv::{
         ConvAutotuneKey,
         backward_weight::{fallback::conv_weight_backward_fallback, implicit_gemm::*},
+        im2col::{wgrad_im2col, wgrad_im2col_1x1, wgrad_im2col_1x1_split},
     },
     tensor::CubeTensor,
 };
 
 /// Executes autotune on the weight gradients pass for convolution
-pub fn wgrad_autotune<R: CubeRuntime, const N: usize>(
-    input: CubeTensor<R>,
-    out_grad: CubeTensor<R>,
+pub fn wgrad_autotune<const N: usize>(
+    input: CubeTensor,
+    out_grad: CubeTensor,
     weight_shape: Shape,
     options: ConvOptions<N>,
-) -> CubeTensor<R> {
+) -> CubeTensor {
     let client = input.client.clone();
 
     static TUNER: LocalTuner<CubeAutotuneKey, CubeTuneId> = local_tuner!();
 
-    let tunables = TUNER.init(|| {
-        TunableSet::new(create_key::<R, N>, create_wgrad_input::<R, N>)
+    let tune_id = CubeTuneId::new(&input.client, &input.device);
+    let tunables = TUNER.init(&tune_id, || {
+        TunableSet::new(create_key::<N>, create_wgrad_input::<N>)
             .with(Tunable::new(
                 "wgrad_fallback",
                 |(input, grad, shape, options)| {
-                    conv_weight_backward_fallback::<R, N>(input, grad, shape, options)
+                    conv_weight_backward_fallback::<N>(input, grad, shape, options)
                 },
+            ))
+            // The dense case, which the two pointwise candidates decline and
+            // the fallback computes as a convolution by the gradient.
+            .with(Tunable::new(
+                "wgrad_im2col",
+                |(input, grad, shape, options)| wgrad_im2col::<N>(input, grad, shape, options),
+            ))
+            // The same matmul with its contraction cut into pieces, which is
+            // what a weight gradient's shape asks for — see `split_count`.
+            .with(Tunable::new(
+                "wgrad_im2col_1x1_split",
+                |(input, grad, shape, options)| {
+                    wgrad_im2col_1x1_split::<N>(input, grad, shape, options)
+                },
+            ))
+            // Declines every shape but the pointwise one. It earns its place
+            // because a device with no accelerated matmul for the dtype
+            // declines every candidate below, leaving the fallback unopposed.
+            .with(Tunable::new(
+                "wgrad_im2col_1x1",
+                |(input, grad, shape, options)| wgrad_im2col_1x1::<N>(input, grad, shape, options),
             ))
             .with(Tunable::new(
                 "simple_sync_cmma",
@@ -73,22 +97,17 @@ pub fn wgrad_autotune<R: CubeRuntime, const N: usize>(
     });
 
     TUNER.execute(
-        &CubeTuneId::new(&input.client, &input.device),
+        &tune_id,
         &client,
         tunables,
         (input, out_grad, weight_shape, options),
     )
 }
 
-pub fn create_wgrad_input<R: CubeRuntime, const N: usize>(
+pub fn create_wgrad_input<const N: usize>(
     _key: &CubeAutotuneKey,
-    (input, out_grad, weight_shape, options): &(
-        CubeTensor<R>,
-        CubeTensor<R>,
-        Shape,
-        ConvOptions<N>,
-    ),
-) -> (CubeTensor<R>, CubeTensor<R>, Shape, ConvOptions<N>) {
+    (input, out_grad, weight_shape, options): &(CubeTensor, CubeTensor, Shape, ConvOptions<N>),
+) -> (CubeTensor, CubeTensor, Shape, ConvOptions<N>) {
     (
         input.clone(),
         out_grad.clone(),
@@ -97,13 +116,8 @@ pub fn create_wgrad_input<R: CubeRuntime, const N: usize>(
     )
 }
 
-fn create_key<R: CubeRuntime, const N: usize>(
-    (input, out_grad, weight_shape, options): &(
-        CubeTensor<R>,
-        CubeTensor<R>,
-        Shape,
-        ConvOptions<N>,
-    ),
+fn create_key<const N: usize>(
+    (input, out_grad, weight_shape, options): &(CubeTensor, CubeTensor, Shape, ConvOptions<N>),
 ) -> CubeAutotuneKey {
     let dtype = input.dtype;
     let rank = input.meta.num_dims();
@@ -127,13 +141,16 @@ fn create_key<R: CubeRuntime, const N: usize>(
     } = options.clone();
 
     let lhs_stride_align = if out_grad.meta.strides()[dim_c] == 1 {
-        stride_align(out_grad.meta.strides(), out_grad.dtype.into())
+        stride_align(
+            out_grad.meta.strides(),
+            dtype_to_storage_type(out_grad.dtype),
+        )
     } else {
         0
     };
     let lhs_shape_align = pow2_factor(out_channels).min(lhs_stride_align);
     let rhs_stride_align = if input.meta.strides()[dim_c] == 1 {
-        stride_align(input.meta.strides(), input.dtype.into())
+        stride_align(input.meta.strides(), dtype_to_storage_type(input.dtype))
     } else {
         0
     };
@@ -163,7 +180,7 @@ fn create_key<R: CubeRuntime, const N: usize>(
 const MAX_STRIDE_FACTOR: u32 = 10;
 
 /// Defines the non-contiguous stride alignment in terms of powers of two
-fn stride_align(strides: &[usize], elem: StorageType) -> u8 {
+fn stride_align(strides: &[usize], elem: ElemType) -> u8 {
     let max = MAX_STRIDE_FACTOR;
     let dim_c = strides.len() - 1;
     let factor = strides[..dim_c]

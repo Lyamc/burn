@@ -3,15 +3,14 @@ use crate::metric::{
     SerializedEntry,
     state::{FormatOptions, NumericMetricState},
 };
+use burn_core::tensor::TensorReadError;
 use burn_core::{
-    prelude::{Backend, Int, Tensor},
+    prelude::{Device, Int, Tensor},
     tensor::{
-        ElementConversion,
         module::{avg_pool2d, conv2d},
-        ops::{ConvOptions, PadMode},
+        ops::{AvgPoolOptions, ConvOptions, PadMode},
     },
 };
-use core::marker::PhantomData;
 
 /// Input type for the [MsSsimMetric].
 ///
@@ -30,18 +29,18 @@ use core::marker::PhantomData;
 /// # Example
 /// ```rust,ignore
 /// // Create input for RGB images
-/// let outputs: Tensor<B, 4> = /* tensor */;
-/// let targets: Tensor<B, 4> = /* tensor */;
+/// let outputs: Tensor<4> = /* tensor */;
+/// let targets: Tensor<4> = /* tensor */;
 /// let input = MsSsimInput::new(outputs, targets);
 /// ```
-pub struct MsSsimInput<B: Backend> {
+pub struct MsSsimInput {
     /// Model outputs with shape [N, C, H, W].
-    outputs: Tensor<B, 4>,
+    outputs: Tensor<4>,
     /// Ground truth targets with shape [N, C, H, W].
-    targets: Tensor<B, 4>,
+    targets: Tensor<4>,
 }
 
-impl<B: Backend> MsSsimInput<B> {
+impl MsSsimInput {
     /// Creates a new MsSsimInput with the given outputs and targets.
     ///
     /// # Arguments
@@ -53,7 +52,7 @@ impl<B: Backend> MsSsimInput<B> {
     ///
     /// # Panics
     /// - If `outputs` and `targets` do not have the same shape.
-    pub fn new(outputs: Tensor<B, 4>, targets: Tensor<B, 4>) -> Self {
+    pub fn new(outputs: Tensor<4>, targets: Tensor<4>) -> Self {
         assert!(
             outputs.dims() == targets.dims(),
             "Shape mismatch: outputs {:?} targets {:?}",
@@ -65,6 +64,9 @@ impl<B: Backend> MsSsimInput<B> {
 }
 
 /// Configuration for the [MsSsimMetric].
+///
+/// Parameters are validated by the configuration builders and again when constructing
+/// the metric, including configurations created or modified through public fields.
 #[derive(Debug, Clone)]
 pub struct MsSsimMetricConfig {
     /// A parameter of SSIM used to stabilize the luminance comparison.
@@ -93,6 +95,9 @@ pub struct MsSsimMetricConfig {
     pub channels: usize,
     /// The weights/betas for each scale in the MS-SSIM computation.
     /// The length of this vector determines the number of scales.
+    /// Must be nonempty with finite, nonnegative values and at least one positive value.
+    /// Individual zero weights are allowed and omit that scale's contribution.
+    /// The weights are used as provided, without normalization.
     /// Default is \[0.0448, 0.2856, 0.3001, 0.2363, 0.1333\] (5 scales).
     pub betas: Vec<f32>,
 }
@@ -108,7 +113,7 @@ impl MsSsimMetricConfig {
     /// - channels: 3
     ///
     /// # Panics
-    /// - If `pixel_range` is not positive.
+    /// - If `pixel_range` is not finite and positive.
     ///
     /// # Example
     /// ```rust,ignore
@@ -124,8 +129,7 @@ impl MsSsimMetricConfig {
     ///     .with_kernel_size(7);
     /// ```
     pub fn new(pixel_range: f32) -> Self {
-        assert!(pixel_range > 0.0, "pixel_range must be positive");
-        Self {
+        let config = Self {
             k1: 0.01,
             k2: 0.03,
             pixel_range,
@@ -133,7 +137,9 @@ impl MsSsimMetricConfig {
             sigma: 1.5,
             channels: 3,
             betas: vec![0.0448, 0.2856, 0.3001, 0.2363, 0.1333],
-        }
+        };
+        config.validate();
+        config
     }
 
     /// Sets custom values for the k1 and k2 parameters of MS-SSIM which are
@@ -144,12 +150,11 @@ impl MsSsimMetricConfig {
     /// - k2: 0.03
     ///
     /// # Panics
-    /// - If `k1` or `k2` is not positive.
+    /// - If `k1` or `k2` is not finite and positive.
     pub fn with_k1_k2(mut self, k1: f32, k2: f32) -> Self {
-        assert!(k1 > 0.0, "k1 must be positive");
-        assert!(k2 > 0.0, "k2 must be positive");
         self.k1 = k1;
         self.k2 = k2;
+        self.validate();
         self
     }
 
@@ -162,11 +167,8 @@ impl MsSsimMetricConfig {
     /// # Panics
     /// - If `kernel_size` is not a positive odd number.
     pub fn with_kernel_size(mut self, kernel_size: usize) -> Self {
-        assert!(
-            kernel_size > 0 && kernel_size % 2 == 1,
-            "kernel_size must be positive and an odd number"
-        );
         self.kernel_size = kernel_size;
+        self.validate();
         self
     }
 
@@ -176,10 +178,10 @@ impl MsSsimMetricConfig {
     /// - sigma: 1.5
     ///
     /// # Panics
-    /// - If `sigma` is not positive.
+    /// - If `sigma` is not finite and positive.
     pub fn with_sigma(mut self, sigma: f32) -> Self {
-        assert!(sigma > 0.0, "sigma must be a positive number");
         self.sigma = sigma;
+        self.validate();
         self
     }
 
@@ -194,8 +196,8 @@ impl MsSsimMetricConfig {
     /// # Panics
     /// - If `channels` is 0.
     pub fn with_channels(mut self, channels: usize) -> Self {
-        assert!(channels > 0, "channels must be a positive number");
         self.channels = channels;
+        self.validate();
         self
     }
 
@@ -203,24 +205,48 @@ impl MsSsimMetricConfig {
     /// determines the number of scales used in the MS-SSIM computation.
     /// If you want to make different parameter settings comparable, the betas
     /// vector should sum to 1 as per the original paper. However, note
-    /// that this is not a strict requirement.
+    /// that this is not a strict requirement and weights are not normalized.
+    /// Individual zero weights are allowed, but at least one weight must be positive.
     ///
     /// # Default value
     /// - betas: `[0.0448, 0.2856, 0.3001, 0.2363, 0.1333]` (5 scales)
     ///
     /// # Panics
     /// - If `betas` is empty.
-    /// - If not all values in `betas` are positive.
+    /// - If any value in `betas` is nonfinite or negative.
+    /// - If all values in `betas` are zero.
     pub fn with_betas(mut self, betas: Vec<f32>) -> Self {
-        assert!(!betas.is_empty(), "betas vector cannot be empty");
-
-        assert!(
-            betas.iter().all(|&b| b >= 0.0),
-            "All beta values must be non-negative"
-        );
-
         self.betas = betas;
+        self.validate();
         self
+    }
+
+    fn validate(&self) {
+        for (name, value) in [
+            ("pixel_range", self.pixel_range),
+            ("k1", self.k1),
+            ("k2", self.k2),
+            ("sigma", self.sigma),
+        ] {
+            assert!(
+                value.is_finite() && value > 0.0,
+                "{name} must be finite and positive"
+            );
+        }
+        assert!(
+            self.kernel_size > 0 && self.kernel_size % 2 == 1,
+            "kernel_size must be positive and an odd number"
+        );
+        assert!(self.channels > 0, "channels must be a positive number");
+        assert!(!self.betas.is_empty(), "betas vector cannot be empty");
+        assert!(
+            self.betas.iter().all(|&b| b.is_finite() && b >= 0.0),
+            "All beta values must be finite and non-negative"
+        );
+        assert!(
+            self.betas.iter().any(|&b| b > 0.0),
+            "At least one beta value must be positive"
+        );
     }
 }
 
@@ -267,21 +293,19 @@ impl MsSsimMetricConfig {
 ///
 /// [Multi-scale Structural Similarity for Image Quality Assessment](https://www.cns.nyu.edu/pub/eero/wang03b.pdf)
 #[derive(Clone)]
-pub struct MsSsimMetric<B: Backend> {
+pub struct MsSsimMetric {
     name: MetricName,
     /// Internal state for numeric metric aggregation.
     state: NumericMetricState,
-    /// Marker for backend type.
-    _b: PhantomData<B>,
     /// Configuration for the metric.
     config: MsSsimMetricConfig,
     /// Pre-computed horizontal Gaussian kernel with shape [C, 1, 1, K]
-    horizontal_kernel: Tensor<B, 4>,
+    horizontal_kernel: Tensor<4>,
     /// Pre-computed vertical Gaussian kernel with shape [C, 1, K, 1]
-    vertical_kernel: Tensor<B, 4>,
+    vertical_kernel: Tensor<4>,
 }
 
-impl<B: Backend> MsSsimMetric<B> {
+impl MsSsimMetric {
     /// Creates a new MS-SSIM metric with the given configuration.
     ///
     /// # Arguments
@@ -293,12 +317,18 @@ impl<B: Backend> MsSsimMetric<B> {
     /// where pr is the pixel range, k is the kernel size, and σ is the
     /// standard deviation.
     ///
+    /// # Panics
+    /// - If `k1`, `k2`, `pixel_range`, or `sigma` is not finite and positive.
+    /// - If `kernel_size` is not a positive odd number or `channels` is zero.
+    /// - If `betas` is empty, contains nonfinite or negative values, or has no positive value.
+    ///
     /// # Example
     /// ```ignore
     /// let config = MsSsimMetricConfig::new(1.0).with_channels(1); // Grayscale
-    /// let metric = MsSsimMetric::<B>::new(config, &device);
+    /// let metric = MsSsimMetric::new(config, &device);
     /// ```
-    pub fn new(config: MsSsimMetricConfig, device: &B::Device) -> Self {
+    pub fn new(config: MsSsimMetricConfig, device: &Device) -> Self {
+        config.validate();
         let kernel = Self::create_1d_gaussian_kernel(&config, device);
         let size = config.kernel_size;
 
@@ -319,7 +349,6 @@ impl<B: Backend> MsSsimMetric<B> {
                 config.pixel_range, config.kernel_size, config.sigma
             )),
             state: NumericMetricState::default(),
-            _b: PhantomData,
             config,
             horizontal_kernel,
             vertical_kernel,
@@ -330,7 +359,7 @@ impl<B: Backend> MsSsimMetric<B> {
     ///
     /// # Example
     /// ```ignore
-    /// let metric = MsSsimMetric::<B>::new(config, &device)
+    /// let metric = MsSsimMetric::new(config, &device)
     ///     .with_name("Custom MS-SSIM Name");
     /// ```
     pub fn with_name(mut self, name: &str) -> Self {
@@ -339,12 +368,12 @@ impl<B: Backend> MsSsimMetric<B> {
     }
 
     /// Creates a normalized 1D Gaussian kernel as a tensor where the kernel values sum to 1.0.
-    fn create_1d_gaussian_kernel(config: &MsSsimMetricConfig, device: &B::Device) -> Tensor<B, 1> {
+    fn create_1d_gaussian_kernel(config: &MsSsimMetricConfig, device: &Device) -> Tensor<1> {
         let size = config.kernel_size as i64;
         let sigma = config.sigma;
         let center = (size / 2) as f32;
 
-        let one_to_size_tensor = Tensor::<B, 1, Int>::arange(0..size, device).float();
+        let one_to_size_tensor = Tensor::<1, Int>::arange(0..size, device).float();
         let x_vals = one_to_size_tensor.sub_scalar(center);
 
         // Gaussian: exp(-x² / 2σ²)
@@ -362,7 +391,7 @@ impl<B: Backend> MsSsimMetric<B> {
     ///
     /// # Arguments
     /// - `input`: Tensor of shape [N, C, H, W]
-    fn gaussian_separable_conv(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
+    fn gaussian_separable_conv(&self, input: Tensor<4>) -> Tensor<4> {
         let padding = self.config.kernel_size / 2;
         let h_kernel = self.horizontal_kernel.clone();
         let v_kernel = self.vertical_kernel.clone();
@@ -379,14 +408,18 @@ impl<B: Backend> MsSsimMetric<B> {
     }
 }
 
-impl<B: Backend> Metric for MsSsimMetric<B> {
-    type Input = MsSsimInput<B>;
+impl Metric for MsSsimMetric {
+    type Input = MsSsimInput;
 
     fn name(&self) -> MetricName {
         self.name.clone()
     }
 
-    fn update(&mut self, item: &Self::Input, _metadata: &MetricMetadata) -> SerializedEntry {
+    fn update(
+        &mut self,
+        item: &Self::Input,
+        _metadata: &MetricMetadata,
+    ) -> Result<SerializedEntry, TensorReadError> {
         let dims = item.outputs.dims();
         let scales = self.config.betas.len();
 
@@ -426,8 +459,7 @@ impl<B: Backend> Metric for MsSsimMetric<B> {
         // Shape: [N, C]
         let batch_size = dims[0];
         let channels = dims[1];
-        let mut ms_ssim_tensor =
-            Tensor::<B, 2>::ones([batch_size, channels], &item.outputs.device());
+        let mut ms_ssim_tensor = Tensor::<2>::ones([batch_size, channels], &item.outputs.device());
 
         for (j, beta_j) in betas.iter().enumerate() {
             // Compute mu_x and mu_y
@@ -453,7 +485,7 @@ impl<B: Backend> Metric for MsSsimMetric<B> {
             // Include luminance at the last scale
             if j == betas.len() - 1 {
                 // Compute l(x, y) = (2μxμy + C1) / (μx² + μy² + C1)
-                let luminance: Tensor<B, 4> =
+                let luminance: Tensor<4> =
                     (2 * mu_x * mu_y + c1) / (square_of_mu_x + square_of_mu_y + c1);
                 let ssim = luminance * contrast_structure;
                 let ssim_spatial_mean = ssim.mean_dims(&[2, 3]).reshape([batch_size, channels]);
@@ -468,19 +500,24 @@ impl<B: Backend> Metric for MsSsimMetric<B> {
                 let c_s_mean_clamped = contrast_structure_spatial_mean.clamp_min(0.0);
                 ms_ssim_tensor = ms_ssim_tensor * c_s_mean_clamped.powf_scalar(*beta_j);
 
-                x = avg_pool2d(x, [2, 2], [2, 2], [0, 0], false, false);
-                y = avg_pool2d(y, [2, 2], [2, 2], [0, 0], false, false);
+                x = avg_pool2d(x, AvgPoolOptions::new([2, 2]).with_count_include_pad(false));
+                y = avg_pool2d(y, AvgPoolOptions::new([2, 2]).with_count_include_pad(false));
             }
         }
 
         let ms_ssim_per_image = ms_ssim_tensor.mean_dim(1);
-        let avg_ms_ssim = ms_ssim_per_image.mean().into_scalar().elem::<f64>();
+        let avg_ms_ssim = ms_ssim_per_image.mean().try_into_scalar::<f64>()?;
 
-        self.state.update(
-            avg_ms_ssim,
-            batch_size,
-            FormatOptions::new(self.name()).precision(4),
-        )
+        self.state.update(avg_ms_ssim, batch_size);
+        Ok(self
+            .state
+            .compute_update(FormatOptions::new(self.name()).precision(4)))
+    }
+
+    fn compute(&mut self) -> Result<SerializedEntry, TensorReadError> {
+        Ok(self
+            .state
+            .compute_final(FormatOptions::new(self.name()).precision(4)))
     }
 
     /// Clears the metric state.
@@ -497,21 +534,26 @@ impl<B: Backend> Metric for MsSsimMetric<B> {
     }
 }
 
-impl<B: Backend> Numeric for MsSsimMetric<B> {
-    fn value(&self) -> NumericEntry {
-        self.state.current_value()
+impl Numeric for MsSsimMetric {
+    fn value(&self) -> Option<NumericEntry> {
+        Some(self.state.current_value())
     }
 
-    fn running_value(&self) -> NumericEntry {
-        self.state.running_value()
+    fn running_value(&self) -> Option<NumericEntry> {
+        Some(self.state.running_value())
+    }
+
+    fn final_value(&self) -> NumericEntry {
+        self.state.final_value()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{TestBackend, metric::Numeric};
+    use crate::metric::Numeric;
     use burn_core::tensor::Distribution;
+    use rstest::rstest;
 
     fn test_config() -> MsSsimMetricConfig {
         // Use small kernel and single channel for testing
@@ -526,7 +568,7 @@ mod tests {
     fn test_ms_ssim_perfect_similarity() {
         // Identical images should give MS-SSIM = 1.0
         let device = Default::default();
-        let outputs = Tensor::<TestBackend, 4>::from_data(
+        let outputs = Tensor::<4>::from_data(
             [[[
                 [0.5_f32; 64]; 64  // 64x64 constant image
             ]]],
@@ -534,11 +576,11 @@ mod tests {
         );
         let targets = outputs.clone();
 
-        let mut metric = MsSsimMetric::<TestBackend>::new(test_config(), &device);
+        let mut metric = MsSsimMetric::new(test_config(), &device);
         let input = MsSsimInput::new(outputs, targets);
-        let _entry = metric.update(&input, &MetricMetadata::fake());
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
 
-        let ms_ssim = metric.value().current();
+        let ms_ssim = metric.value().unwrap().current();
         assert!(
             ms_ssim > 0.99,
             "MS-SSIM for identical images should be 1.0, got {}",
@@ -550,14 +592,14 @@ mod tests {
     fn test_ms_ssim_completely_different() {
         // Black vs white images should give very low MS-SSIM (close to 0.0)
         let device = Default::default();
-        let outputs = Tensor::<TestBackend, 4>::zeros([1, 1, 256, 256], &device);
-        let targets = Tensor::<TestBackend, 4>::ones([1, 1, 256, 256], &device);
+        let outputs = Tensor::<4>::zeros([1, 1, 256, 256], &device);
+        let targets = Tensor::<4>::ones([1, 1, 256, 256], &device);
 
-        let mut metric = MsSsimMetric::<TestBackend>::new(test_config(), &device);
+        let mut metric = MsSsimMetric::new(test_config(), &device);
         let input = MsSsimInput::new(outputs, targets);
-        let _entry = metric.update(&input, &MetricMetadata::fake());
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
 
-        let ms_ssim = metric.value().current();
+        let ms_ssim = metric.value().unwrap().current();
         assert!(
             (ms_ssim - 0.3).abs() < 0.01,
             "MS-SSIM for black vs white should be low (around 0.3), got {}",
@@ -569,14 +611,14 @@ mod tests {
     fn test_ms_ssim_similar_images() {
         // Small perturbation should give high MS-SSIM (close to 1.0)
         let device = Default::default();
-        let outputs = Tensor::<TestBackend, 4>::full([1, 1, 64, 64], 0.5, &device);
-        let targets = Tensor::<TestBackend, 4>::full([1, 1, 64, 64], 0.52, &device);
+        let outputs = Tensor::<4>::full([1, 1, 64, 64], 0.5, &device);
+        let targets = Tensor::<4>::full([1, 1, 64, 64], 0.52, &device);
 
-        let mut metric = MsSsimMetric::<TestBackend>::new(test_config(), &device);
+        let mut metric = MsSsimMetric::new(test_config(), &device);
         let input = MsSsimInput::new(outputs, targets);
-        let _entry = metric.update(&input, &MetricMetadata::fake());
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
 
-        let ms_ssim = metric.value().current();
+        let ms_ssim = metric.value().unwrap().current();
         assert!(
             ms_ssim > 0.95,
             "MS-SSIM for very similar images should be close to 1.0, got {}",
@@ -588,14 +630,14 @@ mod tests {
     fn test_ms_ssim_batch_averaging() {
         let device = Default::default();
         // Batch of 2: one identical, one different
-        let outputs = Tensor::<TestBackend, 4>::from_data(
+        let outputs = Tensor::<4>::from_data(
             [
                 [[[0.5_f32; 64]; 64]], // Image 1: constant 0.5
                 [[[0.0_f32; 64]; 64]], // Image 2: constant 0.0 (black)
             ],
             &device,
         );
-        let targets = Tensor::<TestBackend, 4>::from_data(
+        let targets = Tensor::<4>::from_data(
             [
                 [[[0.5_f32; 64]; 64]], // Image 1: identical
                 [[[1.0_f32; 64]; 64]], // Image 2: white (opposite)
@@ -603,11 +645,11 @@ mod tests {
             &device,
         );
 
-        let mut metric = MsSsimMetric::<TestBackend>::new(test_config(), &device);
+        let mut metric = MsSsimMetric::new(test_config(), &device);
         let input = MsSsimInput::new(outputs, targets);
-        let _entry = metric.update(&input, &MetricMetadata::fake());
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
 
-        let ms_ssim = metric.value().current();
+        let ms_ssim = metric.value().unwrap().current();
         // Average of ~1.0 and ~0.292 should be around 0.64
         assert!(
             (ms_ssim - 0.64).abs() < 0.02,
@@ -625,18 +667,14 @@ mod tests {
             .with_sigma(1.0)
             .with_channels(3);
 
-        let outputs = Tensor::<TestBackend, 4>::random(
-            [2, 3, 64, 64],
-            Distribution::Uniform(0.0, 1.0),
-            &device,
-        );
+        let outputs = Tensor::<4>::random([2, 3, 64, 64], Distribution::Uniform(0.0, 1.0), &device);
         let targets = outputs.clone();
 
-        let mut metric = MsSsimMetric::<TestBackend>::new(config, &device);
+        let mut metric = MsSsimMetric::new(config, &device);
         let input = MsSsimInput::new(outputs, targets);
-        let _entry = metric.update(&input, &MetricMetadata::fake());
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
 
-        let ms_ssim = metric.value().current();
+        let ms_ssim = metric.value().unwrap().current();
         assert!(
             ms_ssim > 0.99,
             "MS-SSIM for identical RGB images should be 1.0, got {}",
@@ -647,25 +685,25 @@ mod tests {
     #[test]
     fn test_ms_ssim_running_average() {
         let device = Default::default();
-        let mut metric = MsSsimMetric::<TestBackend>::new(test_config(), &device);
+        let mut metric = MsSsimMetric::new(test_config(), &device);
 
         // First update: identical (1.0)
-        let img1 = Tensor::<TestBackend, 4>::full([1, 1, 64, 64], 0.5, &device);
+        let img1 = Tensor::<4>::full([1, 1, 64, 64], 0.5, &device);
         let input1 = MsSsimInput::new(img1.clone(), img1);
-        metric.update(&input1, &MetricMetadata::fake());
+        metric.update(&input1, &MetricMetadata::fake()).unwrap();
 
         assert!(
-            metric.value().current() > 0.99,
+            metric.value().unwrap().current() > 0.99,
             "First update should be approximately 1.0"
         );
 
         // Second update: different (~0.29)
-        let black = Tensor::<TestBackend, 4>::zeros([1, 1, 64, 64], &device);
-        let white = Tensor::<TestBackend, 4>::ones([1, 1, 64, 64], &device);
+        let black = Tensor::<4>::zeros([1, 1, 64, 64], &device);
+        let white = Tensor::<4>::ones([1, 1, 64, 64], &device);
         let input2 = MsSsimInput::new(black, white);
-        metric.update(&input2, &MetricMetadata::fake());
+        metric.update(&input2, &MetricMetadata::fake()).unwrap();
 
-        let running = metric.running_value().current();
+        let running = metric.running_value().unwrap().current();
         assert!(
             (running - 0.64).abs() < 0.02,
             "Running average should be approximately 0.64, got {}",
@@ -683,19 +721,19 @@ mod tests {
             .with_channels(1)
             .with_betas(vec![1.0]); // 1 scale
 
-        let mut metric = MsSsimMetric::<TestBackend>::new(config, &device);
+        let mut metric = MsSsimMetric::new(config, &device);
 
         // Create a 16x16 image. This would normally panic with 5 scales,
         // but should succeed with 1 scale.
-        let outputs = Tensor::<TestBackend, 4>::zeros([1, 1, 16, 16], &device);
+        let outputs = Tensor::<4>::zeros([1, 1, 16, 16], &device);
         let targets = outputs.clone();
         let input = MsSsimInput::new(outputs, targets);
 
         // This should not panic
-        let _ = metric.update(&input, &MetricMetadata::fake());
+        let _ = metric.update(&input, &MetricMetadata::fake()).unwrap();
 
         // Identical images should still yield ~1.0
-        let ms_ssim = metric.value().current();
+        let ms_ssim = metric.value().unwrap().current();
         assert!(
             ms_ssim > 0.99,
             "1-scale MS-SSIM for identical images should be 1.0, got {}",
@@ -713,26 +751,18 @@ mod tests {
             .with_sigma(1.0)
             .with_channels(3);
 
-        let img1 = Tensor::<TestBackend, 4>::random(
-            [2, 3, 64, 64],
-            Distribution::Uniform(0.0, 1.0),
-            &device,
-        );
-        let img2 = Tensor::<TestBackend, 4>::random(
-            [2, 3, 64, 64],
-            Distribution::Uniform(0.0, 1.0),
-            &device,
-        );
+        let img1 = Tensor::<4>::random([2, 3, 64, 64], Distribution::Uniform(0.0, 1.0), &device);
+        let img2 = Tensor::<4>::random([2, 3, 64, 64], Distribution::Uniform(0.0, 1.0), &device);
 
-        let mut metric1 = MsSsimMetric::<TestBackend>::new(config.clone(), &device);
+        let mut metric1 = MsSsimMetric::new(config.clone(), &device);
         let input1 = MsSsimInput::new(img1.clone(), img2.clone());
-        let _entry = metric1.update(&input1, &MetricMetadata::fake());
-        let ms_ssim1 = metric1.value().current();
+        let _entry = metric1.update(&input1, &MetricMetadata::fake()).unwrap();
+        let ms_ssim1 = metric1.value().unwrap().current();
 
-        let mut metric2 = MsSsimMetric::<TestBackend>::new(config, &device);
+        let mut metric2 = MsSsimMetric::new(config, &device);
         let input2 = MsSsimInput::new(img2, img1);
-        let _entry = metric2.update(&input2, &MetricMetadata::fake());
-        let ms_ssim2 = metric2.value().current();
+        let _entry = metric2.update(&input2, &MetricMetadata::fake()).unwrap();
+        let ms_ssim2 = metric2.value().unwrap().current();
 
         assert!(
             (ms_ssim1 - ms_ssim2).abs() < 0.001,
@@ -745,23 +775,23 @@ mod tests {
     #[test]
     fn test_ms_ssim_clear() {
         let device = Default::default();
-        let mut metric = MsSsimMetric::<TestBackend>::new(test_config(), &device);
+        let mut metric = MsSsimMetric::new(test_config(), &device);
 
-        let img = Tensor::<TestBackend, 4>::full([1, 1, 64, 64], 0.5, &device);
+        let img = Tensor::<4>::full([1, 1, 64, 64], 0.5, &device);
         let input = MsSsimInput::new(img.clone(), img);
-        metric.update(&input, &MetricMetadata::fake());
+        metric.update(&input, &MetricMetadata::fake()).unwrap();
 
-        assert!(metric.value().current() > 0.99);
+        assert!(metric.value().unwrap().current() > 0.99);
 
         metric.clear();
-        assert!(metric.running_value().current().is_nan());
+        assert!(metric.running_value().unwrap().current().is_nan());
     }
 
     #[test]
     fn test_ms_ssim_custom_name() {
         let device = Default::default();
         let config = MsSsimMetricConfig::new(1.0);
-        let metric = MsSsimMetric::<TestBackend>::new(config, &device).with_name("CustomMS-SSIM");
+        let metric = MsSsimMetric::new(config, &device).with_name("CustomMS-SSIM");
         assert_eq!(metric.name().to_string(), "CustomMS-SSIM");
     }
 
@@ -769,7 +799,7 @@ mod tests {
     fn test_ms_ssim_default_name() {
         let device = Default::default();
         let config = MsSsimMetricConfig::new(255.0);
-        let metric = MsSsimMetric::<TestBackend>::new(config, &device);
+        let metric = MsSsimMetric::new(config, &device);
         assert_eq!(metric.name().to_string(), "MS-SSIM (pr=255, k=11, σ=1.5)");
     }
 
@@ -777,7 +807,7 @@ mod tests {
     fn test_ms_ssim_attributes() {
         let device = Default::default();
         let config = MsSsimMetricConfig::new(1.0);
-        let metric = MsSsimMetric::<TestBackend>::new(config, &device);
+        let metric = MsSsimMetric::new(config, &device);
 
         match metric.attributes() {
             MetricAttributes::Numeric(attrs) => {
@@ -792,33 +822,33 @@ mod tests {
     #[should_panic(expected = "Shape mismatch")]
     fn test_ms_ssim_shape_mismatch() {
         let device = Default::default();
-        let outputs = Tensor::<TestBackend, 4>::zeros([1, 1, 64, 64], &device);
-        let targets = Tensor::<TestBackend, 4>::zeros([1, 1, 32, 32], &device);
+        let outputs = Tensor::<4>::zeros([1, 1, 64, 64], &device);
+        let targets = Tensor::<4>::zeros([1, 1, 32, 32], &device);
         let _ = MsSsimInput::new(outputs, targets);
     }
 
-    #[test]
-    #[should_panic(expected = "k1 must be positive")]
-    fn test_ms_ssim_negative_k1() {
-        let _ = MsSsimMetricConfig::new(1.0).with_k1_k2(-0.01, 0.03);
+    #[rstest]
+    #[should_panic(expected = "k1 must be finite and positive")]
+    fn test_ms_ssim_invalid_k1(
+        #[values(0.0, -0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY)] k1: f32,
+    ) {
+        let _ = MsSsimMetricConfig::new(1.0).with_k1_k2(k1, 0.03);
     }
 
-    #[test]
-    #[should_panic(expected = "k2 must be positive")]
-    fn test_ms_ssim_negative_k2() {
-        let _ = MsSsimMetricConfig::new(1.0).with_k1_k2(0.01, -0.03);
+    #[rstest]
+    #[should_panic(expected = "k2 must be finite and positive")]
+    fn test_ms_ssim_invalid_k2(
+        #[values(0.0, -0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY)] k2: f32,
+    ) {
+        let _ = MsSsimMetricConfig::new(1.0).with_k1_k2(0.01, k2);
     }
 
-    #[test]
-    #[should_panic(expected = "pixel_range must be positive")]
-    fn test_ms_ssim_negative_data_range() {
-        let _ = MsSsimMetricConfig::new(-1.0);
-    }
-
-    #[test]
-    #[should_panic(expected = "pixel_range must be positive")]
-    fn test_ms_ssim_zero_data_range() {
-        let _ = MsSsimMetricConfig::new(0.0);
+    #[rstest]
+    #[should_panic(expected = "pixel_range must be finite and positive")]
+    fn test_ms_ssim_invalid_data_range(
+        #[values(0.0, -0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY)] pixel_range: f32,
+    ) {
+        let _ = MsSsimMetricConfig::new(pixel_range);
     }
 
     #[test]
@@ -833,16 +863,12 @@ mod tests {
         let _ = MsSsimMetricConfig::new(1.0).with_kernel_size(0);
     }
 
-    #[test]
-    #[should_panic(expected = "sigma must be a positive number")]
-    fn test_ms_ssim_negative_sigma() {
-        let _ = MsSsimMetricConfig::new(1.0).with_sigma(-1.5);
-    }
-
-    #[test]
-    #[should_panic(expected = "sigma must be a positive number")]
-    fn test_ms_ssim_zero_sigma() {
-        let _ = MsSsimMetricConfig::new(1.0).with_sigma(0.0);
+    #[rstest]
+    #[should_panic(expected = "sigma must be finite and positive")]
+    fn test_ms_ssim_invalid_sigma(
+        #[values(0.0, -0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY)] sigma: f32,
+    ) {
+        let _ = MsSsimMetricConfig::new(1.0).with_sigma(sigma);
     }
 
     #[test]
@@ -857,10 +883,85 @@ mod tests {
         let _ = MsSsimMetricConfig::new(1.0).with_betas(vec![]);
     }
 
+    #[rstest]
+    #[should_panic(expected = "All beta values must be finite and non-negative")]
+    fn test_ms_ssim_invalid_beta(
+        #[values(-0.1, f32::NAN, f32::INFINITY, f32::NEG_INFINITY)] beta: f32,
+    ) {
+        let _ = MsSsimMetricConfig::new(1.0).with_betas(vec![0.3, beta, 0.5]);
+    }
+
+    #[rstest]
+    #[case(vec![0.0])]
+    #[case(vec![0.0; 5])]
+    #[case(vec![0.0, -0.0])]
+    #[should_panic(expected = "At least one beta value must be positive")]
+    fn test_ms_ssim_all_zero_betas(#[case] betas: Vec<f32>) {
+        let _ = MsSsimMetricConfig::new(1.0).with_betas(betas);
+    }
+
+    #[rstest]
+    #[case(vec![0.0448, 0.2856, 0.3001, 0.2363, 0.1333])]
+    #[case(vec![1.0])]
+    #[case(vec![0.0, 1.0])]
+    #[case(vec![1.0, 0.0])]
+    #[case(vec![0.0, -0.0, 1.0])]
+    #[case(vec![2.0, 3.0])]
+    #[case(vec![f32::MIN_POSITIVE])]
+    #[case(vec![f32::from_bits(1)])]
+    fn test_ms_ssim_valid_betas_are_preserved(#[case] betas: Vec<f32>) {
+        let config = MsSsimMetricConfig::new(1.0).with_betas(betas.clone());
+        assert_eq!(config.betas, betas);
+    }
+
+    #[rstest]
+    #[should_panic(expected = "must be finite and positive")]
+    fn test_ms_ssim_constructor_rejects_invalid_scalar_fields(
+        #[values("k1", "k2", "pixel_range", "sigma")] field: &str,
+        #[values(0.0, -0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY)] value: f32,
+    ) {
+        let mut config = MsSsimMetricConfig::new(1.0);
+        match field {
+            "k1" => config.k1 = value,
+            "k2" => config.k2 = value,
+            "pixel_range" => config.pixel_range = value,
+            "sigma" => config.sigma = value,
+            _ => unreachable!(),
+        }
+        let _ = MsSsimMetric::new(config, &Default::default());
+    }
+
+    #[rstest]
+    #[case(MsSsimMetricConfig { kernel_size: 0, ..MsSsimMetricConfig::new(1.0) })]
+    #[case(MsSsimMetricConfig { kernel_size: 2, ..MsSsimMetricConfig::new(1.0) })]
+    #[case(MsSsimMetricConfig { channels: 0, ..MsSsimMetricConfig::new(1.0) })]
+    #[case(MsSsimMetricConfig { betas: vec![], ..MsSsimMetricConfig::new(1.0) })]
+    #[case(MsSsimMetricConfig { betas: vec![0.0; 5], ..MsSsimMetricConfig::new(1.0) })]
+    #[case(MsSsimMetricConfig { betas: vec![1.0, -0.1], ..MsSsimMetricConfig::new(1.0) })]
+    #[case(MsSsimMetricConfig { betas: vec![1.0, f32::NAN], ..MsSsimMetricConfig::new(1.0) })]
+    #[case(MsSsimMetricConfig { betas: vec![1.0, f32::INFINITY], ..MsSsimMetricConfig::new(1.0) })]
+    #[case(MsSsimMetricConfig { betas: vec![1.0, f32::NEG_INFINITY], ..MsSsimMetricConfig::new(1.0) })]
+    #[should_panic]
+    fn test_ms_ssim_constructor_rejects_invalid_config(#[case] config: MsSsimMetricConfig) {
+        let _ = MsSsimMetric::new(config, &Default::default());
+    }
+
     #[test]
-    #[should_panic(expected = "All beta values must be non-negative")]
-    fn test_ms_ssim_negative_betas() {
-        let _ = MsSsimMetricConfig::new(1.0).with_betas(vec![0.3, 0.3, -0.1, 0.5]);
+    fn test_ms_ssim_zero_beta_keeps_score_meaningful() {
+        let device = Default::default();
+        let config = test_config().with_betas(vec![0.0, 1.0]);
+        let mut metric = MsSsimMetric::new(config, &device);
+        let input = MsSsimInput::new(
+            Tensor::<4>::zeros([1, 1, 8, 8], &device),
+            Tensor::<4>::ones([1, 1, 8, 8], &device),
+        );
+        metric.update(&input, &MetricMetadata::fake());
+
+        // Only the coarsest scale contributes: black/white contrast is identical,
+        // while their luminance similarity is C1 / (1 + C1).
+        let expected = 0.01_f64.powi(2) / (1.0 + 0.01_f64.powi(2));
+        let score = metric.value().unwrap().current();
+        assert!((score - expected).abs() < 1e-6, "got {score}");
     }
 
     #[test]
@@ -869,11 +970,11 @@ mod tests {
         let device = Default::default();
         // 3 scales with kernel_size=11 requires 44x44 minimum (11 * 2^2)
         let config = MsSsimMetricConfig::new(1.0).with_betas(vec![0.5, 0.3, 0.2]);
-        let mut metric = MsSsimMetric::<TestBackend>::new(config, &device);
+        let mut metric = MsSsimMetric::new(config, &device);
 
-        let outputs = Tensor::<TestBackend, 4>::zeros([1, 3, 32, 32], &device); // Too small (32 < 44)
+        let outputs = Tensor::<4>::zeros([1, 3, 32, 32], &device); // Too small (32 < 44)
         let targets = outputs.clone();
         let input = MsSsimInput::new(outputs, targets);
-        let _ = metric.update(&input, &MetricMetadata::fake());
+        let _ = metric.update(&input, &MetricMetadata::fake()).unwrap();
     }
 }

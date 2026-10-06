@@ -1,21 +1,19 @@
+use burn_backend::distributed::DistributedOps;
+
+use crate::CubeBackend;
+
+#[cfg(feature = "std")]
+use crate::ops::numeric::{self, zeros_client};
+#[cfg(feature = "std")]
 use burn_backend::{
     DeviceId, TensorMetadata,
-    distributed::{CollectiveTensor, DistributedBackend, ReduceOperation},
+    cubecl::dtype_to_elem_type,
+    distributed::{CollectiveTensor, ReduceOperation},
     tensor::{Device, FloatTensor},
 };
 
-use crate::{
-    BoolElement, CubeBackend, CubeRuntime, FloatElement, IntElement,
-    ops::numeric::{self, zeros_client},
-};
-
-impl<R, F, I, BT> DistributedBackend for CubeBackend<R, F, I, BT>
-where
-    R: CubeRuntime,
-    F: FloatElement,
-    I: IntElement,
-    BT: BoolElement,
-{
+impl DistributedOps<Self> for CubeBackend {
+    #[cfg(feature = "std")]
     fn all_reduce(
         tensor: FloatTensor<Self>,
         op: ReduceOperation,
@@ -25,7 +23,7 @@ where
         let out_tensor = if tensor.handle.can_mut() && tensor.is_contiguous() {
             tensor
         } else {
-            let zeros_tensor = zeros_client::<R>(
+            let zeros_tensor = zeros_client(
                 tensor.client.clone(),
                 device.clone(),
                 tensor.shape(),
@@ -39,19 +37,20 @@ where
             ReduceOperation::Mean => cubecl::server::ReduceOperation::Mean,
         };
 
-        let mut client = R::client(device);
+        let mut client = device.client();
         client.all_reduce(
             out_tensor.handle.clone(),
             out_tensor.handle.clone(),
-            out_tensor.dtype.into(),
+            dtype_to_elem_type(out_tensor.dtype),
             device_ids.clone(),
             op,
         );
         CollectiveTensor::new(out_tensor)
     }
 
+    #[cfg(feature = "std")]
     fn sync_collective(device: &Device<Self>) {
-        let client = R::client(device);
+        let client = device.client();
         client.sync_collective();
     }
 }

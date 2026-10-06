@@ -12,14 +12,17 @@ workspace = true
 [dependencies]
 burn = { workspace = true, features = [
     "autodiff",
+    "fusion",
     "wgpu",
     "autotune",
     "template",
+    "extension"
 ] }
 cubecl = { workspace = true, features = ["wgpu"] }
 
+burn-cubecl = { workspace = true, features = ["fusion"] }
+
 # Serialization
-log = { workspace = true }
 serde = { workspace = true, features = ["std", "derive"] }
 
 # Wgpu internal dependencies

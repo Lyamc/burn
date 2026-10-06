@@ -6,15 +6,9 @@ use burn_backend::{
 use burn_std::{Shape, Strides};
 use cubecl::server::{CopyDescriptor, Handle};
 
-use crate::{CubeBackend, CubeRuntime, FloatElement, IntElement, element::BoolElement};
+use crate::CubeBackend;
 
-impl<R, F, I, BT> TransactionOps<Self> for CubeBackend<R, F, I, BT>
-where
-    R: CubeRuntime,
-    F: FloatElement,
-    I: IntElement,
-    BT: BoolElement,
-{
+impl TransactionOps<Self> for CubeBackend {
     async fn tr_execute(
         transaction: TransactionPrimitive<Self>,
     ) -> Result<TransactionPrimitiveData, ExecutionError> {
@@ -112,9 +106,7 @@ where
         let mut data: Vec<Option<_>> = client
             .read_tensor_async(bindings)
             .await
-            .map_err(|err| ExecutionError::WithContext {
-                reason: format!("{err:?}"),
-            })?
+            .map_err(crate::backend::server_err)?
             .into_iter()
             .map(Some)
             .collect::<Vec<Option<_>>>();

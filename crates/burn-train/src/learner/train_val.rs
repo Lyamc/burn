@@ -1,7 +1,9 @@
 use crate::{ItemLazy, renderer::MetricsRenderer};
-use burn_core::module::AutodiffModule;
-use burn_core::tensor::backend::AutodiffBackend;
-use burn_optim::{GradientsParams, MultiGradientsParams, Optimizer};
+use burn_core::{module::Module, tensor::Gradients};
+use burn_optim::{
+    GradientsParams, ModuleOptimizer, MultiGradientsParams,
+    lr_scheduler::module_lr_scheduler::ModuleLearningRate,
+};
 
 /// A training output.
 pub struct TrainOutput<TO> {
@@ -24,11 +26,7 @@ impl<TO> TrainOutput<TO> {
     /// # Returns
     ///
     /// A new training output.
-    pub fn new<B: AutodiffBackend, M: AutodiffModule<B>>(
-        module: &M,
-        grads: B::Gradients,
-        item: TO,
-    ) -> Self {
+    pub fn new<M: Module>(module: &M, grads: Gradients, item: TO) -> Self {
         let grads = GradientsParams::from_grads(grads, module);
         Self { grads, item }
     }
@@ -45,8 +43,7 @@ impl<TO> TrainOutput<TO> {
 /// # Notes
 ///
 /// To be used with the [Learner](crate::Learner) struct, the struct which implements this trait must
-/// also implement the [AutodiffModule] trait, which is done automatically with the
-/// [Module](burn_core::module::Module) derive.
+/// also implement the [Module] trait, which is done automatically with its derive.
 pub trait TrainStep {
     /// Type of input for a step of the training stage.
     type Input: Send + 'static;
@@ -73,13 +70,16 @@ pub trait TrainStep {
     /// # Returns
     ///
     /// The updated model.
-    fn optimize<B, O>(self, optim: &mut O, lr: f64, grads: GradientsParams) -> Self
+    fn optimize(
+        self,
+        optim: &mut ModuleOptimizer,
+        lr_module: ModuleLearningRate,
+        grads: GradientsParams,
+    ) -> Self
     where
-        B: AutodiffBackend,
-        O: Optimizer<Self, B>,
-        Self: AutodiffModule<B>,
+        Self: Module + Sized,
     {
-        optim.step(lr, self, grads)
+        optim.step(lr_module, self, grads)
     }
     /// Optimize the current module with the provided gradients and learning rate.
     ///
@@ -92,13 +92,16 @@ pub trait TrainStep {
     /// # Returns
     ///
     /// The updated model.
-    fn optimize_multi<B, O>(self, optim: &mut O, lr: f64, grads: MultiGradientsParams) -> Self
+    fn optimize_multi(
+        self,
+        optim: &mut ModuleOptimizer,
+        lr_module: ModuleLearningRate,
+        grads: MultiGradientsParams,
+    ) -> Self
     where
-        B: AutodiffBackend,
-        O: Optimizer<Self, B>,
-        Self: AutodiffModule<B>,
+        Self: Module + Sized,
     {
-        optim.step_multi(lr, self, grads)
+        optim.step_multi(lr_module, self, grads)
     }
 }
 
@@ -122,8 +125,16 @@ pub trait InferenceStep {
 
 /// The result of a training, containing the model along with the [renderer](MetricsRenderer).
 pub struct LearningResult<M> {
-    /// The model with the learned weights.
+    /// The model with the learned weights, converted to validation mode.
+    ///
+    /// Call [`Module::train`](burn_core::module::Module::train) before using it for follow-up
+    /// training. To continue on another device, use `model.train().fork(device)`.
     pub model: M,
     /// The renderer that can be used for follow up training and evaluation.
     pub renderer: Box<dyn MetricsRenderer>,
+    /// The stop that ended training before its last epoch, if
+    /// [`Interrupter::stop`](crate::Interrupter::stop) was called and no error happened.
+    pub interrupted: Option<crate::Interruption>,
+    /// The error that ended training before its last epoch, if it hit one.
+    pub error: Option<std::sync::Arc<crate::TrainingError>>,
 }

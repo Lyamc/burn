@@ -1,13 +1,13 @@
 [package]
 authors = ["nathanielsimard <nathaniel.simard.42@gmail.com>"]
 categories = ["science", "no-std", "embedded", "wasm"]
-description = "Ndarray backend for the Burn framework"
+description = "[Deprecated] Ndarray backend for the Burn framework - use burn-flex, burn-cuda, burn-rocm, or burn-wgpu instead"
 documentation = "https://docs.rs/burn-ndarray"
 edition.workspace = true
 keywords = ["deep-learning", "machine-learning", "data"]
 license.workspace = true
 name = "burn-ndarray"
-readme.workspace = true
+readme = "README.md"
 repository = "https://github.com/tracel-ai/burn/tree/main/crates/burn-ndarray"
 version.workspace = true
 
@@ -35,7 +35,6 @@ multi-threads = [
 ]
 simd = ["macerator", "bytemuck", "seq-macro", "itertools"]
 std = [
-    "burn-autodiff",
     "burn-std/std",
     "burn-backend/std",
     "burn-ir/std",
@@ -47,7 +46,6 @@ std = [
     "macerator/std",
 ]
 tracing = [
-    "burn-autodiff?/tracing",
     "burn-std/tracing",
     "burn-backend/tracing",
     "burn-ir/tracing",
@@ -60,7 +58,6 @@ export_tests = []
 
 # ** Please make sure all dependencies support no_std when std is disabled **
 
-burn-autodiff = { workspace = true, optional = true }
 burn-std = { workspace = true }
 burn-ir = { workspace = true }
 burn-backend = { workspace = true }
@@ -78,16 +75,12 @@ rand = { workspace = true, default-features = false }
 
 # SIMD
 bytemuck = { workspace = true, optional = true }
-itertools = { version = "0.14", optional = true }
+itertools = { version = "0.15", optional = true }
 macerator = { workspace = true, optional = true }
 seq-macro = { version = "0.3", optional = true }
 
 # Parallel
 rayon = { workspace = true, optional = true }
-
-[target.'cfg(not(target_has_atomic = "ptr"))'.dependencies]
-portable-atomic = { workspace = true }
-portable-atomic-util = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }

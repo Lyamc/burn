@@ -1,6 +1,5 @@
 use super::*;
-use burn_tensor::backend::Backend;
-use burn_tensor::{DType, Element, Shape, TensorData, get_device_settings};
+use burn_tensor::{DType, Element, Shape, TensorData};
 
 // Floating point values might not match for other precisions
 fn skip_precision_not_f32() -> bool {
@@ -21,12 +20,10 @@ fn test_display_2d_int_tensor() {
  [7, 8, 9]],
   shape:  [3, 3],
   device:  {:?},
-  backend:  {:?},
   kind:  "Int",
   dtype:  "{dtype}",
 }}"#,
         tensor_int.device(),
-        TestBackend::name(&tensor_int.device()),
         dtype = core::any::type_name::<IntElem>(),
     );
     assert_eq!(output, expected);
@@ -50,12 +47,10 @@ fn test_display_2d_float_tensor() {
  [7.7, 8.8, 9.9]],
   shape:  [3, 3],
   device:  {:?},
-  backend:  {:?},
   kind:  "Float",
   dtype:  "f32",
 }}"#,
         tensor_float.device(),
-        TestBackend::name(&tensor_float.device()),
     );
     assert_eq!(output, expected);
 }
@@ -72,7 +67,7 @@ fn test_display_2d_bool_tensor() {
 
     let output = format!("{}", tensor_bool);
     // TODO: remove once backends no longer rely on generics for default elem types
-    let expected_name = match get_device_settings::<TestBackend>(&device).bool_dtype {
+    let expected_dtype_name = match device.settings().bool_dtype {
         burn_tensor::BoolDType::Native => DType::Bool(burn_tensor::BoolStore::Native).name(),
         burn_tensor::BoolDType::U8 => DType::Bool(burn_tensor::BoolStore::U8).name(),
         burn_tensor::BoolDType::U32 => DType::Bool(burn_tensor::BoolStore::U32).name(),
@@ -85,13 +80,11 @@ fn test_display_2d_bool_tensor() {
  [false, true, true]],
   shape:  [3, 3],
   device:  {:?},
-  backend:  {:?},
   kind:  "Bool",
   dtype:  {:?},
 }}"#,
         tensor_bool.device(),
-        TestBackend::name(&tensor_bool.device()),
-        expected_name,
+        expected_dtype_name,
     );
     assert_eq!(output, expected);
 }
@@ -116,12 +109,10 @@ fn test_display_3d_tensor() {
   [21, 22, 23, 24]]],
   shape:  [2, 3, 4],
   device:  {:?},
-  backend:  {:?},
   kind:  "Int",
   dtype:  "{dtype}",
 }}"#,
         tensor.device(),
-        TestBackend::name(&tensor.device()),
         dtype = core::any::type_name::<IntElem>(),
     );
     assert_eq!(output, expected);
@@ -150,12 +141,10 @@ fn test_display_4d_tensor() {
    [22, 23, 24]]]],
   shape:  [2, 2, 2, 3],
   device:  {:?},
-  backend:  {:?},
   kind:  "Int",
   dtype:  "{dtype}",
 }}"#,
         tensor.device(),
-        TestBackend::name(&tensor.device()),
         dtype = core::any::type_name::<IntElem>(),
     );
     assert_eq!(output, expected);
@@ -179,12 +168,10 @@ fn test_display_tensor_summarize_1() {
    [0.0, 0.0, 0.0, ..., 0.0, 0.0, 0.0]]]],
   shape:  [2, 2, 2, 1000],
   device:  {:?},
-  backend:  {:?},
   kind:  "Float",
   dtype:  "{dtype}",
 }}"#,
         tensor.device(),
-        TestBackend::name(&tensor.device()),
         dtype = FloatElem::dtype().name(),
     );
     assert_eq!(output, expected);
@@ -228,12 +215,10 @@ fn test_display_tensor_summarize_2() {
    [0.0, 0.0, 0.0, ..., 0.0, 0.0, 0.0]]]],
   shape:  [2, 2, 20, 100],
   device:  {:?},
-  backend:  {:?},
   kind:  "Float",
   dtype:  "{dtype}",
 }}"#,
         tensor.device(),
-        TestBackend::name(&tensor.device()),
         dtype = FloatElem::dtype().name(),
     );
     assert_eq!(output, expected);
@@ -277,12 +262,10 @@ fn test_display_tensor_summarize_3() {
    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]]],
   shape:  [2, 2, 200, 6],
   device:  {:?},
-  backend:  {:?},
   kind:  "Float",
   dtype:  "{dtype}",
 }}"#,
         tensor.device(),
-        TestBackend::name(&tensor.device()),
         dtype = FloatElem::dtype().name(),
     );
     assert_eq!(output, expected);
@@ -302,12 +285,10 @@ fn test_display_precision() {
 [[0.12345679]],
   shape:  [1, 1],
   device:  {:?},
-  backend:  {:?},
   kind:  "Float",
   dtype:  "f32",
 }}"#,
         tensor.device(),
-        TestBackend::name(&tensor.device()),
     );
     assert_eq!(output, expected);
 
@@ -331,12 +312,117 @@ fn test_display_precision() {
  [0.123, 0.123]],
   shape:  [3, 2],
   device:  {:?},
-  backend:  {:?},
   kind:  "Float",
   dtype:  "f32",
 }}"#,
         tensor.device(),
-        TestBackend::name(&tensor.device()),
     );
     assert_eq!(output, expected);
+}
+
+// Quantized tensors display identity metadata only: values are stored as codes with scales,
+// so `Display` points to `dequantize()` / `to_data()` instead of printing them.
+#[cfg(feature = "quantization")]
+mod quantized {
+    use super::super::super::quantization::qtensor::QTensor;
+    use super::*;
+    use burn_tensor::Device;
+    use burn_tensor::quantization::QuantValue;
+
+    const BLOCK_DATA: [[f32; 16]; 2] = [
+        [
+            -1.8, -1.0, 0.0, 0.5, -1.8, -1.0, 0.0, 0.5, 0.01, 0.025, 0.03, 0.04, 0.01, 0.025, 0.03,
+            0.04,
+        ],
+        [
+            0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6,
+        ],
+    ];
+
+    /// Asserts the full metadata-only display output of a quantized tensor.
+    fn assert_display<const D: usize>(tensor: &TestTensor<D>, shape: &str) {
+        let scheme = match tensor.dtype() {
+            DType::QFloat(scheme) => scheme,
+            _ => panic!("Expected a quantized dtype"),
+        };
+        let expected = format!(
+            r#"Tensor {{
+  data:  <quantized, use .dequantize() to view values>,
+  shape:  {shape},
+  device:  {:?},
+  kind:  "Float",
+  dtype:  "qfloat",
+  scheme:  {scheme:?},
+}}"#,
+            tensor.device(),
+        );
+        assert_eq!(format!("{}", tensor), expected);
+    }
+
+    #[test]
+    fn test_display_quantized_tensor() {
+        let tensor = QTensor::<2>::int8([[-127.0, 0.0, 64.0, 127.0], [1.0, -2.0, 3.0, -4.0]]);
+        assert_display(&tensor, "[2, 4]");
+    }
+
+    #[test]
+    fn test_display_quantized_block_tensor() {
+        let tensor = QTensor::<2>::int8_block(BLOCK_DATA);
+        assert_display(&tensor, "[2, 16]");
+    }
+
+    #[test]
+    fn test_display_quantized_large_tensor() {
+        // Above the print threshold: metadata-only display reads no data and never summarizes.
+        let tensor = QTensor::<2>::int8_block(TensorData::new(vec![0.5f32; 1024], [64usize, 16]));
+        assert_display(&tensor, "[64, 16]");
+    }
+
+    #[test]
+    fn test_display_quantized_data_default_scheme() {
+        // Built from quantized data since `quantize_dynamic` doesn't support every scheme on
+        // every backend.
+        let device = Device::default();
+        let data = TensorData::quantized(
+            vec![-127i8, -71, 0, 35],
+            [4],
+            device.settings().quantization.scheme,
+            &[0.014_173_228],
+            None,
+        );
+        assert_display(&TestTensor::<1>::from_data(data, &device), "[4]");
+    }
+
+    #[test]
+    fn test_display_quantized_precision() {
+        // Trailing dim must be divisible by 4 for packed storage on cubecl backends.
+        let tensor = QTensor::<1>::int8([1.0, 2.0, 3.0, 4.0]);
+        // Precision only affects float formatting; metadata display is unchanged.
+        assert_eq!(format!("{:.3}", tensor), format!("{}", tensor));
+    }
+
+    #[test]
+    fn test_display_quantized_data_float_codes() {
+        // Float-code schemes have no readable codes; `TensorData` display must not panic.
+        let device = Device::default();
+        let data = TensorData::quantized(
+            vec![-127i8, -71, 0, 35],
+            [4],
+            device
+                .settings()
+                .quantization
+                .scheme
+                .with_value(QuantValue::E4M3),
+            &[0.014_173_228],
+            None,
+        );
+        let scheme = match data.dtype() {
+            DType::QFloat(scheme) => scheme,
+            _ => panic!("Expected a quantized dtype"),
+        };
+        assert_eq!(
+            format!("{}", data),
+            format!("<float-quantized> {:?}", scheme)
+        );
+    }
 }

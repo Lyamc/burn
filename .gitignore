@@ -23,3 +23,12 @@ uv.lock
 
 # tags files
 tags
+
+examples/**/Cargo.lock
+
+# rustc self-profiling files
+*.mm_profdata
+*.stacks_folded
+*profiler.json
+# linker maps
+*.map

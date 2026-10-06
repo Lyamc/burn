@@ -6,10 +6,9 @@ use std::path::PathBuf;
 use crate::ModuleStore;
 use crate::pytorch::PytorchStore;
 use burn_core::module::Module;
+use burn_core::tensor::Tensor;
 use burn_nn::conv::{Conv2d, Conv2dConfig};
 use burn_nn::{Linear, LinearConfig};
-use burn_tensor::Tensor;
-use burn_tensor::backend::Backend;
 
 /// Path to pytorch test files (now under burn-store)
 fn pytorch_test_path(subdir: &str, filename: &str) -> PathBuf {
@@ -17,17 +16,6 @@ fn pytorch_test_path(subdir: &str, filename: &str) -> PathBuf {
         .join("pytorch-tests")
         .join("tests")
         .join(subdir)
-        .join(filename)
-}
-
-/// Path to burn-store test data files
-fn test_data_path(filename: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("pytorch")
-        .join("tests")
-        .join("reader")
-        .join("test_data")
         .join(filename)
 }
 
@@ -118,24 +106,25 @@ mod basic_tests {
 
 #[cfg(test)]
 mod linear_model_tests {
+    use burn_core::tensor::Device;
+
     use super::*;
-    type TestBackend = burn_flex::Flex;
 
     #[derive(Module, Debug)]
-    pub struct SimpleLinearModel<B: Backend> {
-        fc1: Linear<B>,
-        fc2: Linear<B>,
+    pub struct SimpleLinearModel {
+        fc1: Linear,
+        fc2: Linear,
     }
 
-    impl<B: Backend> SimpleLinearModel<B> {
-        pub fn new(device: &B::Device) -> Self {
+    impl SimpleLinearModel {
+        pub fn new(device: &Device) -> Self {
             Self {
                 fc1: LinearConfig::new(2, 3).init(device),
                 fc2: LinearConfig::new(3, 4).init(device),
             }
         }
 
-        pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        pub fn forward(&self, x: Tensor<2>) -> Tensor<2> {
             let x = self.fc1.forward(x);
             self.fc2.forward(x)
         }
@@ -147,11 +136,11 @@ mod linear_model_tests {
         let path = pytorch_test_path("linear", "linear.pt");
 
         // Create a model and load weights from PyTorch
-        let mut model = SimpleLinearModel::<TestBackend>::new(&device);
+        let mut model = SimpleLinearModel::new(&device);
         let mut store = PytorchStore::from_file(path).allow_partial(true);
 
         // Apply the PyTorch weights to our model
-        let result = store.apply_to::<TestBackend, _>(&mut model);
+        let result = store.apply_to(&mut model);
 
         assert!(
             result.is_ok(),
@@ -163,7 +152,7 @@ mod linear_model_tests {
         assert!(!result.applied.is_empty(), "No tensors were applied");
 
         // Test forward pass with loaded weights
-        let input = Tensor::<TestBackend, 2>::ones([1, 2], &device);
+        let input = Tensor::<2>::ones([1, 2], &device);
         let output = model.forward(input);
 
         // Verify output shape
@@ -177,8 +166,8 @@ mod linear_model_tests {
 
         // Single linear layer with bias
         #[derive(Module, Debug)]
-        struct LinearWithBias<B: Backend> {
-            fc1: Linear<B>,
+        struct LinearWithBias {
+            fc1: Linear,
         }
 
         let mut model = LinearWithBias {
@@ -187,7 +176,7 @@ mod linear_model_tests {
 
         let mut store = PytorchStore::from_file(path).allow_partial(true);
 
-        let result = store.apply_to::<TestBackend, _>(&mut model);
+        let result = store.apply_to(&mut model);
         assert!(result.is_ok(), "Failed to load model with bias");
 
         // Verify biases were loaded
@@ -201,14 +190,14 @@ mod linear_model_tests {
         let device = Default::default();
         let path = pytorch_test_path("linear", "linear.pt");
 
-        let mut model = SimpleLinearModel::<TestBackend>::new(&device);
+        let mut model = SimpleLinearModel::new(&device);
 
         // Only load fc1 layers
         let mut store = PytorchStore::from_file(path)
             .with_regex(r"^fc1\.")
             .allow_partial(true);
 
-        let result = store.apply_to::<TestBackend, _>(&mut model).unwrap();
+        let result = store.apply_to(&mut model).unwrap();
 
         // Should only have fc1 tensors
         for tensor in &result.applied {
@@ -224,9 +213,9 @@ mod linear_model_tests {
 
         // Model with different layer names
         #[derive(Module, Debug)]
-        struct RemappedModel<B: Backend> {
-            linear1: Linear<B>,
-            linear2: Linear<B>,
+        struct RemappedModel {
+            linear1: Linear,
+            linear2: Linear,
         }
 
         let mut model = RemappedModel {
@@ -239,7 +228,7 @@ mod linear_model_tests {
             .with_key_remapping(r"^fc2\.", "linear2.")
             .allow_partial(true);
 
-        let result = store.apply_to::<TestBackend, _>(&mut model);
+        let result = store.apply_to(&mut model);
         assert!(result.is_ok(), "Failed to load with remapped names");
 
         let result = result.unwrap();
@@ -251,18 +240,18 @@ mod linear_model_tests {
 
 #[cfg(test)]
 mod conv_model_tests {
+    use burn_core::tensor::Device;
+
     use super::*;
 
-    type TestBackend = burn_flex::Flex;
-
     #[derive(Module, Debug)]
-    struct SimpleConvModel<B: Backend> {
-        conv1: Conv2d<B>,
-        conv2: Conv2d<B>,
+    struct SimpleConvModel {
+        conv1: Conv2d,
+        conv2: Conv2d,
     }
 
-    impl<B: Backend> SimpleConvModel<B> {
-        pub fn new(device: &B::Device) -> Self {
+    impl SimpleConvModel {
+        pub fn new(device: &Device) -> Self {
             Self {
                 conv1: Conv2dConfig::new([3, 16], [3, 3]).init(device),
                 conv2: Conv2dConfig::new([16, 32], [3, 3]).init(device),
@@ -281,10 +270,10 @@ mod conv_model_tests {
             return;
         }
 
-        let mut model = SimpleConvModel::<TestBackend>::new(&device);
+        let mut model = SimpleConvModel::new(&device);
         let mut store = PytorchStore::from_file(path).allow_partial(true);
 
-        let result = store.apply_to::<TestBackend, _>(&mut model);
+        let result = store.apply_to(&mut model);
 
         if let Ok(result) = result {
             assert!(!result.applied.is_empty(), "No conv tensors applied");
@@ -314,46 +303,6 @@ mod conv_model_tests {
 #[cfg(test)]
 mod complex_model_tests {
     use super::*;
-    type TestBackend = burn_flex::Flex;
-
-    #[test]
-    fn test_load_with_top_level_key() {
-        let path = test_data_path("checkpoint.pt");
-
-        // Just verify that we can create a store with top-level key
-        let store = PytorchStore::from_file(path)
-            .with_top_level_key("model_state_dict")
-            .allow_partial(true);
-
-        assert_eq!(store.top_level_key, Some("model_state_dict".to_string()));
-    }
-
-    #[test]
-    fn test_load_nested_structure() {
-        let path = test_data_path("complex_structure.pt");
-
-        // Just verify that we can create a store for nested structure
-        let store = PytorchStore::from_file(path).allow_partial(true);
-
-        assert!(store.allow_partial);
-    }
-
-    #[test]
-    fn test_legacy_format() {
-        let path = test_data_path("simple_legacy.pt");
-
-        if !path.exists() {
-            println!("Skipping legacy format test - file not found: {:?}", path);
-            return;
-        }
-
-        // Just verify that we can create a store for legacy format
-        let store = PytorchStore::from_file(path).allow_partial(true);
-
-        assert!(store.allow_partial);
-
-        // Could load into an actual model if we had legacy model structure
-    }
 
     #[test]
     fn test_key_remap_chained() {
@@ -368,9 +317,9 @@ mod complex_model_tests {
 
         // Model with different layer names that need remapping
         #[derive(Module, Debug)]
-        struct RemappedChainModel<B: Backend> {
-            convolution1: Linear<B>, // Will be remapped from fc1
-            linear2: Linear<B>,      // Will be remapped from fc2
+        struct RemappedChainModel {
+            convolution1: Linear, // Will be remapped from fc1
+            linear2: Linear,      // Will be remapped from fc2
         }
 
         let mut model = RemappedChainModel {
@@ -384,7 +333,7 @@ mod complex_model_tests {
             .with_key_remapping(r"^fc2\.", "linear2.")
             .allow_partial(true);
 
-        let result = store.apply_to::<TestBackend, _>(&mut model);
+        let result = store.apply_to(&mut model);
 
         if let Ok(result) = result {
             // Check that remapped names were applied
@@ -398,18 +347,18 @@ mod complex_model_tests {
 
 #[cfg(test)]
 mod adapter_tests {
+    use burn_core::tensor::Device;
+
     use super::*;
 
-    type TestBackend = burn_flex::Flex;
-
     #[derive(Module, Debug)]
-    pub struct SimpleLinearModel<B: Backend> {
-        fc1: Linear<B>,
-        fc2: Linear<B>,
+    pub struct SimpleLinearModel {
+        fc1: Linear,
+        fc2: Linear,
     }
 
-    impl<B: Backend> SimpleLinearModel<B> {
-        pub fn new(device: &B::Device) -> Self {
+    impl SimpleLinearModel {
+        pub fn new(device: &Device) -> Self {
             Self {
                 fc1: LinearConfig::new(2, 3).init(device),
                 fc2: LinearConfig::new(3, 4).init(device),
@@ -428,11 +377,11 @@ mod adapter_tests {
         }
 
         let device = Default::default();
-        let mut model = SimpleLinearModel::<TestBackend>::new(&device);
+        let mut model = SimpleLinearModel::new(&device);
 
         let mut store = PytorchStore::from_file(path).allow_partial(true);
 
-        let result = store.apply_to::<TestBackend, _>(&mut model);
+        let result = store.apply_to(&mut model);
 
         // PyTorchToBurnAdapter is always applied internally
         assert!(
@@ -454,14 +403,14 @@ mod adapter_tests {
         }
 
         let device = Default::default();
-        let mut model = SimpleLinearModel::<TestBackend>::new(&device);
+        let mut model = SimpleLinearModel::new(&device);
 
         // Filter to exclude bias tensors
         let mut store = PytorchStore::from_file(path)
             .with_predicate(|path, _| !path.contains("bias"))
             .allow_partial(true);
 
-        let result = store.apply_to::<TestBackend, _>(&mut model).unwrap();
+        let result = store.apply_to(&mut model).unwrap();
 
         // Should not have any bias tensors due to filtering
         for applied_path in &result.applied {
@@ -476,17 +425,18 @@ mod adapter_tests {
 
 #[cfg(test)]
 mod error_handling_tests {
+    use burn_core::tensor::Device;
+
     use super::*;
-    use burn_flex::Flex;
 
     #[derive(Module, Debug)]
-    pub struct SimpleLinearModel<B: Backend> {
-        fc1: Linear<B>,
-        fc2: Linear<B>,
+    pub struct SimpleLinearModel {
+        fc1: Linear,
+        fc2: Linear,
     }
 
-    impl<B: Backend> SimpleLinearModel<B> {
-        pub fn new(device: &B::Device) -> Self {
+    impl SimpleLinearModel {
+        pub fn new(device: &Device) -> Self {
             Self {
                 fc1: LinearConfig::new(2, 3).init(device),
                 fc2: LinearConfig::new(3, 4).init(device),
@@ -497,10 +447,10 @@ mod error_handling_tests {
     #[test]
     fn test_missing_file() {
         let device = Default::default();
-        let mut model = SimpleLinearModel::<Flex>::new(&device);
+        let mut model = SimpleLinearModel::new(&device);
         let mut store = PytorchStore::from_file("nonexistent.pth");
 
-        let result = store.apply_to::<Flex, _>(&mut model);
+        let result = store.apply_to(&mut model);
 
         assert!(result.is_err());
         match result {
@@ -522,11 +472,11 @@ mod error_handling_tests {
         }
 
         let device = Default::default();
-        let mut model = SimpleLinearModel::<Flex>::new(&device);
+        let mut model = SimpleLinearModel::new(&device);
 
         let mut store = PytorchStore::from_file(path).with_top_level_key("nonexistent_key");
 
-        let result = store.apply_to::<Flex, _>(&mut model);
+        let result = store.apply_to(&mut model);
 
         assert!(result.is_err(), "Should fail with invalid top level key");
     }
@@ -544,7 +494,7 @@ mod error_handling_tests {
         }
 
         let device = Default::default();
-        let mut model = SimpleLinearModel::<Flex>::new(&device);
+        let mut model = SimpleLinearModel::new(&device);
 
         // Apply very restrictive filter that matches nothing
         let mut store = PytorchStore::from_file(path)
@@ -552,7 +502,7 @@ mod error_handling_tests {
             .validate(true)
             .allow_partial(false);
 
-        let result = store.apply_to::<Flex, _>(&mut model);
+        let result = store.apply_to(&mut model);
 
         // Should fail because no tensors match and allow_partial is false
         assert!(
@@ -564,30 +514,31 @@ mod error_handling_tests {
 
 #[cfg(test)]
 mod enum_variant_tests {
+    use burn_core::tensor::Device;
+
     use super::*;
     use crate::ModuleSnapshot;
-    use burn_flex::Flex;
 
     /// Enum representing different convolution block types (similar to YOLOX architecture)
     #[derive(Module, Debug)]
-    pub enum ConvBlock<B: Backend> {
+    pub enum ConvBlock {
         /// Base convolution block
-        BaseConv(Linear<B>),
+        BaseConv(Linear),
         /// Depthwise separable convolution block
-        DwsConv(Linear<B>),
+        DwsConv(Linear),
     }
 
     /// Model with enum field that will have variant names in Burn paths
     #[derive(Module, Debug)]
-    pub struct ModelWithEnum<B: Backend> {
+    pub struct ModelWithEnum {
         /// Feature extractor with enum variants
-        feature: ConvBlock<B>,
+        feature: ConvBlock,
         /// Output classifier
-        classifier: Linear<B>,
+        classifier: Linear,
     }
 
-    impl<B: Backend> ModelWithEnum<B> {
-        pub fn new(device: &B::Device) -> Self {
+    impl ModelWithEnum {
+        pub fn new(device: &Device) -> Self {
             Self {
                 feature: ConvBlock::BaseConv(LinearConfig::new(3, 64).init(device)),
                 classifier: LinearConfig::new(64, 10).init(device),
@@ -598,7 +549,7 @@ mod enum_variant_tests {
     #[test]
     fn test_enum_variant_path_mismatch() {
         let device = Default::default();
-        let mut model = ModelWithEnum::<Flex>::new(&device);
+        let mut model = ModelWithEnum::new(&device);
 
         // Load PyTorch model that was generated without enum variant names
         // PyTorch paths: "feature.weight", "feature.bias", "classifier.weight", "classifier.bias"
@@ -614,7 +565,7 @@ mod enum_variant_tests {
             .allow_partial(true) // Allow partial to see what's missing
             .validate(false); // Disable validation to get detailed missing info
 
-        let result = store.apply_to::<Flex, _>(&mut model);
+        let result = store.apply_to(&mut model);
 
         // The load should succeed (allow_partial=true) but report missing tensors
         match result {
@@ -670,39 +621,44 @@ mod enum_variant_tests {
         }
     }
 
+    /// The traversal has to recognize an enum variant as such. The container stack that
+    /// records it is consumed during the walk rather than kept on the collected tensor, so
+    /// check it through what it controls: the variant name appears in a collected path, and
+    /// `skip_enum_variants` is what takes it back out.
     #[test]
-    fn test_enum_variant_detection_in_container_stack() {
+    fn enum_variant_appears_in_path_unless_skipped() {
         let device = Default::default();
 
         // Create model with enum
-        let model = ModelWithEnum::<Flex>::new(&device);
+        let model = ModelWithEnum::new(&device);
 
-        // Collect snapshots to inspect container stacks
-        let snapshots = model.collect(None, None, false);
+        let names = |skip_enum_variants: bool| {
+            let mut names: Vec<String> = model
+                .collect(None, None, skip_enum_variants)
+                .iter()
+                .map(|t| t.name.clone())
+                .filter(|name| name.starts_with("feature"))
+                .collect();
+            names.sort();
+            names
+        };
 
-        // Find a snapshot from inside the enum
-        let enum_snapshot = snapshots
-            .iter()
-            .find(|s| s.full_path().contains("feature"))
-            .expect("Should have feature snapshots");
-
-        // Verify container stack contains enum marker
-        if let Some(container_stack) = &enum_snapshot.container_stack {
-            let container_str = container_stack.join(".");
-            assert!(
-                container_str.contains("Enum:ConvBlock"),
-                "Container stack should contain Enum:ConvBlock marker. Got: {}",
-                container_str
-            );
-        } else {
-            panic!("Snapshot should have container_stack");
-        }
+        assert_eq!(
+            names(false),
+            vec!["feature.BaseConv.bias", "feature.BaseConv.weight"],
+            "the enum variant should appear in the collected path"
+        );
+        assert_eq!(
+            names(true),
+            vec!["feature.bias", "feature.weight"],
+            "skip_enum_variants should drop the variant it detected"
+        );
     }
 
     #[test]
     fn test_skip_enum_variants_feature() {
         let device = Default::default();
-        let mut model = ModelWithEnum::<Flex>::new(&device);
+        let mut model = ModelWithEnum::new(&device);
 
         // Load PyTorch model that was generated without enum variant names
         // PyTorch paths: "feature.weight", "feature.bias", "classifier.weight", "classifier.bias"
@@ -716,7 +672,7 @@ mod enum_variant_tests {
             .allow_partial(true)
             .validate(false);
 
-        let result = store.apply_to::<Flex, _>(&mut model);
+        let result = store.apply_to(&mut model);
 
         // The load should succeed and all tensors should be loaded
         match result {
@@ -762,7 +718,7 @@ mod direct_access_tests {
     use super::*;
 
     #[test]
-    fn test_get_all_snapshots() {
+    fn test_get_all_tensors() {
         let path = pytorch_test_path("linear", "linear.pt");
 
         if !path.exists() {
@@ -771,7 +727,7 @@ mod direct_access_tests {
         }
 
         let mut store = PytorchStore::from_file(path);
-        let snapshots = store.get_all_snapshots().unwrap();
+        let snapshots = store.get_all_tensors().unwrap();
 
         // linear.pt should have fc1.weight, fc1.bias, fc2.weight, fc2.bias
         assert!(!snapshots.is_empty(), "Should have snapshots");
@@ -786,7 +742,7 @@ mod direct_access_tests {
     }
 
     #[test]
-    fn test_get_snapshot_existing() {
+    fn test_get_tensor_existing() {
         let path = pytorch_test_path("linear", "linear.pt");
 
         if !path.exists() {
@@ -797,7 +753,7 @@ mod direct_access_tests {
         let mut store = PytorchStore::from_file(path);
 
         // Get existing snapshot
-        let snapshot = store.get_snapshot("fc1.weight").unwrap();
+        let snapshot = store.get_tensor("fc1.weight").unwrap();
         assert!(snapshot.is_some(), "Should find fc1.weight");
 
         let snapshot = snapshot.unwrap();
@@ -805,12 +761,12 @@ mod direct_access_tests {
         assert_eq!(snapshot.shape.len(), 2, "Weight should be 2D tensor");
 
         // Verify we can load data
-        let data = snapshot.to_data().unwrap();
-        assert!(!data.bytes.is_empty(), "Data should not be empty");
+        let data = crate::bridge::to_data(snapshot).unwrap();
+        assert!(!data.bytes().is_empty(), "Data should not be empty");
     }
 
     #[test]
-    fn test_get_snapshot_not_found() {
+    fn test_get_tensor_not_found() {
         let path = pytorch_test_path("linear", "linear.pt");
 
         if !path.exists() {
@@ -821,7 +777,7 @@ mod direct_access_tests {
         let mut store = PytorchStore::from_file(path);
 
         // Get non-existent snapshot
-        let snapshot = store.get_snapshot("nonexistent.weight").unwrap();
+        let snapshot = store.get_tensor("nonexistent.weight").unwrap();
         assert!(snapshot.is_none(), "Should not find nonexistent tensor");
     }
 
@@ -864,8 +820,8 @@ mod direct_access_tests {
         let keys = store.keys().unwrap();
         assert!(!keys.is_empty(), "Should have keys via fast path");
 
-        // Now call get_all_snapshots to populate cache
-        let snapshots = store.get_all_snapshots().unwrap();
+        // Now call get_all_tensors to populate cache
+        let snapshots = store.get_all_tensors().unwrap();
         assert!(!snapshots.is_empty(), "Should have snapshots");
 
         // keys() should now use the cached data
@@ -885,18 +841,18 @@ mod direct_access_tests {
         let mut store = PytorchStore::from_file(path);
 
         // First call populates cache
-        let snapshots1 = store.get_all_snapshots().unwrap();
+        let snapshots1 = store.get_all_tensors().unwrap();
         let count1 = snapshots1.len();
 
         // Second call uses cache
-        let snapshots2 = store.get_all_snapshots().unwrap();
+        let snapshots2 = store.get_all_tensors().unwrap();
         let count2 = snapshots2.len();
 
         assert_eq!(count1, count2, "Cached results should match");
     }
 
     #[test]
-    fn test_get_all_snapshots_with_remapping() {
+    fn test_get_all_tensors_with_remapping() {
         let path = pytorch_test_path("linear", "linear.pt");
 
         if !path.exists() {
@@ -907,7 +863,7 @@ mod direct_access_tests {
         // Create store with key remapping
         let mut store = PytorchStore::from_file(path).with_key_remapping(r"^fc1\.", "linear1.");
 
-        let snapshots = store.get_all_snapshots().unwrap();
+        let snapshots = store.get_all_tensors().unwrap();
 
         // Should have remapped keys
         assert!(
@@ -928,7 +884,7 @@ mod direct_access_tests {
     }
 
     #[test]
-    fn test_get_snapshot_with_remapped_name() {
+    fn test_get_tensor_with_remapped_name() {
         let path = pytorch_test_path("linear", "linear.pt");
 
         if !path.exists() {
@@ -940,11 +896,11 @@ mod direct_access_tests {
         let mut store = PytorchStore::from_file(path).with_key_remapping(r"^fc1\.", "linear1.");
 
         // Should find by remapped name
-        let snapshot = store.get_snapshot("linear1.weight").unwrap();
+        let snapshot = store.get_tensor("linear1.weight").unwrap();
         assert!(snapshot.is_some(), "Should find tensor by remapped name");
 
         // Should NOT find by original name
-        let snapshot_orig = store.get_snapshot("fc1.weight").unwrap();
+        let snapshot_orig = store.get_tensor("fc1.weight").unwrap();
         assert!(
             snapshot_orig.is_none(),
             "Should not find tensor by original name after remapping"
@@ -952,7 +908,7 @@ mod direct_access_tests {
     }
 
     #[test]
-    fn test_get_all_snapshots_ignores_filter() {
+    fn test_get_all_tensors_ignores_filter() {
         let path = pytorch_test_path("linear", "linear.pt");
 
         if !path.exists() {
@@ -963,8 +919,8 @@ mod direct_access_tests {
         // Create store with filter that only matches fc1
         let mut store = PytorchStore::from_file(path).with_regex(r"^fc1\.");
 
-        // get_all_snapshots should return ALL tensors regardless of filter
-        let snapshots = store.get_all_snapshots().unwrap();
+        // get_all_tensors should return ALL tensors regardless of filter
+        let snapshots = store.get_all_tensors().unwrap();
 
         // Should have both fc1 and fc2 tensors
         assert!(
@@ -973,7 +929,7 @@ mod direct_access_tests {
         );
         assert!(
             snapshots.contains_key("fc2.weight"),
-            "Should contain fc2.weight (filter not applied to get_all_snapshots)"
+            "Should contain fc2.weight (filter not applied to get_all_tensors)"
         );
     }
 }
@@ -981,17 +937,18 @@ mod direct_access_tests {
 /// Tests for contiguous index mapping feature
 #[cfg(test)]
 mod map_indices_contiguous_tests {
+    use burn_core::tensor::Device;
+
     use super::*;
-    type TestBackend = burn_flex::Flex;
 
     /// Model with a Vec of Conv2d layers that expects contiguous indices
     #[derive(Module, Debug)]
-    struct SequentialConvModel<B: Backend> {
-        fc: Vec<Conv2d<B>>,
+    struct SequentialConvModel {
+        fc: Vec<Conv2d>,
     }
 
-    impl<B: Backend> SequentialConvModel<B> {
-        pub fn new(device: &B::Device, num_layers: usize) -> Self {
+    impl SequentialConvModel {
+        pub fn new(device: &Device, num_layers: usize) -> Self {
             Self {
                 fc: (0..num_layers)
                     .map(|_| {
@@ -1020,7 +977,7 @@ mod map_indices_contiguous_tests {
         let device = Default::default();
 
         // Create model with 5 conv layers (matching the PyTorch model)
-        let mut model = SequentialConvModel::<TestBackend>::new(&device, 5);
+        let mut model = SequentialConvModel::new(&device, 5);
 
         // Load with contiguous index mapping enabled (default)
         let mut store = PytorchStore::from_file(&path)
@@ -1028,7 +985,7 @@ mod map_indices_contiguous_tests {
             .allow_partial(true)
             .validate(false);
 
-        let result = store.apply_to::<TestBackend, _>(&mut model);
+        let result = store.apply_to(&mut model);
 
         match result {
             Ok(apply_result) => {
@@ -1097,7 +1054,7 @@ mod map_indices_contiguous_tests {
         let device = Default::default();
 
         // Create model with 5 conv layers
-        let mut model = SequentialConvModel::<TestBackend>::new(&device, 5);
+        let mut model = SequentialConvModel::new(&device, 5);
 
         // Load with contiguous index mapping DISABLED
         let mut store = PytorchStore::from_file(&path)
@@ -1105,7 +1062,7 @@ mod map_indices_contiguous_tests {
             .allow_partial(true)
             .validate(false);
 
-        let result = store.apply_to::<TestBackend, _>(&mut model);
+        let result = store.apply_to(&mut model);
 
         match result {
             Ok(apply_result) => {
@@ -1196,5 +1153,25 @@ mod map_indices_contiguous_tests {
             !keys_no_mapping.iter().any(|k| k.starts_with("fc.1.")),
             "Without index mapping, should NOT have fc.1 (not in original file)"
         );
+    }
+
+    #[test]
+    fn test_builder_after_read_rebuilds_cache() {
+        let path = pytorch_test_path("non_contiguous_indexes", "non_contiguous_indexes.pt");
+
+        if !path.exists() {
+            println!("Skipping test - file not found: {:?}", path);
+            return;
+        }
+
+        // First read populates the cache with mapped names (fc.2 -> fc.1)
+        let mut store = PytorchStore::from_file(&path);
+        assert!(store.keys().unwrap().contains(&"fc.1.weight".to_string()));
+
+        // Reconfiguring must not serve the stale names
+        let mut store = store.map_indices_contiguous_except(r"^fc$");
+        let keys = store.keys().unwrap();
+        assert!(keys.contains(&"fc.2.weight".to_string()), "{keys:?}");
+        assert!(!keys.contains(&"fc.1.weight".to_string()), "{keys:?}");
     }
 }

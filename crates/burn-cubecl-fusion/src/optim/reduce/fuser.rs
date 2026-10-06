@@ -11,22 +11,21 @@ use crate::{
     optim::CubeOptimization,
 };
 use burn_fusion::{FuserStatus, OperationFuser};
-use burn_ir::{NumericOperationIr, OperationIr, ReduceDimOpIr};
+use burn_ir::{BaseOperationIr, NumericOperationIr, OperationIr, ReduceDimOpIr};
 use burn_std::Shape;
-use cubecl::Runtime;
 
 /// Fuses element wise operations around a reduce operation.
-pub struct ReduceFuser<R: Runtime> {
+pub struct ReduceFuser {
     pub(crate) fuser: TraceOperationFuser,
     pub(crate) fuser_read_fallback: TraceOperationFuser,
     fuser_write_fallback: TraceOperationFuser,
     settings_write: FuseSettings,
-    pub(crate) device: R::Device,
+    pub(crate) device: cubecl::Device,
     pub(crate) reduce: Option<FusedReduce>,
     settings: ReduceSettings,
 }
 
-impl<R: Runtime> Clone for ReduceFuser<R> {
+impl Clone for ReduceFuser {
     fn clone(&self) -> Self {
         Self {
             fuser: self.fuser.clone(),
@@ -46,15 +45,16 @@ pub enum ReduceFuserInfo {
     FusedElemwise { shape_id: Shape },
 }
 
-impl<R: Runtime> ReduceFuser<R> {
-    pub fn new(device: R::Device, settings: ReduceSettings) -> Self {
-        let client = R::client(&device);
+impl ReduceFuser {
+    pub fn new(device: cubecl::Device, settings: ReduceSettings) -> Self {
+        let client = device.client();
         let props = client.properties();
         let max_bindings = props.hardware.max_bindings;
         let settings_read = FuseSettings {
             // Inplace would work, but not when we have a concrete output to write too.
             inplace: true,
             ref_layout: RefLayoutSetting::OnlyContiguous,
+            choose_output_layout: false,
             broadcast: false,
             output_shape_updates: true,
             vectorization: VectorizationSetting::Activated,
@@ -65,6 +65,7 @@ impl<R: Runtime> ReduceFuser<R> {
             vectorization: VectorizationSetting::SmallerOrEqualThanPreviousBlock { block_pos: 0 },
             broadcast: false,
             ref_layout: RefLayoutSetting::OnlyContiguous,
+            choose_output_layout: false,
         };
         let settings_fallback = FuseSettings::default();
 
@@ -188,9 +189,32 @@ impl<R: Runtime> ReduceFuser<R> {
             }
         };
     }
+
+    /// Build the reduce optimization from the fused operations. The typed
+    /// counterpart of [`OperationFuser::finish`], for callers that compose the
+    /// optimization further (the broadcasted-reduce blocks reuse its info).
+    pub(crate) fn finish_reduce(&mut self) -> ReduceOptimization {
+        let client = self.device.client();
+        let trace = self.fuser.finish();
+        let trace_read_fallback = self.fuser_read_fallback.finish();
+        let trace_write_fallback = self.fuser_write_fallback.finish();
+        let fuse_reduce = self.reduce.as_ref().unwrap();
+
+        ReduceOptimization::new(
+            trace,
+            trace_read_fallback,
+            trace_write_fallback,
+            client,
+            self.device.clone(),
+            self.len(),
+            self.fuser_read_fallback.len(),
+            fuse_reduce.clone(),
+            self.settings,
+        )
+    }
 }
 
-impl<R: Runtime> OperationFuser<CubeOptimization<R>> for ReduceFuser<R> {
+impl OperationFuser<CubeOptimization> for ReduceFuser {
     fn fuse(&mut self, operation: &OperationIr) {
         if let FuserStatus::Closed = self.fuser.status() {
             return;
@@ -257,6 +281,21 @@ impl<R: Runtime> OperationFuser<CubeOptimization<R>> for ReduceFuser<R> {
                         self.on_elemwise_read(operation);
                     }
                 };
+            } else if let OperationIr::BaseBool(op)
+            | OperationIr::BaseFloat(op)
+            | OperationIr::BaseInt(op) = operation
+            {
+                match op {
+                    BaseOperationIr::AnyDim(op) => {
+                        self.on_reduce(op, ReduceInstruction::Any);
+                    }
+                    BaseOperationIr::AllDim(op) => {
+                        self.on_reduce(op, ReduceInstruction::All);
+                    }
+                    _ => {
+                        self.on_elemwise_read(operation);
+                    }
+                }
             } else {
                 self.on_elemwise_read(operation);
             }
@@ -265,26 +304,8 @@ impl<R: Runtime> OperationFuser<CubeOptimization<R>> for ReduceFuser<R> {
         }
     }
 
-    fn finish(&mut self) -> CubeOptimization<R> {
-        let client = R::client(&self.device);
-        let trace = self.fuser.finish();
-        let trace_read_fallback = self.fuser_read_fallback.finish();
-        let trace_write_fallback = self.fuser_write_fallback.finish();
-        let fuse_reduce = self.reduce.as_ref().unwrap();
-
-        let reduce = ReduceOptimization::new(
-            trace,
-            trace_read_fallback,
-            trace_write_fallback,
-            client,
-            self.device.clone(),
-            self.len(),
-            self.fuser_read_fallback.len(),
-            fuse_reduce.clone(),
-            self.settings,
-        );
-
-        CubeOptimization::Reduce(reduce)
+    fn finish(&mut self) -> CubeOptimization {
+        CubeOptimization::new(self.finish_reduce())
     }
 
     fn reset(&mut self) {
@@ -308,7 +329,7 @@ impl<R: Runtime> OperationFuser<CubeOptimization<R>> for ReduceFuser<R> {
         self.fuser.len() + if self.reduce.is_some() { 1 } else { 0 }
     }
 
-    fn clone_dyn(&self) -> Box<dyn OperationFuser<CubeOptimization<R>>> {
+    fn clone_dyn(&self) -> Box<dyn OperationFuser<CubeOptimization>> {
         Box::new(self.clone())
     }
 }

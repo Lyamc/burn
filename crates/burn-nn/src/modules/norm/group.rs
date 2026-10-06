@@ -1,12 +1,16 @@
-use burn::module::Initializer;
+use crate::Initializer;
 use burn_core as burn;
 
 use burn::config::Config;
 use burn::module::Module;
 use burn::module::Param;
 use burn::module::{Content, DisplaySettings, ModuleDisplay};
+use burn::tensor::Device;
+use burn::tensor::FloatDType;
 use burn::tensor::Tensor;
-use burn::tensor::backend::Backend;
+use burn::tensor::assert_shape;
+
+use super::accumulation_dtype;
 
 /// Configuration to create a [GroupNorm](GroupNorm) layer using the [init function](GroupNormConfig::init).
 #[derive(Debug, Config)]
@@ -38,11 +42,11 @@ pub struct GroupNormConfig {
 /// Should be created using [GroupNormConfig](GroupNormConfig).
 #[derive(Module, Debug)]
 #[module(custom_display)]
-pub struct GroupNorm<B: Backend> {
+pub struct GroupNorm {
     /// The learnable weight
-    pub gamma: Option<Param<Tensor<B, 1>>>,
+    pub gamma: Option<Param<Tensor<1>>>,
     /// The learnable bias
-    pub beta: Option<Param<Tensor<B, 1>>>,
+    pub beta: Option<Param<Tensor<1>>>,
     /// The number of groups to separate the channels into
     pub num_groups: usize,
     /// The number of channels expected in the input
@@ -53,7 +57,7 @@ pub struct GroupNorm<B: Backend> {
     pub affine: bool,
 }
 
-impl<B: Backend> ModuleDisplay for GroupNorm<B> {
+impl ModuleDisplay for GroupNorm {
     fn custom_settings(&self) -> Option<DisplaySettings> {
         DisplaySettings::new()
             .with_new_line_after_attribute(false)
@@ -72,7 +76,7 @@ impl<B: Backend> ModuleDisplay for GroupNorm<B> {
 
 impl GroupNormConfig {
     /// Initialize a new [group norm](GroupNorm) module.
-    pub fn init<B: Backend>(&self, device: &B::Device) -> GroupNorm<B> {
+    pub fn init(&self, device: &Device) -> GroupNorm {
         assert_eq!(
             self.num_channels % self.num_groups,
             0,
@@ -99,7 +103,7 @@ impl GroupNormConfig {
     }
 }
 
-impl<B: Backend> GroupNorm<B> {
+impl GroupNorm {
     /// Applies the forward pass on the input tensor.
     ///
     /// See [GroupNorm](GroupNorm) for more information.
@@ -108,14 +112,12 @@ impl<B: Backend> GroupNorm<B> {
     ///
     /// - input: `[batch_size, num_channels, *]`
     /// - output: `[batch_size, num_channels, *]`
-    pub fn forward<const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
-        if input.shape()[1] != self.num_channels {
-            panic!(
-                "The number of channels in the input tensor should be equal to the number of channels in the GroupNorm module. Expected {}, got {}",
-                self.num_channels,
-                input.shape()[1]
-            );
-        }
+    ///
+    /// # Panics
+    ///
+    /// Panics if the input has rank < 2 or its second axis is not `num_channels`.
+    pub fn forward<const D: usize>(&self, input: Tensor<D>) -> Tensor<D> {
+        assert_shape!(input, [_, self.num_channels, ..]);
 
         let gamma = self.gamma.as_ref().map(|x| x.val());
         let beta = self.beta.as_ref().map(|x| x.val());
@@ -141,14 +143,14 @@ impl<B: Backend> GroupNorm<B> {
 /// - `γ` is the learnable weight
 /// - `β` is the learnable bias
 ///
-pub(crate) fn group_norm<B: Backend, const D: usize>(
-    input: Tensor<B, D>,
-    gamma: Option<Tensor<B, 1>>,
-    beta: Option<Tensor<B, 1>>,
+pub(crate) fn group_norm<const D: usize>(
+    input: Tensor<D>,
+    gamma: Option<Tensor<1>>,
+    beta: Option<Tensor<1>>,
     num_groups: usize,
     epsilon: f64,
     affine: bool,
-) -> Tensor<B, D> {
+) -> Tensor<D> {
     if (beta.is_none() || gamma.is_none()) && affine {
         panic!("Affine is set to true, but gamma or beta is None");
     }
@@ -167,11 +169,29 @@ pub(crate) fn group_norm<B: Backend, const D: usize>(
     let hidden_size = shape[2..].iter().product::<usize>() * num_channels / num_groups;
     let input = input.reshape([batch_size, num_groups, hidden_size]);
 
-    let mean = input.clone().sum_dim(2) / hidden_size as f64;
+    // Widen before the reduction when the input dtype cannot hold a sum of
+    // squares (see [`accumulation_dtype`]); `square()` below is what overflows.
+    // Narrowed again straight after, so the affine still runs at the model's
+    // own dtype and only the statistics pay for the wider arithmetic.
+    let original: FloatDType = input.dtype().into();
+    let widened = accumulation_dtype(input.dtype());
+    let input = match widened {
+        Some(dtype) => input.cast(dtype),
+        None => input,
+    };
+
+    // Keep the denominator inside the backend reduction so it is applied in
+    // the accumulator precision instead of through a narrow `div_scalar`.
+    let mean = input.clone().mean_dim(2);
     let input = input.sub(mean);
 
-    let var = input.clone().square().sum_dim(2) / hidden_size as f64;
+    let var = input.clone().square().mean_dim(2);
     let input_normalized = input.div(var.add_scalar(epsilon).sqrt());
+
+    let input_normalized = match widened {
+        Some(_) => input_normalized.cast(original),
+        None => input_normalized,
+    };
 
     if affine {
         let mut affine_shape = [1; D];
@@ -189,23 +209,30 @@ pub(crate) fn group_norm<B: Backend, const D: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestBackend;
     use alloc::format;
     use burn::tensor::TensorData;
-    use burn::tensor::{Tolerance, ops::FloatElem};
-    type FT = FloatElem<TestBackend>;
+    use burn::tensor::Tolerance;
+    type FT = f32;
+
+    #[test]
+    #[should_panic(
+        expected = "assert_shape!(input, [_, self.num_channels, ..]): axis 1 expected 6, got 4"
+    )]
+    fn input_channels_must_match() {
+        let device = Default::default();
+        let module = GroupNormConfig::new(3, 6).init(&device);
+        let _ = module.forward(Tensor::<3>::zeros([1, 4, 2], &device));
+    }
 
     #[test]
     fn group_norm_forward_affine_false() {
         let device = Default::default();
-        let module = GroupNormConfig::new(2, 6)
-            .with_affine(false)
-            .init::<TestBackend>(&device);
+        let module = GroupNormConfig::new(2, 6).with_affine(false).init(&device);
 
         assert!(module.gamma.is_none());
         assert!(module.beta.is_none());
 
-        let input = Tensor::<TestBackend, 3>::from_data(
+        let input = Tensor::<3>::from_data(
             TensorData::from([
                 [
                     [-0.3034, 0.2726, -0.9659],
@@ -255,9 +282,7 @@ mod tests {
     #[test]
     fn group_norm_forward_affine_true() {
         let device = Default::default();
-        let module = GroupNormConfig::new(3, 6)
-            .with_affine(true)
-            .init::<TestBackend>(&device);
+        let module = GroupNormConfig::new(3, 6).with_affine(true).init(&device);
 
         let tolerance = Tolerance::permissive();
         module
@@ -276,7 +301,7 @@ mod tests {
             .to_data()
             .assert_approx_eq::<FT>(&TensorData::zeros::<f32, _>([6]), tolerance);
 
-        let input = Tensor::<TestBackend, 3>::from_data(
+        let input = Tensor::<3>::from_data(
             TensorData::from([
                 [
                     [0.3345, 0.4429, 0.6639],
@@ -324,9 +349,28 @@ mod tests {
     }
 
     #[test]
+    fn group_norm_f16_large_group_does_not_underflow_mean() {
+        use burn::tensor::DType;
+        let device = Default::default();
+        let module = GroupNormConfig::new(4, 64).with_affine(false).init(&device);
+
+        // 64 / 4 channels * 64 * 64 spatial elements = 65_536 values per
+        // group. Applying the denominator through f16 `div_scalar` turns the
+        // mean into zero on Vulkan, producing a large non-zero output.
+        let input = Tensor::<4>::full([1, 64, 64, 64], 0.5, (&device, DType::F16));
+        assert_eq!(input.dtype(), DType::F16);
+
+        let output = module.forward(input);
+        assert_eq!(output.dtype(), DType::F16);
+
+        let max_abs: f32 = output.abs().max().into_scalar();
+        assert_eq!(max_abs, 0.0);
+    }
+
+    #[test]
     fn display() {
         let config = GroupNormConfig::new(3, 6);
-        let group_norm = config.init::<TestBackend>(&Default::default());
+        let group_norm = config.init(&Default::default());
 
         assert_eq!(
             format!("{group_norm}"),

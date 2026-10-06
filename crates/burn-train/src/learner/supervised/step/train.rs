@@ -1,18 +1,75 @@
-use crate::{LearningComponentsTypes, TrainingModel};
-use crate::{TrainOutput, TrainStep, TrainingBackend, TrainingModelInput, TrainingModelOutput};
+use crate::LearnerModel;
+use crate::{TrainOutput, TrainStep, TrainingModelInput, TrainingModelOutput};
 use burn_core::data::dataloader::DataLoaderIterator;
 use burn_core::data::dataloader::Progress;
-use burn_core::module::Module;
-use burn_core::prelude::DeviceOps;
+use burn_core::data::dataset::DatasetError;
 use burn_core::tensor::Device;
-use burn_core::tensor::backend::DeviceId;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::spawn;
 
+/// Outputs and progress collected from workers for one step.
+type StepOutput<TO> = (Vec<MultiTrainOutput<TO>>, Progress);
+
+/// Error that happened on one device during a step of multi-device training.
+#[derive(Debug)]
+pub enum MultiDeviceStepError {
+    /// Error while loading data.
+    Dataset(DatasetError),
+    /// The training step panicked on one or more workers.
+    Workers(Vec<WorkerFailure>),
+}
+
+/// A training step that panicked on a worker.
+#[derive(Debug)]
+pub struct WorkerFailure {
+    /// The worker's device index.
+    pub device_id: usize,
+    /// The panic message.
+    pub message: String,
+}
+
+impl core::fmt::Display for WorkerFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "training worker on device {} failed: {}",
+            self.device_id, self.message
+        )
+    }
+}
+
+/// Every failure, on one line if there is only one.
+pub(crate) fn fmt_worker_failures(
+    failures: &[WorkerFailure],
+    f: &mut core::fmt::Formatter<'_>,
+) -> core::fmt::Result {
+    match failures {
+        [failure] => write!(f, "{failure}"),
+        failures => {
+            write!(f, "{} training workers failed:", failures.len())?;
+            for failure in failures {
+                write!(f, "\n  {failure}")?;
+            }
+            Ok(())
+        }
+    }
+}
+
+impl core::fmt::Display for MultiDeviceStepError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Dataset(err) => write!(f, "dataset error during training step: {err}"),
+            Self::Workers(failures) => fmt_worker_failures(failures, f),
+        }
+    }
+}
+
+impl core::error::Error for MultiDeviceStepError {}
+
 /// Multi devices train step.
-pub struct MultiDevicesTrainStep<LC: LearningComponentsTypes> {
-    workers: Vec<Worker<LC>>,
-    receiver: Receiver<MultiTrainOutput<TrainingModelOutput<LC>>>,
+pub struct MultiDevicesTrainStep<M: LearnerModel> {
+    workers: Vec<Worker<M>>,
+    receiver: Receiver<WorkerMessage<TrainingModelOutput<M>>>,
 }
 
 struct Message<M, TI> {
@@ -20,15 +77,31 @@ struct Message<M, TI> {
     model: M,
 }
 
-struct Worker<LC: LearningComponentsTypes> {
-    // Not that complex. Extracting into another type would only make it more confusing.
-    #[allow(clippy::type_complexity)]
-    sender_input: Sender<Message<TrainingModel<LC>, TrainingModelInput<LC>>>,
-    device: Device<TrainingBackend<LC>>,
+enum WorkerMessage<TO> {
+    Output(MultiTrainOutput<TO>),
+    Error(usize, String),
 }
 
-impl<LC: LearningComponentsTypes> Worker<LC> {
-    fn register(&self, item: TrainingModelInput<LC>, model: &TrainingModel<LC>) {
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic in training worker".to_string()
+    }
+}
+
+struct Worker<M: LearnerModel> {
+    // Not that complex. Extracting into another type would only make it more confusing.
+    // #[allow(clippy::type_complexity)]
+    sender_input: Sender<Message<M, TrainingModelInput<M>>>,
+    device: Device,
+    device_id: usize,
+}
+
+impl<M: LearnerModel> Worker<M> {
+    fn register(&self, item: TrainingModelInput<M>, model: &M) {
         let message = Message {
             item,
             model: model.clone(),
@@ -37,26 +110,36 @@ impl<LC: LearningComponentsTypes> Worker<LC> {
     }
 
     // Not that complex. Extracting into another type would only make it more confusing.
-    #[allow(clippy::type_complexity)]
+    // #[allow(clippy::type_complexity)]
     fn start(
         &self,
-        sender_output: Sender<MultiTrainOutput<TrainingModelOutput<LC>>>,
-        receiver_input: Receiver<Message<TrainingModel<LC>, TrainingModelInput<LC>>>,
+        sender_output: Sender<WorkerMessage<TrainingModelOutput<M>>>,
+        receiver_input: Receiver<Message<M, TrainingModelInput<M>>>,
     ) {
         let device = self.device.clone();
+        let device_id = self.device_id;
 
         spawn(move || {
             loop {
                 match receiver_input.recv() {
                     Ok(item) => {
-                        let model = item.model.fork(&device);
-                        let output = model.step(item.item);
-                        let item = MultiTrainOutput {
-                            output,
-                            device: device.to_id(),
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let model = item.model.fork(&device);
+                            TrainStep::step(&model, item.item)
+                        }));
+
+                        let message = match result {
+                            Ok(output) => {
+                                WorkerMessage::Output(MultiTrainOutput { output, device_id })
+                            }
+                            Err(payload) => {
+                                WorkerMessage::Error(device_id, panic_message(payload.as_ref()))
+                            }
                         };
 
-                        sender_output.send(item).unwrap();
+                        if sender_output.send(message).is_err() {
+                            break;
+                        }
                     }
                     Err(_err) => {
                         log::info!("Closing thread on device {device:?}");
@@ -72,11 +155,11 @@ impl<LC: LearningComponentsTypes> Worker<LC> {
 pub struct MultiTrainOutput<TO> {
     /// The training output.
     pub output: TrainOutput<TO>,
-    /// The device on which the computing happened.
-    pub device: DeviceId,
+    /// The worker/device on which the computing happened.
+    pub(crate) device_id: usize,
 }
 
-impl<LC: LearningComponentsTypes> MultiDevicesTrainStep<LC> {
+impl<M: LearnerModel> MultiDevicesTrainStep<M> {
     /// Create a new multi devices train step.
     ///
     /// # Arguments
@@ -86,15 +169,17 @@ impl<LC: LearningComponentsTypes> MultiDevicesTrainStep<LC> {
     /// # Returns
     ///
     /// MultiDevicesTrainStep instance.
-    pub fn new(devices: &[Device<TrainingBackend<LC>>]) -> Self {
+    pub fn new(devices: &[Device]) -> Self {
         let (sender_output, receiver_output) = std::sync::mpsc::channel();
         let workers = devices
             .iter()
-            .map(|device| {
+            .enumerate()
+            .map(|(device_id, device)| {
                 let (sender_input, receiver_input) = std::sync::mpsc::channel();
                 let worker = Worker {
                     sender_input,
                     device: device.clone(),
+                    device_id,
                 };
 
                 worker.start(sender_output.clone(), receiver_input);
@@ -120,32 +205,74 @@ impl<LC: LearningComponentsTypes> MultiDevicesTrainStep<LC> {
     /// Outputs.
     pub fn step<'a>(
         &self,
-        dataloaders: &mut [Box<dyn DataLoaderIterator<TrainingModelInput<LC>> + 'a>],
-        model: &TrainingModel<LC>,
-    ) -> (Vec<MultiTrainOutput<TrainingModelOutput<LC>>>, Progress) {
+        dataloaders: &mut [Box<dyn DataLoaderIterator<TrainingModelInput<M>> + 'a>],
+        model: &M,
+    ) -> Result<StepOutput<TrainingModelOutput<M>>, MultiDeviceStepError> {
         let mut num_send = 0;
 
         let mut items_total = 0;
         let mut items_processed = 0;
+        let unit: Option<String> = Some("items".to_string());
 
         for (i, worker) in self.workers.iter().enumerate() {
             let dataloader = &mut dataloaders[i];
-            if let Some(item) = dataloader.next() {
-                worker.register(item, model);
-                num_send += 1;
-                let progress = dataloader.progress();
-                items_total += progress.items_total;
-                items_processed += progress.items_processed;
+            match dataloader.next() {
+                Some(Ok(item)) => {
+                    worker.register(item, model);
+                    num_send += 1;
+                    let progress = dataloader.progress();
+                    items_total += progress.items_total;
+                    items_processed += progress.items_processed;
+                }
+                Some(Err(err)) => return Err(MultiDeviceStepError::Dataset(err)),
+                None => {}
             }
         }
 
         let mut outputs = Vec::with_capacity(num_send);
+        let mut failures = Vec::new();
 
+        // Every worker answers before this returns, even after one failed: an answer left in
+        // the channel would be taken for the next step's.
         for _ in 0..num_send {
-            let output = self.receiver.recv().unwrap();
-            outputs.push(output);
+            match self.receiver.recv().unwrap() {
+                WorkerMessage::Output(output) => outputs.push(output),
+                WorkerMessage::Error(device_id, message) => {
+                    failures.push(WorkerFailure { device_id, message })
+                }
+            }
         }
 
-        (outputs, Progress::new(items_processed, items_total))
+        if !failures.is_empty() {
+            return Err(MultiDeviceStepError::Workers(failures));
+        }
+        Ok((outputs, Progress::new(items_processed, items_total, unit)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failure(device_id: usize, message: &str) -> WorkerFailure {
+        WorkerFailure {
+            device_id,
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn every_failed_worker_is_reported() {
+        let error = MultiDeviceStepError::Workers(vec![
+            failure(0, "out of memory"),
+            failure(2, "illegal address"),
+        ]);
+
+        assert_eq!(
+            error.to_string(),
+            "2 training workers failed:\n  \
+             training worker on device 0 failed: out of memory\n  \
+             training worker on device 2 failed: illegal address"
+        );
     }
 }

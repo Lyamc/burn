@@ -5,6 +5,7 @@ use super::super::{
     state::{FormatOptions, NumericMetricState},
 };
 use crate::metric::{Metric, MetricName, Numeric, SerializedEntry};
+use burn_core::tensor::TensorReadError;
 
 /// Metric for the cumulative reward of the last completed episode.
 #[derive(Clone)]
@@ -42,12 +43,17 @@ impl Metric for CumulativeRewardMetric {
         &mut self,
         item: &CumulativeRewardInput,
         _metadata: &MetricMetadata,
-    ) -> SerializedEntry {
-        self.state.update(
-            item.cum_reward,
-            1,
-            FormatOptions::new(self.name()).precision(2),
-        )
+    ) -> Result<SerializedEntry, TensorReadError> {
+        self.state.update(item.cum_reward, 1);
+        Ok(self
+            .state
+            .compute_update(FormatOptions::new(self.name()).precision(2)))
+    }
+
+    fn compute(&mut self) -> Result<SerializedEntry, TensorReadError> {
+        Ok(self
+            .state
+            .compute_final(FormatOptions::new(self.name()).precision(2)))
     }
 
     fn clear(&mut self) {
@@ -68,11 +74,15 @@ impl Metric for CumulativeRewardMetric {
 }
 
 impl Numeric for CumulativeRewardMetric {
-    fn value(&self) -> NumericEntry {
-        self.state.current_value()
+    fn value(&self) -> Option<NumericEntry> {
+        Some(self.state.current_value())
     }
 
-    fn running_value(&self) -> NumericEntry {
-        self.state.running_value()
+    fn running_value(&self) -> Option<NumericEntry> {
+        Some(self.state.running_value())
+    }
+
+    fn final_value(&self) -> NumericEntry {
+        self.state.final_value()
     }
 }

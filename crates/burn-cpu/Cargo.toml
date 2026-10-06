@@ -1,13 +1,13 @@
 [package]
 authors = ["marcantoinem <marc-antoine.m@outlook.com>"]
 categories = ["science"]
-description = "MLIR based CPU backend for the Burn framework"
+description = "LLVM-based CPU backend for the Burn framework"
 documentation = "https://docs.rs/burn-cpu"
 edition.workspace = true
 keywords = ["deep-learning", "machine-learning", "cpu"]
 license.workspace = true
 name = "burn-cpu"
-readme.workspace = true
+readme = "README.md"
 repository = "https://github.com/tracel-ai/burn/tree/main/crates/burn-cpu"
 version.workspace = true
 
@@ -17,8 +17,8 @@ workspace = true
 [features]
 default = ["std", "fusion", "autotune", "burn-cubecl/default", "cubecl/default"]
 doc = ["burn-cubecl/doc"]
-fusion = ["burn-fusion", "burn-cubecl/fusion"]
 std = ["burn-cubecl/std", "cubecl/std"]
+
 tracing = [
     "burn-backend/tracing",
     "burn-cubecl/tracing",
@@ -26,6 +26,7 @@ tracing = [
     "cubecl/tracing",
 ]
 
+fusion = ["burn-fusion", "burn-cubecl/fusion"]
 autotune = ["burn-cubecl/autotune"]
 autotune-checks = ["burn-cubecl/autotune-checks"]
 

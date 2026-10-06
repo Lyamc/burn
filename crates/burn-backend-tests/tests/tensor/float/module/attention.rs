@@ -5,17 +5,13 @@ use burn_tensor::Tolerance;
 use burn_tensor::module::attention;
 use burn_tensor::module::attention_fallback;
 use burn_tensor::ops::AttentionModuleOptions;
-use num_traits::{Signed, cast::cast};
+use num_traits::cast::cast;
+
+#[allow(unused)]
+use num_traits::Signed; // f16
 
 #[test]
 fn test_attention_no_mask() {
-    // Skip on metal with f16 - flash attention returns zeros
-    // Enable once this issue is fixed: https://github.com/tracel-ai/burn/issues/4325
-    #[cfg(feature = "metal")]
-    if core::any::TypeId::of::<FloatElem>() == core::any::TypeId::of::<burn_tensor::f16>() {
-        return;
-    }
-
     let num_batches = 1;
     let num_heads = 1;
     let seq_q = 128;
@@ -48,8 +44,7 @@ fn test_attention_no_mask() {
         Default::default(),
     );
 
-    let expected =
-        attention_fallback::<TestBackend>(query, key, value, None, None, Default::default());
+    let expected = attention_fallback(query, key, value, None, None, Default::default());
 
     output.into_data().assert_approx_eq::<FloatElem>(
         &expected.into_data(),
@@ -91,7 +86,7 @@ fn test_attention_custom_scale() {
         options,
     );
 
-    let expected = attention_fallback::<TestBackend>(query, key, value, None, None, options);
+    let expected = attention_fallback(query, key, value, None, None, options);
 
     output.into_data().assert_approx_eq::<FloatElem>(
         &expected.into_data(),
@@ -133,8 +128,7 @@ fn test_attention_attn_bias() {
         Default::default(),
     );
 
-    let expected =
-        attention_fallback::<TestBackend>(query, key, value, None, Some(bias), Default::default());
+    let expected = attention_fallback(query, key, value, None, Some(bias), Default::default());
 
     output.into_data().assert_approx_eq::<FloatElem>(
         &expected.into_data(),
@@ -176,7 +170,7 @@ fn test_attention_softcap() {
         options,
     );
 
-    let expected = attention_fallback::<TestBackend>(query, key, value, None, None, options);
+    let expected = attention_fallback(query, key, value, None, None, options);
 
     output.into_data().assert_approx_eq::<FloatElem>(
         &expected.into_data(),
@@ -218,7 +212,7 @@ fn test_attention_is_causal() {
         options,
     );
 
-    let expected = attention_fallback::<TestBackend>(query, key, value, None, None, options);
+    let expected = attention_fallback(query, key, value, None, None, options);
 
     output.into_data().assert_approx_eq::<FloatElem>(
         &expected.into_data(),
@@ -266,7 +260,7 @@ fn test_attention_cross_attention_with_bias() {
         options,
     );
 
-    let expected = attention_fallback::<TestBackend>(query, key, value, None, Some(bias), options);
+    let expected = attention_fallback(query, key, value, None, Some(bias), options);
 
     output.into_data().assert_approx_eq::<FloatElem>(
         &expected.into_data(),
@@ -304,7 +298,7 @@ fn test_attention_softcap_preserves_causal_mask() {
         ..Default::default()
     };
 
-    let output = attention_fallback::<TestBackend>(query, key, value.clone(), None, None, options);
+    let output = attention_fallback(query, key, value.clone(), None, None, options);
 
     // With causal masking, position 0 can only attend to itself (softmax = [1, 0, 0, 0]).
     // So output[..., 0, :] must equal value[..., 0, :].
@@ -349,8 +343,7 @@ fn test_attention_fully_masked_rows_no_nan() {
         &Default::default(),
     );
 
-    let output =
-        attention_fallback::<TestBackend>(query, key, value, Some(mask), None, Default::default());
+    let output = attention_fallback(query, key, value, Some(mask), None, Default::default());
 
     let output_data = output.into_data();
     let values = output_data.as_slice::<FloatElem>().unwrap();
@@ -415,7 +408,7 @@ fn test_attention_fully_masked_rows_causal_no_nan() {
         ..Default::default()
     };
 
-    let output = attention_fallback::<TestBackend>(query, key, value, Some(mask), None, options);
+    let output = attention_fallback(query, key, value, Some(mask), None, options);
 
     let output_data = output.into_data();
     let values = output_data.as_slice::<FloatElem>().unwrap();
@@ -486,8 +479,7 @@ fn test_attention_all_options() {
         options,
     );
 
-    let expected =
-        attention_fallback::<TestBackend>(query, key, value, Some(mask), Some(bias), options);
+    let expected = attention_fallback(query, key, value, Some(mask), Some(bias), options);
 
     output.into_data().assert_approx_eq::<FloatElem>(
         &expected.into_data(),
@@ -533,8 +525,7 @@ fn test_attention_bias_broadcast_batch_and_heads() {
         Default::default(),
     );
 
-    let expected =
-        attention_fallback::<TestBackend>(query, key, value, None, Some(bias), Default::default());
+    let expected = attention_fallback(query, key, value, None, Some(bias), Default::default());
 
     output.into_data().assert_approx_eq::<FloatElem>(
         &expected.into_data(),
@@ -578,8 +569,7 @@ fn test_attention_bias_broadcast_heads_only() {
         Default::default(),
     );
 
-    let expected =
-        attention_fallback::<TestBackend>(query, key, value, None, Some(bias), Default::default());
+    let expected = attention_fallback(query, key, value, None, Some(bias), Default::default());
 
     output.into_data().assert_approx_eq::<FloatElem>(
         &expected.into_data(),
@@ -636,8 +626,7 @@ fn test_attention_bool_mask_broadcast_batch_and_heads() {
         Default::default(),
     );
 
-    let expected =
-        attention_fallback::<TestBackend>(query, key, value, Some(mask), None, Default::default());
+    let expected = attention_fallback(query, key, value, Some(mask), None, Default::default());
 
     output.into_data().assert_approx_eq::<FloatElem>(
         &expected.into_data(),

@@ -1,6 +1,5 @@
-use burn_tensor::{
+use burn_core::tensor::{
     Tensor,
-    backend::Backend,
     grid::affine_grid_2d,
     ops::{GridSampleOptions, GridSamplePaddingMode, InterpolateMode},
 };
@@ -12,6 +11,7 @@ pub struct Transform2D {
     // 2x3 transformation matrix, to be used with column vectors:
     // T(x) = Ax
     transform: [[f32; 3]; 2],
+    padding_mode: GridSamplePaddingMode,
 }
 
 impl Transform2D {
@@ -22,16 +22,28 @@ impl Transform2D {
     /// # Returns
     ///
     /// A tensor with the same as the input
-    pub fn transform<B: Backend>(self, img: Tensor<B, 4>) -> Tensor<B, 4> {
-        let [batch_size, channels, height, width] = img.shape().dims();
-        let transform = Tensor::<B, 2>::from(self.transform);
+    pub fn transform(self, img: Tensor<4>) -> Tensor<4> {
+        let device = img.device();
+        let [batch_size, channels, height, width] = img.dims();
+        let transform = Tensor::<2>::from_data(self.transform, &device);
         let transform = transform.reshape([1, 2, 3]).expand([batch_size, 2, 3]);
         let grid = affine_grid_2d(transform, [batch_size, channels, height, width]);
 
         let options = GridSampleOptions::new(InterpolateMode::Bilinear)
-            .with_padding_mode(GridSamplePaddingMode::Border)
+            .with_padding_mode(self.padding_mode)
             .with_align_corners(true);
         img.grid_sample_2d(grid, options)
+    }
+
+    /// Set the padding mode for the transformed images.
+    ///
+    /// # Default
+    /// [GridSamplePaddingMode::Border]
+    pub fn with_padding_mode(self, padding_mode: GridSamplePaddingMode) -> Self {
+        Self {
+            transform: self.transform,
+            padding_mode,
+        }
     }
 
     /// Makes a 2d transformation composed of other transformations
@@ -65,13 +77,17 @@ impl Transform2D {
             + self.transform[1][1] * other.transform[1][2]
             + self.transform[1][2];
 
-        Transform2D { transform: result }
+        Transform2D {
+            transform: result,
+            padding_mode: self.padding_mode,
+        }
     }
 
     /// Makes an identity transform (x = Ax)
     pub fn identity() -> Self {
         Self {
             transform: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            padding_mode: GridSamplePaddingMode::Border,
         }
     }
 
@@ -89,7 +105,10 @@ impl Transform2D {
             [sin_theta, cos_theta, cy - sin_theta * cx - cos_theta * cy],
         ];
 
-        Self { transform }
+        Self {
+            transform,
+            padding_mode: GridSamplePaddingMode::Border,
+        }
     }
 
     /// Makes a [`Transform2D`] for scaling an image tensor
@@ -101,7 +120,10 @@ impl Transform2D {
     pub fn scale(sx: f32, sy: f32, cx: f32, cy: f32) -> Self {
         let transform = [[sx, 0.0, cx - sx * cx], [0.0, sy, cy - sy * cy]];
 
-        Self { transform }
+        Self {
+            transform,
+            padding_mode: GridSamplePaddingMode::Border,
+        }
     }
 
     /// Makes a [`Transform2D`] for translating an image tensor
@@ -111,7 +133,10 @@ impl Transform2D {
     pub fn translation(tx: f32, ty: f32) -> Self {
         let transform = [[1.0, 0.0, tx], [0.0, 1.0, ty]];
 
-        Self { transform }
+        Self {
+            transform,
+            padding_mode: GridSamplePaddingMode::Border,
+        }
     }
 
     /// Applies a general shear transformation around the image center,
@@ -127,21 +152,22 @@ impl Transform2D {
     pub fn shear(shx: f32, shy: f32, cx: f32, cy: f32) -> Self {
         let transform = [[1.0, shx, -shx * cy], [shy, 1.0, -shy * cx]];
 
-        Self { transform }
+        Self {
+            transform,
+            padding_mode: GridSamplePaddingMode::Border,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn_flex::Flex;
-    use burn_tensor::Tolerance;
-    type B = Flex;
+    use burn_core::tensor::Tolerance;
 
     #[test]
     fn transform_identity_translation() {
         let t = Transform2D::translation(0.0, 0.0);
-        let image_original = Tensor::<B, 4>::from([[[[1., 0.], [0., 2.]]]]);
+        let image_original = Tensor::<4>::from([[[[1., 0.], [0., 2.]]]]);
         let image_transformed = t.transform(image_original.clone());
         image_original
             .to_data()
@@ -151,9 +177,9 @@ mod tests {
     #[test]
     fn transform_translation() {
         let t = Transform2D::translation(1., 1.);
-        let image = Tensor::<B, 4>::from([[[[1., 2.], [3., 4.]]]]);
+        let image = Tensor::<4>::from([[[[1., 2.], [3., 4.]]]]);
         // This result would change if the padding method is different
-        let image_expected = Tensor::<B, 4>::from([[[[2.5, 3.], [3.5, 4.]]]]);
+        let image_expected = Tensor::<4>::from([[[[2.5, 3.], [3.5, 4.]]]]);
         let image = t.transform(image);
         image_expected
             .to_data()
@@ -163,8 +189,8 @@ mod tests {
     #[test]
     fn transform_rotation_90_degrees() {
         let t = Transform2D::rotation(std::f32::consts::FRAC_PI_2, 0.0, 0.0);
-        let image = Tensor::<B, 4>::from([[[[1., 2.], [3., 4.]]]]);
-        let image_expected = Tensor::<B, 4>::from([[[[2., 4.], [1., 3.]]]]);
+        let image = Tensor::<4>::from([[[[1., 2.], [3., 4.]]]]);
+        let image_expected = Tensor::<4>::from([[[[2., 4.], [1., 3.]]]]);
         let image = t.transform(image);
         image_expected
             .to_data()
@@ -176,9 +202,9 @@ mod tests {
         let cx = 1.;
         let cy = -1.;
         let t = Transform2D::rotation(std::f32::consts::FRAC_PI_2, cx, cy);
-        let image = Tensor::<B, 4>::from([[[[1., 2.], [3., 4.]]]]);
+        let image = Tensor::<4>::from([[[[1., 2.], [3., 4.]]]]);
         // This result would change if the padding method is different
-        let image_expected = Tensor::<B, 4>::from([[[[2., 2.], [1., 1.]]]]);
+        let image_expected = Tensor::<4>::from([[[[2., 2.], [1., 1.]]]]);
         let image = t.transform(image);
         image_expected
             .to_data()
@@ -190,8 +216,8 @@ mod tests {
         let cx = 0.0;
         let cy = 0.0;
         let t = Transform2D::scale(0.5, 0.5, cx, cy);
-        let image = Tensor::<B, 4>::from([[[[1., 2.], [3., 4.]]]]);
-        let image_expected = Tensor::<B, 4>::from([[[[1.75, 2.25], [2.75, 3.25]]]]);
+        let image = Tensor::<4>::from([[[[1., 2.], [3., 4.]]]]);
+        let image_expected = Tensor::<4>::from([[[[1.75, 2.25], [2.75, 3.25]]]]);
         let image = t.transform(image);
         image_expected
             .to_data()
@@ -203,8 +229,8 @@ mod tests {
         let cx = 1.;
         let cy = -1.;
         let t = Transform2D::scale(0.5, 0.5, cx, cy);
-        let image = Tensor::<B, 4>::from([[[[1., 2.], [3., 4.]]]]);
-        let image_expected = Tensor::<B, 4>::from([[[[1.5, 2.], [2.5, 3.]]]]);
+        let image = Tensor::<4>::from([[[[1., 2.], [3., 4.]]]]);
+        let image_expected = Tensor::<4>::from([[[[1.5, 2.], [2.5, 3.]]]]);
         let image = t.transform(image);
         image_expected
             .to_data()
@@ -217,10 +243,10 @@ mod tests {
         let t2 = Transform2D::rotation(std::f32::consts::FRAC_PI_3, 0., 0.);
         let t = Transform2D::composed([t1, t2]);
 
-        let image = Tensor::<B, 4>::from([[[[1., 2.], [3., 4.]]]]);
+        let image = Tensor::<4>::from([[[[1., 2.], [3., 4.]]]]);
         // This result would change if the padding method is different
         let image_expected =
-            Tensor::<B, 4>::from([[[[1.7830127, 2.8660254], [1.1339746, 3.2830124]]]]);
+            Tensor::<4>::from([[[[1.7830127, 2.8660254], [1.1339746, 3.2830124]]]]);
         let image = t.transform(image);
         image_expected
             .to_data()

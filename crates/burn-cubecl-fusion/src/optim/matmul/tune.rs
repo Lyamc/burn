@@ -1,21 +1,54 @@
-use super::optimization::MatmulOptimizationTuneArg;
+use super::{bounds::with_fused_matmul_bounds, optimization::MatmulOptimizationTuneArg};
 use crate::{
     CubeFusionHandle,
     engine::trace::TuneOutput,
     optim::matmul::{AcceleratedTileKind, FusedMatmulSelector},
     tune::{FusionInputGen, TuneInput},
 };
+use burn_backend::cubecl::dtype_to_storage_type;
 use burn_fusion::stream::Context;
 use cubecl::{
-    AutotuneKey, CubeTuneId, Runtime,
+    AutotuneKey, CubeTuneId,
+    client::Client,
     std::tensor::MatrixBatchLayout,
     tune::{LocalTuner, Tunable, TunableSet, TuneGroup, local_tuner},
 };
 use cubek::matmul::{
-    definition::MatmulKind,
-    launch::{MatmulAutotuneKey, MatmulGlobalScale, should_tune_double_buffering},
+    definition::{MatmulElems, MatmulGlobalElems, MatmulKind},
+    multi_level::{components::tile::TileMatmulKind, definition::adjust_dtypes},
+    tune_key::{
+        MatmulAutotuneKey, MatmulGlobalScale, MatmulProblemDefinition, should_tune_double_buffering,
+    },
 };
 use serde::{Deserialize, Serialize};
+
+/// Whether the device can run `tile_matmul` with the element types of the matmul `definition`.
+///
+/// The kernel runs on the *register* types, not the global ones: the selection paths promote
+/// them with [`adjust_dtypes`] when the tile matmul needs an accelerator (f32 to tf32, flex32 to
+/// f16). Without the same promotion here, every f32 problem would look unsupported and the tf32
+/// tensor core path would be lost.
+fn tile_matmul_supported(
+    client: &Client,
+    tile_matmul: TileMatmulKind,
+    definition: &MatmulProblemDefinition,
+) -> bool {
+    let mut elems = MatmulElems::from_globals(&MatmulGlobalElems {
+        lhs: definition.elem_lhs,
+        rhs: definition.elem_rhs,
+        out: definition.elem_out,
+    });
+    adjust_dtypes(client, &mut elems, tile_matmul.requires_accelerator());
+
+    !tile_matmul
+        .supported_sizes(
+            client,
+            elems.lhs_register,
+            elems.rhs_register,
+            elems.acc_register,
+        )
+        .is_empty()
+}
 
 #[derive(Hash, Eq, PartialEq, Debug, Clone, Serialize, Deserialize, AutotuneKey)]
 pub struct FusedMatmulAutotuneKey {
@@ -27,13 +60,15 @@ pub struct FusedMatmulAutotuneKey {
 }
 
 /// Executes autotune on matmul operations
-pub fn fused_matmul_autotune<R: Runtime>(
-    optimization: MatmulOptimizationTuneArg<R>,
-    context: &mut Context<CubeFusionHandle<R>>,
+pub fn fused_matmul_autotune(
+    optimization: MatmulOptimizationTuneArg,
+    context: &mut Context<CubeFusionHandle>,
 ) {
+    let tune_client = optimization.info.client.clone();
     static TUNER: LocalTuner<FusedMatmulAutotuneKey, CubeTuneId> = local_tuner!();
 
-    let tunables = TUNER.init(|| {
+    let tune_id = CubeTuneId::new(&optimization.info.client, &optimization.info.device);
+    let tunables = TUNER.init(&tune_id, move || {
         const PRIORITY_MAX: i8 = 3;
         const PRIORITY_HIGH: i8 = 2;
         const PRIORITY_MEDIUM: i8 = 1;
@@ -50,7 +85,7 @@ pub fn fused_matmul_autotune<R: Runtime>(
                 key.matmul_key.analysis.kind,
                 MatmulKind::MatVec | MatmulKind::VecMat
             ) {
-                PRIORITY_HIGH
+                PRIORITY_MAX
             } else {
                 PRIORITY_MEDIUM
             }
@@ -120,8 +155,8 @@ pub fn fused_matmul_autotune<R: Runtime>(
         }
 
         // First entry should always work, since it is considered the fallback.
-        let mut set = TunableSet::new(create_key::<R>, FusionInputGen).with(
-            Tunable::new("fused_matmul_fallback", tune_fallback::<R>).group(&unit, |key| {
+        let mut set = with_fused_matmul_bounds(TunableSet::new(create_key, FusionInputGen)).with(
+            Tunable::new("fused_matmul_fallback", tune_fallback).group(&unit, |key| {
                 if matches!(key.matmul_key.analysis.kind, MatmulKind::InnerProduct) {
                     PRIORITY_MAX
                 } else if matches!(
@@ -139,17 +174,17 @@ pub fn fused_matmul_autotune<R: Runtime>(
         for (selector, double_buf) in [
             (FusedMatmulSelector::SimpleVecMat, false),
             (FusedMatmulSelector::DoubleVecMat, true),
-            (FusedMatmulSelector::GemvPlaneParallel, false),
+            (FusedMatmulSelector::GemmNoStage, false),
             (FusedMatmulSelector::GemvUnitPerpendicular, false),
         ] {
             set = set.with(
-                Tunable::new(&selector.name(), move |input| {
-                    tune_fused::<R>(input, selector)
-                })
-                .group(&gemv, move |key| match double_buf {
-                    false => PRIORITY_MAX,
-                    true => double_buffering_priority(key, PRIORITY_MAX, PRIORITY_HIGH),
-                }),
+                Tunable::new(&selector.name(), move |input| tune_fused(input, selector)).group(
+                    &gemv,
+                    move |key| match double_buf {
+                        false => PRIORITY_MAX,
+                        true => double_buffering_priority(key, PRIORITY_MAX, PRIORITY_HIGH),
+                    },
+                ),
             );
         }
 
@@ -159,18 +194,22 @@ pub fn fused_matmul_autotune<R: Runtime>(
             (FusedMatmulSelector::DoubleUnit, true),
         ] {
             set = set.with(
-                Tunable::new(&selector.name(), move |input| {
-                    tune_fused::<R>(input, selector)
-                })
-                .group(&unit, move |key| match double_buf {
-                    false => PRIORITY_MAX,
-                    true => double_buffering_priority(key, PRIORITY_MAX, PRIORITY_HIGH),
-                }),
+                Tunable::new(&selector.name(), move |input| tune_fused(input, selector)).group(
+                    &unit,
+                    move |key| match double_buf {
+                        false => PRIORITY_MAX,
+                        true => double_buffering_priority(key, PRIORITY_MAX, PRIORITY_HIGH),
+                    },
+                ),
             );
         }
 
         // Accelerated matmuls
         for tile_matmul in [AcceleratedTileKind::Cmma, AcceleratedTileKind::Mma] {
+            let tm = match tile_matmul {
+                AcceleratedTileKind::Cmma => TileMatmulKind::Cmma,
+                AcceleratedTileKind::Mma => TileMatmulKind::Mma,
+            };
             for (selector, double_buf, extra_group) in [
                 (
                     FusedMatmulSelector::Simple {
@@ -210,21 +249,32 @@ pub fn fused_matmul_autotune<R: Runtime>(
                     Some(&odd),
                 ),
             ] {
-                let priority_within_group =
-                    |key: &FusedMatmulAutotuneKey, double_buf: bool| match double_buf {
+                // Accelerated kernels are demoted when the device doesn't support the tile
+                // matmul they are built on, otherwise they would be compiled just to fail. They
+                // keep the minimum priority rather than being discarded, so they remain a last
+                // resort and the tune plan can never end up empty.
+                let accelerated_priority = move |key: &FusedMatmulAutotuneKey, client: &Client| {
+                    if !tile_matmul_supported(client, tm, &key.matmul_key.definition) {
+                        return PRIORITY_MIN;
+                    }
+
+                    match double_buf {
                         false => PRIORITY_MAX,
                         true => double_buffering_priority(key, PRIORITY_MAX, PRIORITY_HIGH),
-                    };
-                let mut tunable = Tunable::new(&selector.name(), move |input| {
-                    tune_fused::<R>(input, selector)
-                })
-                .group(&accelerated, move |key| {
-                    priority_within_group(key, double_buf)
-                });
+                    }
+                };
+
+                let client_accelerated = tune_client.clone();
+                let mut tunable =
+                    Tunable::new(&selector.name(), move |input| tune_fused(input, selector))
+                        .group(&accelerated, move |key| {
+                            accelerated_priority(key, &client_accelerated)
+                        });
 
                 if let Some(group) = extra_group {
+                    let client_extra = tune_client.clone();
                     tunable =
-                        tunable.group(group, move |key| priority_within_group(key, double_buf));
+                        tunable.group(group, move |key| accelerated_priority(key, &client_extra));
                 }
                 set = set.with(tunable);
             }
@@ -234,16 +284,14 @@ pub fn fused_matmul_autotune<R: Runtime>(
     });
 
     TUNER.execute(
-        &CubeTuneId::new(&optimization.info.client, &optimization.info.device),
+        &tune_id,
         &optimization.info.client.clone(),
         tunables,
         TuneInput::new(context, optimization),
     );
 }
 
-pub(crate) fn create_key<R: Runtime>(
-    input: &TuneInput<R, MatmulOptimizationTuneArg<R>>,
-) -> FusedMatmulAutotuneKey {
+pub(crate) fn create_key(input: &TuneInput<MatmulOptimizationTuneArg>) -> FusedMatmulAutotuneKey {
     let opt = input.optimization();
     assert!(input.is_original(), "Not supported when generating key");
     let tensors = input.tensors();
@@ -253,36 +301,30 @@ pub(crate) fn create_key<R: Runtime>(
     let rhs = tensors.get(&opt.info.matmul.op.rhs.id).unwrap();
     let out = tensors.get(&opt.info.matmul.op.out.id).unwrap();
 
-    let lhs_strides = handles
-        .get_handle_ref(&lhs.id)
-        .expect("lhs handle")
-        .strides
-        .clone();
-    let rhs_strides = handles
-        .get_handle_ref(&rhs.id)
-        .expect("rhs handle")
-        .strides
-        .clone();
+    let lhs_handle = handles.get_handle_ref(&lhs.id).expect("lhs handle");
+    let rhs_handle = handles.get_handle_ref(&rhs.id).expect("rhs handle");
 
     let key = MatmulAutotuneKey::generate(
         &opt.info.client,
-        &lhs.shape,
-        &rhs.shape,
-        &lhs_strides,
-        &rhs_strides,
-        lhs.dtype.into(),
-        rhs.dtype.into(),
-        out.dtype.into(),
+        &lhs_handle.physical_shape(lhs.shape.clone()),
+        &rhs_handle.physical_shape(rhs.shape.clone()),
+        &lhs_handle.strides,
+        &rhs_handle.strides,
+        lhs_handle.tiling(),
+        rhs_handle.tiling(),
+        dtype_to_storage_type(lhs.dtype),
+        dtype_to_storage_type(rhs.dtype),
+        dtype_to_storage_type(out.dtype),
         opt.info.matmul.lhs.scheme(),
         opt.info.matmul.rhs.scheme(),
     );
     FusedMatmulAutotuneKey::new(key, opt.info.num_output_buffers(), opt.info.num_ops_fused())
 }
 
-fn tune_fused<R: Runtime>(
-    input: TuneInput<R, MatmulOptimizationTuneArg<R>>,
+fn tune_fused(
+    input: TuneInput<MatmulOptimizationTuneArg>,
     selector: FusedMatmulSelector,
-) -> Result<TuneOutput<R>, String> {
+) -> Result<TuneOutput, String> {
     let is_original = input.is_original();
     input.execute(|ctx, opt| match opt.execute_fused(ctx, selector) {
         Ok(out) => Ok(out),
@@ -291,8 +333,6 @@ fn tune_fused<R: Runtime>(
     })
 }
 
-fn tune_fallback<R: Runtime>(
-    input: TuneInput<R, MatmulOptimizationTuneArg<R>>,
-) -> Result<TuneOutput<R>, String> {
+fn tune_fallback(input: TuneInput<MatmulOptimizationTuneArg>) -> Result<TuneOutput, String> {
     Ok(input.execute(|ctx, opt| opt.execute_fallback(ctx)))
 }

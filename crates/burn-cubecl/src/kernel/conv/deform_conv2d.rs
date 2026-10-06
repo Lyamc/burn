@@ -1,3 +1,4 @@
+use burn_backend::cubecl::dtype_to_storage_type;
 use cubecl::{calculate_cube_count_elemwise, prelude::*, std::FastDivmod};
 use cubek::convolution::components::ConvSetupError;
 
@@ -7,7 +8,6 @@ use burn_backend::{
 };
 
 use crate::{
-    CubeRuntime,
     kernel::{
         AddOp, into_contiguous_aligned, launch_binop,
         matmul::{MatmulStrategy, matmul},
@@ -37,13 +37,13 @@ struct DeformConv2dArgs {
 fn deform_im2col_kernel<F: Float>(
     input: &Tensor<F>,
     offset: &Tensor<F>,
-    mask: &ComptimeOption<Tensor<F>>,
+    mask: ComptimeOption<&Tensor<F>>,
     columns: &mut Tensor<F>,
     pos_shape: Sequence<FastDivmod<usize>>,
     args: &DeformConv2dArgs,
     #[comptime] kernel_h_unroll: Option<usize>,
     #[comptime] kernel_w_unroll: Option<usize>,
-    #[define(F)] _dtype: StorageType,
+    #[define(F)] _dtype: ElemType,
 ) {
     // position shape: [in_channels, batch_size, out_h, out_w]
     // columns shape: [[in_channels, kernel_h, kernel_w], [batch_size, out_h, out_w]]
@@ -141,14 +141,14 @@ pub(crate) fn bilinear_interpolate<F: Float>(
     let stride_y = input.stride(2);
     let stride_x = input.stride(3);
 
-    let mut result = F::new(0.0);
-    if y > -1.0 && height as f32 > y && x > -1.0 && width as f32 > x {
+    let mut result = F::new(0.0_f32);
+    if y > -1.0f32 && height as f32 > y && x > -1.0f32 && width as f32 > x {
         let y_low = y.floor();
         let x_low = x.floor();
         let y_high = (y_low + 1.) as usize;
         let x_high = (x_low + 1.) as usize;
 
-        let zero = F::new(0.0);
+        let zero = F::new(0.0_f32);
         let v1: F = if y_low >= 0. && x_low >= 0. {
             input[offset + y_low as usize * stride_y + x_low as usize * stride_x]
         } else {
@@ -185,14 +185,14 @@ pub(crate) fn bilinear_interpolate<F: Float>(
     result
 }
 
-pub(crate) fn deform_im2col<R: CubeRuntime>(
-    input: CubeTensor<R>,
-    offset: CubeTensor<R>,
-    mask: Option<CubeTensor<R>>,
+pub(crate) fn deform_im2col(
+    input: CubeTensor,
+    offset: CubeTensor,
+    mask: Option<CubeTensor>,
     options: DeformConvOptions<2>,
     out_dims: (usize, usize),
     kernel_dims: (usize, usize),
-) -> Result<CubeTensor<R>, LaunchError> {
+) -> Result<CubeTensor, LaunchError> {
     let client = input.client.clone();
     let device = input.device.clone();
     let dtype = input.dtype;
@@ -233,11 +233,11 @@ pub(crate) fn deform_im2col<R: CubeRuntime>(
             options.dilation[1],
             {
                 let val = options.padding[0] as f32;
-                InputScalar::new(val, dtype)
+                InputScalar::new(val, dtype_to_storage_type(dtype))
             },
             {
                 let val = options.padding[1] as f32;
-                InputScalar::new(val, dtype)
+                InputScalar::new(val, dtype_to_storage_type(dtype))
             },
             options.offset_groups,
             kernel_height,
@@ -247,25 +247,25 @@ pub(crate) fn deform_im2col<R: CubeRuntime>(
         ),
         Some(kernel_height),
         Some(kernel_width),
-        dtype.into(),
+        dtype_to_storage_type(dtype),
     );
 
     Ok(output)
 }
 
-pub(crate) fn deform_conv2d<R: CubeRuntime>(
-    input: CubeTensor<R>,
-    offset: CubeTensor<R>,
-    weight: CubeTensor<R>,
-    mask: Option<CubeTensor<R>>,
-    bias: Option<CubeTensor<R>>,
+pub(crate) fn deform_conv2d(
+    input: CubeTensor,
+    offset: CubeTensor,
+    weight: CubeTensor,
+    mask: Option<CubeTensor>,
+    bias: Option<CubeTensor>,
     options: DeformConvOptions<2>,
-) -> Result<CubeTensor<R>, ConvSetupError> {
+) -> Result<CubeTensor, ConvSetupError> {
     let input = into_contiguous_aligned(input);
     let offset = into_contiguous_aligned(offset);
     let weight = into_contiguous_aligned(weight);
-    let mask = mask.map(|it| into_contiguous_aligned(it));
-    let bias = bias.map(|it| into_contiguous_aligned(it));
+    let mask = mask.map(into_contiguous_aligned);
+    let bias = bias.map(into_contiguous_aligned);
 
     let [batch_size, _, in_height, in_width] = input.meta.shape().dims();
     let [out_channels, _, kernel_h, kernel_w] = weight.meta.shape().dims();
@@ -303,7 +303,7 @@ pub(crate) fn deform_conv2d<R: CubeRuntime>(
 
     if let Some(bias) = bias {
         let bias = reshape(bias, Shape::new([1, out_channels, 1, 1]));
-        Ok(launch_binop::<R, AddOp>(out, bias))
+        Ok(launch_binop::<AddOp>(out, bias))
     } else {
         Ok(out)
     }

@@ -6,7 +6,7 @@ authors = [
 edition.workspace = true
 license.workspace = true
 name = "burn-no-std-tests"
-readme.workspace = true
+readme = "README.md"
 repository = "https://github.com/tracel-ai/burn/tree/main/crates/burn-no-std-tests"
 version.workspace = true
 
@@ -16,21 +16,11 @@ workspace = true
 [features]
 default = []
 
-# Enable burn-flex's `critical-section` fallback for no_std targets without
-# atomic CAS (e.g. thumbv6m-none-eabi). See burn-flex Cargo.toml for details.
-critical-section = ["burn-flex/critical-section"]
-
-tracing = [
-    "burn/tracing",
-    "burn-flex/tracing",
-    "burn-store/tracing",
-]
-
 [dependencies]
 
 # ** Please make sure all dependencies support no_std **
 
-burn = { workspace = true }
+burn = { workspace = true, features = ["flex"] }
 burn-flex = { workspace = true }
 
-burn-store = { workspace = true, features = ["safetensors", "burnpack"] }
+burn-store = { workspace = true, features = ["safetensors"] }

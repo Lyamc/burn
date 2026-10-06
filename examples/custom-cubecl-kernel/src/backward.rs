@@ -1,21 +1,18 @@
 use crate::FloatTensor;
 
-use super::{AutodiffBackend, Backend};
+use super::Backend;
 use burn::{
-    backend::autodiff::{
-        Autodiff, NodeId,
-        checkpoint::{base::Checkpointer, strategy::CheckpointStrategy},
-        grads::Gradients,
-        ops::{Backward, Ops, OpsKind, broadcast_shape},
+    backend::{
+        TensorMetadata,
+        autodiff::{
+            Autodiff, NodeId,
+            checkpoint::{base::Checkpointer, strategy::CheckpointStrategy},
+            grads::Gradients,
+            ops::{Backward, Ops, OpsKind, broadcast_shape},
+        },
     },
-    tensor::{Shape, TensorMetadata},
+    tensor::Shape,
 };
-use burn_cubecl::{CubeBackend, CubeRuntime, FloatElement, IntElement, element::BoolElement};
-
-impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> AutodiffBackend
-    for Autodiff<CubeBackend<R, F, I, BT>>
-{
-}
 
 // Implement our custom backend trait for any backend that also implements our custom backend trait.
 impl<B: Backend, C: CheckpointStrategy> Backend for Autodiff<B, C> {
@@ -92,11 +89,12 @@ impl<B: Backend, C: CheckpointStrategy> Backend for Autodiff<B, C> {
             }
         }
 
-        // Prepare a stateful operation with each variable node and corresponding graph.
+        // Prepare a stateful operation, keeping its inputs alive through registration.
+        // `node()` returns a guard that `prep.finish` releases after registering the output.
         //
         // Each node can be fetched with `ops.parents` in the same order as defined here.
         match FusedMatmulAddReluBackward
-            .prepare::<C>([lhs.node.clone(), rhs.node.clone(), bias.node.clone()])
+            .prepare::<C>([lhs.node(), rhs.node(), bias.node()])
             // Marks the operation as compute bound, meaning it will save its
             // state instead of recomputing itself during checkpointing
             .compute_bound()
@@ -114,12 +112,12 @@ impl<B: Backend, C: CheckpointStrategy> Backend for Autodiff<B, C> {
                 // compute bound operation.
                 let lhs_state = prep.checkpoint(&lhs);
                 let rhs_state = prep.checkpoint(&rhs);
-                let bias_shape = bias.primitive.shape();
+                let bias_shape = bias.primitive().shape();
 
                 let output = B::fused_matmul_add_relu(
-                    lhs.primitive.clone(),
-                    rhs.primitive.clone(),
-                    bias.primitive,
+                    lhs.primitive().clone(),
+                    rhs.primitive().clone(),
+                    bias.into_primitive(),
                 );
 
                 let state = (lhs_state, rhs_state, output.clone(), bias_shape);
@@ -129,7 +127,11 @@ impl<B: Backend, C: CheckpointStrategy> Backend for Autodiff<B, C> {
             OpsKind::UnTracked(prep) => {
                 // When no node is tracked, we can just compute the original operation without
                 // keeping any state.
-                let output = B::fused_matmul_add_relu(lhs.primitive, rhs.primitive, bias.primitive);
+                let output = B::fused_matmul_add_relu(
+                    lhs.into_primitive(),
+                    rhs.into_primitive(),
+                    bias.into_primitive(),
+                );
                 prep.finish(output)
             }
         }

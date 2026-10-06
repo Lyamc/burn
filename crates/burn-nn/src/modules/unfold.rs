@@ -4,7 +4,6 @@ use burn::config::Config;
 use burn::module::{Content, DisplaySettings, Module, ModuleDisplay};
 
 use burn::tensor::Tensor;
-use burn::tensor::backend::Backend;
 use burn::tensor::module::unfold4d;
 use burn::tensor::ops::UnfoldOptions;
 
@@ -27,7 +26,7 @@ pub struct Unfold4dConfig {
 /// Four-dimensional unfolding.
 ///
 /// Should be created with [Unfold4dConfig].
-#[derive(Module, Clone, Debug)]
+#[derive(Module, Debug)]
 #[module(custom_display)]
 pub struct Unfold4d {
     /// The size of the kernel.
@@ -49,10 +48,10 @@ impl ModuleDisplay for Unfold4d {
 
     fn custom_content(&self, content: Content) -> Option<Content> {
         content
-            .add("kernel_size", &alloc::format!("{:?}", &self.kernel_size))
-            .add("stride", &alloc::format!("{:?}", &self.stride))
-            .add("dilation", &alloc::format!("{:?}", &self.dilation))
-            .add("padding", &alloc::format!("{:?}", &self.padding))
+            .add("kernel_size", &alloc::format!("{:?}", self.kernel_size))
+            .add("stride", &alloc::format!("{:?}", self.stride))
+            .add("dilation", &alloc::format!("{:?}", self.dilation))
+            .add("padding", &alloc::format!("{:?}", self.padding))
             .optional()
     }
 }
@@ -78,7 +77,7 @@ impl Unfold4d {
     ///
     /// input:   `[batch_size, channels_in, height, width]`
     /// returns: `[batch_size, channels_in * kernel_size_1 * kernel_size_2, number of blocks]`
-    pub fn forward<B: Backend>(&self, input: Tensor<B, 4>) -> Tensor<B, 3> {
+    pub fn forward(&self, input: Tensor<4>) -> Tensor<3> {
         unfold4d(
             input,
             self.kernel_size,

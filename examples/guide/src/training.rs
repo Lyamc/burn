@@ -1,3 +1,9 @@
+// The Burn Book includes sections of this file using mdBook's ANCHOR / ANCHOR_END
+// markers. Keep each pair around the code it documents, and update the includes in
+// `burn-book/src/basic-workflow/training.md` if you rename or remove a marker.
+
+use std::path::PathBuf;
+
 use crate::{
     data::{MnistBatch, MnistBatcher},
     model::{Model, ModelConfig},
@@ -7,20 +13,19 @@ use burn::{
     nn::loss::CrossEntropyLossConfig,
     optim::AdamConfig,
     prelude::*,
-    record::CompactRecorder,
-    tensor::backend::AutodiffBackend,
     train::{
         ClassificationOutput, InferenceStep, Learner, SupervisedTraining, TrainOutput, TrainStep,
         metric::{AccuracyMetric, LossMetric},
     },
 };
 
-impl<B: Backend> Model<B> {
+// ANCHOR: classification
+impl Model {
     pub fn forward_classification(
         &self,
-        images: Tensor<B, 3>,
-        targets: Tensor<B, 1, Int>,
-    ) -> ClassificationOutput<B> {
+        images: Tensor<3>,
+        targets: Tensor<1, Int>,
+    ) -> ClassificationOutput {
         let output = self.forward(images);
         let loss = CrossEntropyLossConfig::new()
             .init(&output.device())
@@ -30,26 +35,30 @@ impl<B: Backend> Model<B> {
     }
 }
 
-impl<B: AutodiffBackend> TrainStep for Model<B> {
-    type Input = MnistBatch<B>;
-    type Output = ClassificationOutput<B>;
+// ANCHOR_END: classification
+// ANCHOR: steps
+impl TrainStep for Model {
+    type Input = MnistBatch;
+    type Output = ClassificationOutput;
 
-    fn step(&self, batch: MnistBatch<B>) -> TrainOutput<ClassificationOutput<B>> {
+    fn step(&self, batch: MnistBatch) -> TrainOutput<ClassificationOutput> {
         let item = self.forward_classification(batch.images, batch.targets);
 
         TrainOutput::new(self, item.loss.backward(), item)
     }
 }
 
-impl<B: Backend> InferenceStep for Model<B> {
-    type Input = MnistBatch<B>;
-    type Output = ClassificationOutput<B>;
+impl InferenceStep for Model {
+    type Input = MnistBatch;
+    type Output = ClassificationOutput;
 
-    fn step(&self, batch: MnistBatch<B>) -> ClassificationOutput<B> {
+    fn step(&self, batch: MnistBatch) -> ClassificationOutput {
         self.forward_classification(batch.images, batch.targets)
     }
 }
 
+// ANCHOR_END: steps
+// ANCHOR: training
 #[derive(Config, Debug)]
 pub struct TrainingConfig {
     pub model: ModelConfig,
@@ -67,18 +76,19 @@ pub struct TrainingConfig {
 }
 
 fn create_artifact_dir(artifact_dir: &str) {
-    // Remove existing artifacts before to get an accurate learner summary
-    std::fs::remove_dir_all(artifact_dir).ok();
+    std::fs::remove_file(PathBuf::from(artifact_dir).join("experiment.log")).ok();
     std::fs::create_dir_all(artifact_dir).ok();
 }
 
-pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, device: B::Device) {
+pub fn train(artifact_dir: &str, config: TrainingConfig, device: impl Into<Device>) {
     create_artifact_dir(artifact_dir);
     config
         .save(format!("{artifact_dir}/config.json"))
         .expect("Config should be saved successfully");
 
-    B::seed(&device, config.seed);
+    let device = device.into();
+    device.seed(config.seed);
+    let autodiff_device = device.autodiff();
 
     let batcher = MnistBatcher::default();
 
@@ -96,11 +106,11 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
 
     let training = SupervisedTraining::new(artifact_dir, dataloader_train, dataloader_test)
         .metrics((AccuracyMetric::new(), LossMetric::new()))
-        .with_file_checkpointer(CompactRecorder::new())
+        .with_default_checkpointers()
         .num_epochs(config.num_epochs)
         .summary();
 
-    let model = config.model.init::<B>(&device);
+    let model = config.model.init(&autodiff_device);
     let result = training.launch(Learner::new(
         model,
         config.optimizer.init(),
@@ -109,6 +119,8 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
 
     result
         .model
-        .save_file(format!("{artifact_dir}/model"), &CompactRecorder::new())
+        .into_record()
+        .save(format!("{artifact_dir}/model"))
         .expect("Trained model should be saved successfully");
 }
+// ANCHOR_END: training

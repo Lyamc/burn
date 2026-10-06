@@ -1,5 +1,4 @@
 use crate::{
-    CubeRuntime,
     kernel::{
         into_contiguous,
         utils::{address_type, broadcast_shape},
@@ -7,15 +6,16 @@ use crate::{
     ops::{numeric::empty_device_dtype, swap_dims},
     tensor::CubeTensor,
 };
-use cubecl::std::tensor::layout::linear::LinearView;
+use burn_backend::cubecl::dtype_to_storage_type;
+use cubecl::std::tensor::layout::linear::{LinearView, LinearViewMut};
 use cubecl::{calculate_cube_count_elemwise, prelude::*};
 
 #[cube(launch_unchecked, address_type = "dynamic")]
 fn cross_kernel<E: Float>(
-    lhs: &LinearView<E>,
-    rhs: &LinearView<E>,
-    output: &mut LinearView<E, ReadWrite>,
-    #[define(E)] _dtype: StorageType,
+    lhs: LinearView<'_, E>,
+    rhs: LinearView<'_, E>,
+    mut output: LinearViewMut<'_, E>,
+    #[define(E)] _dtype: ElemType,
 ) {
     // Each thread processes one 3-element vector
     let vector_idx = ABSOLUTE_POS;
@@ -26,12 +26,12 @@ fn cross_kernel<E: Float>(
     }
 
     // Extract vectors
-    let a0 = lhs[base_pos];
-    let a1 = lhs[base_pos + 1];
-    let a2 = lhs[base_pos + 2];
-    let b0 = rhs[base_pos];
-    let b1 = rhs[base_pos + 1];
-    let b2 = rhs[base_pos + 2];
+    let a0 = lhs.read(base_pos);
+    let a1 = lhs.read(base_pos + 1);
+    let a2 = lhs.read(base_pos + 2);
+    let b0 = rhs.read(base_pos);
+    let b1 = rhs.read(base_pos + 1);
+    let b2 = rhs.read(base_pos + 2);
 
     // Compute cross product: a × b
     let x = a1 * b2 - a2 * b1;
@@ -39,16 +39,12 @@ fn cross_kernel<E: Float>(
     let z = a0 * b1 - a1 * b0;
 
     // Store result
-    output[base_pos] = x;
-    output[base_pos + 1] = y;
-    output[base_pos + 2] = z;
+    output.write(base_pos, x);
+    output.write(base_pos + 1, y);
+    output.write(base_pos + 2, z);
 }
 
-pub(crate) fn cross<R: CubeRuntime>(
-    lhs: CubeTensor<R>,
-    rhs: CubeTensor<R>,
-    dim: usize,
-) -> CubeTensor<R> {
+pub(crate) fn cross(lhs: CubeTensor, rhs: CubeTensor, dim: usize) -> CubeTensor {
     let ndims = lhs.meta.num_dims();
 
     // Validate that the cross dimension has size 3
@@ -76,6 +72,16 @@ pub(crate) fn cross<R: CubeRuntime>(
 
     let output_shape = broadcast_shape(&[&lhs, &rhs]);
 
+    // A zero-sized broadcast output has no elements to compute. Return the empty output directly.
+    if output_shape.num_elements() == 0 {
+        return empty_device_dtype(
+            lhs.client.clone(),
+            lhs.device.clone(),
+            output_shape,
+            lhs.dtype,
+        );
+    }
+
     let output = empty_device_dtype(
         lhs.client.clone(),
         lhs.device.clone(),
@@ -99,7 +105,7 @@ pub(crate) fn cross<R: CubeRuntime>(
             lhs.into_linear_view_like(&output),
             rhs.into_linear_view_like(&output),
             output.clone().into_linear_view(),
-            dtype.into(),
+            dtype_to_storage_type(dtype),
         );
     };
 

@@ -1,108 +1,191 @@
-use core::f64;
-use core::marker::PhantomData;
-
 use super::MetricMetadata;
-use super::state::{FormatOptions, NumericMetricState};
-use crate::metric::{Metric, MetricName, Numeric, SerializedEntry};
-use burn_core::tensor::backend::Backend;
-use burn_core::tensor::{ElementConversion, Int, Tensor};
+use super::state::{FormatOptions, PredictionAccumulatorState};
+use crate::metric::{
+    ClassReduction, ConfusionStatsInput, Metric, MetricName, Numeric, SerializedEntry,
+};
+use burn_core::tensor::{Bool, Tensor, TensorReadError, Transaction};
+use std::sync::Arc;
 
-/// The Area Under the Receiver Operating Characteristic Curve (AUROC, also referred to as [ROC AUC](https://en.wikipedia.org/wiki/Receiver_operating_characteristic)) for binary classification.
+/// The Area Under the Receiver Operating Characteristic Curve (AUROC, also
+/// referred to as [ROC AUC](https://en.wikipedia.org/wiki/Receiver_operating_characteristic)).
+///
+/// Supports binary, multiclass and multi-label classification through a
+/// One-vs-Rest decomposition, aggregated with the configured
+/// [class reduction](ClassReduction).
 #[derive(Clone)]
-pub struct AurocMetric<B: Backend> {
+pub struct AurocMetric {
     name: MetricName,
-    state: NumericMetricState,
-    _b: PhantomData<B>,
+    state: PredictionAccumulatorState,
+    class_reduction: ClassReduction,
 }
 
-/// The [AUROC metric](AurocMetric) input type.
-#[derive(new)]
-pub struct AurocInput<B: Backend> {
-    outputs: Tensor<B, 2>,
-    targets: Tensor<B, 1, Int>,
-}
-
-impl<B: Backend> Default for AurocMetric<B> {
+impl Default for AurocMetric {
     fn default() -> Self {
-        Self::new()
+        Self::new(Default::default())
     }
 }
 
-impl<B: Backend> AurocMetric<B> {
-    /// Creates the metric.
-    pub fn new() -> Self {
+impl AurocMetric {
+    fn new(class_reduction: ClassReduction) -> Self {
+        let state = Default::default();
+        let name = Arc::new(format!("AUROC [{:?}]", class_reduction));
+
         Self {
-            name: MetricName::new("AUROC".to_string()),
-            state: Default::default(),
-            _b: PhantomData,
+            state,
+            class_reduction,
+            name,
         }
     }
 
-    fn binary_auroc(&self, probabilities: &Tensor<B, 1>, targets: &Tensor<B, 1, Int>) -> f64 {
-        let n = targets.dims()[0];
+    /// AUROC metric for binary classification.
+    #[allow(dead_code)]
+    pub fn binary() -> Self {
+        Self::new(ClassReduction::default())
+    }
 
-        let n_pos = targets.clone().sum().into_scalar().elem::<u64>() as usize;
+    /// AUROC metric for multiclass classification.
+    ///
+    /// # Arguments
+    ///
+    /// * `class_reduction` - [Class reduction](ClassReduction) type.
+    #[allow(dead_code)]
+    pub fn multiclass(class_reduction: ClassReduction) -> Self {
+        Self::new(class_reduction)
+    }
 
-        // Early return if we don't have both positive and negative samples
-        if n_pos == 0 || n_pos == n {
-            if n_pos == 0 {
-                log::warn!("Metric cannot be computed because all target values are negative.")
-            } else {
-                log::warn!("Metric cannot be computed because all target values are positive.")
+    /// AUROC metric for multi-label classification.
+    ///
+    /// # Arguments
+    ///
+    /// * `class_reduction` - [Class reduction](ClassReduction) type.
+    #[allow(dead_code)]
+    pub fn multilabel(class_reduction: ClassReduction) -> Self {
+        Self::new(class_reduction)
+    }
+
+    /// Exact AUROC from a score sort and a scan of equal-score groups.
+    /// A group contributes one win for each lower-scored negative and half a
+    /// win for each negative in the same group, for every positive in it.
+    fn sorted_auc(samples: &mut Vec<(f64, bool)>) -> Option<f64> {
+        let positives = samples.iter().filter(|(_, target)| *target).count() as u128;
+        let negatives = samples.len() as u128 - positives;
+        if positives == 0 || negatives == 0 {
+            return None;
+        }
+
+        // Comparisons with NaN contributed no wins or ties in the pairwise
+        // implementation, but those pairs still counted in the denominator.
+        samples.retain(|(score, _)| !score.is_nan());
+        samples.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+
+        let mut negatives_below = 0u128;
+        let mut twice_winning_pairs = 0u128;
+        let mut index = 0;
+        while index < samples.len() {
+            let score = samples[index].0;
+            let mut group_positives = 0u128;
+            let mut group_negatives = 0u128;
+            // Numeric equality keeps -0.0 and +0.0 in the same tie group.
+            while index < samples.len() && samples[index].0 == score {
+                if samples[index].1 {
+                    group_positives += 1;
+                } else {
+                    group_negatives += 1;
+                }
+                index += 1;
             }
-            return 0.0;
+
+            twice_winning_pairs += group_positives * (2 * negatives_below + group_negatives);
+            negatives_below += group_negatives;
         }
 
-        let pos_mask = targets.clone().equal_elem(1).int().reshape([n, 1]);
-        let neg_mask = targets.clone().equal_elem(0).int().reshape([1, n]);
-
-        let valid_pairs = pos_mask * neg_mask;
-
-        let prob_i = probabilities.clone().reshape([n, 1]).repeat_dim(1, n);
-        let prob_j = probabilities.clone().reshape([1, n]).repeat_dim(0, n);
-
-        let correct_order = prob_i.clone().greater(prob_j.clone()).int();
-
-        let ties = prob_i.equal(prob_j).int();
-
-        // Calculate AUC components
-        let num_pairs = valid_pairs.clone().sum().into_scalar().elem::<f64>();
-        let correct_pairs = (correct_order * valid_pairs.clone())
-            .sum()
-            .into_scalar()
-            .elem::<f64>();
-        let tied_pairs = (ties * valid_pairs).sum().into_scalar().elem::<f64>();
-
-        (correct_pairs + 0.5 * tied_pairs) / num_pairs
+        Some(twice_winning_pairs as f64 / (2 * positives * negatives) as f64)
     }
-}
 
-impl<B: Backend> Metric for AurocMetric<B> {
-    type Input = AurocInput<B>;
+    fn compute_auc(
+        &self,
+        predictions: Tensor<2>,
+        targets: Tensor<2, Bool>,
+    ) -> Result<f64, TensorReadError> {
+        let [n, c] = predictions.dims();
+        let [scores_data, targets_data] = Transaction::default()
+            .register(predictions)
+            .register(targets)
+            .try_execute()?
+            .try_into()
+            .expect("Expected predictions and targets");
+        let scores = scores_data.try_into_vec_as::<f64>()?;
+        let targets = targets_data.try_into_vec_as::<bool>()?;
 
-    fn update(&mut self, input: &AurocInput<B>, _metadata: &MetricMetadata) -> SerializedEntry {
-        let [batch_size, num_classes] = input.outputs.dims();
-
-        assert_eq!(
-            num_classes, 2,
-            "Currently only binary classification is supported"
-        );
-
-        let probabilities = {
-            let exponents = input.outputs.clone().exp();
-            let sum = exponents.clone().sum_dim(1);
-            (exponents / sum)
-                .select(1, Tensor::arange(1..2, &input.outputs.device()))
-                .squeeze_dim(1)
+        let auc = match self.class_reduction {
+            ClassReduction::Macro => {
+                let mut samples = Vec::with_capacity(n);
+                let mut sum = 0.0;
+                let mut count = 0;
+                for class in 0..c {
+                    samples.clear();
+                    for row in 0..n {
+                        let index = row * c + class;
+                        samples.push((scores[index], targets[index]));
+                    }
+                    if let Some(value) = Self::sorted_auc(&mut samples) {
+                        sum += value;
+                        count += 1;
+                    }
+                }
+                (count > 0).then(|| sum / count as f64)
+            }
+            ClassReduction::Micro => {
+                let mut samples = scores.into_iter().zip(targets).collect();
+                Self::sorted_auc(&mut samples)
+            }
         };
 
-        let area_under_curve = self.binary_auroc(&probabilities, &input.targets);
+        Ok(auc.unwrap_or_else(|| {
+            log::warn!(
+                "AUROC is undefined (no class has both positive and negative samples in the \
+                 epoch); reporting 0.5 (chance level)."
+            );
+            0.5
+        }))
+    }
+}
 
-        self.state.update(
-            100.0 * area_under_curve,
-            batch_size,
+impl Metric for AurocMetric {
+    type Input = ConfusionStatsInput;
+
+    fn update(
+        &mut self,
+        input: &ConfusionStatsInput,
+        _metadata: &MetricMetadata,
+    ) -> Result<SerializedEntry, TensorReadError> {
+        // Update the state with predictions and targets
+        self.state
+            .accumulate(input.predictions.clone(), input.targets.clone());
+
+        // Serialize placeholder to indicate no valid scalar exists yet mid-epoch
+        Ok(self
+            .state
+            .serialize_placeholder(FormatOptions::new(self.name()).unit("%").precision(2)))
+    }
+
+    fn compute(&mut self) -> Result<SerializedEntry, TensorReadError> {
+        // Guard against an empty epoch calculation
+        if self.state.is_empty() {
+            return Ok(self
+                .state
+                .serialize_placeholder(FormatOptions::new(self.name()).unit("%").precision(2)));
+        }
+
+        // Recompute over the whole epoch
+        let (predictions, targets) = self.state.tensors();
+        let metric = self.compute_auc(predictions, targets)?;
+
+        // Complete the state with the calculated scalar
+        Ok(self.state.compute(
+            100.0 * metric,
             FormatOptions::new(self.name()).unit("%").precision(2),
-        )
+        ))
     }
 
     fn clear(&mut self) {
@@ -114,118 +197,337 @@ impl<B: Backend> Metric for AurocMetric<B> {
     }
 }
 
-impl<B: Backend> Numeric for AurocMetric<B> {
-    fn value(&self) -> super::NumericEntry {
-        self.state.current_value()
+impl Numeric for AurocMetric {
+    fn value(&self) -> Option<super::NumericEntry> {
+        None // current value is invalid; requires epoch-level aggregation
     }
 
-    fn running_value(&self) -> super::NumericEntry {
-        self.state.running_value()
+    fn running_value(&self) -> Option<super::NumericEntry> {
+        None
+    }
+
+    fn final_value(&self) -> super::NumericEntry {
+        self.state
+            .value()
+            .expect("Compute must be called to get final value")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestBackend;
+    use crate::metric::ClassReduction::{self, *};
+    use burn_core::tensor::{TensorData, Tolerance};
+    use rstest::rstest;
 
-    #[test]
-    fn test_auroc() {
-        let device = Default::default();
-        let mut metric = AurocMetric::<TestBackend>::new();
-
-        let input = AurocInput::new(
-            Tensor::from_data(
-                [
-                    [0.1, 0.9], // High confidence positive
-                    [0.7, 0.3], // Low confidence negative
-                    [0.6, 0.4], // Low confidence negative
-                    [0.2, 0.8], // High confidence positive
-                ],
-                &device,
-            ),
-            Tensor::from_data([1, 0, 0, 1], &device), // True labels
-        );
-
-        let _entry = metric.update(&input, &MetricMetadata::fake());
-        assert_eq!(metric.value().current(), 100.0);
+    /// Inputs and expected AUROC computed with an independent reference
+    /// equivalent to scikit-learn's `roc_auc_score` (Mann-Whitney U:
+    /// `(#pos>neg + 0.5·ties) / (P·N)`, One-vs-Rest, macro/micro). Scores
+    /// are distinct so the statistic is unambiguous and matches sklearn.
+    #[derive(Clone, Copy)]
+    enum Data {
+        Binary,
+        Multiclass,
+        Multilabel,
     }
 
-    #[test]
-    fn test_auroc_perfect_separation() {
-        let device = Default::default();
-        let mut metric = AurocMetric::<TestBackend>::new();
+    fn input(data: Data) -> ConfusionStatsInput {
+        let dev = Default::default();
+        match data {
+            Data::Binary => ConfusionStatsInput::new(
+                Tensor::from_data([[0.34], [0.64], [0.12], [0.19], [0.53], [0.38]], &dev),
+                Tensor::from_data([[0], [0], [0], [0], [1], [1]], &dev),
+            ),
+            Data::Multiclass => ConfusionStatsInput::new(
+                Tensor::from_data(
+                    [
+                        [0.79, 0.41, 0.16],
+                        [0.25, 0.93, 0.78],
+                        [0.61, 0.09, 0.21],
+                        [0.9, 0.31, 0.33],
+                        [0.16, 0.82, 0.57],
+                        [0.57, 0.18, 0.63],
+                    ],
+                    &dev,
+                ),
+                Tensor::from_data(
+                    [
+                        [1, 0, 0],
+                        [1, 0, 0],
+                        [1, 0, 0],
+                        [0, 0, 1],
+                        [0, 1, 0],
+                        [1, 0, 0],
+                    ],
+                    &dev,
+                ),
+            ),
+            Data::Multilabel => ConfusionStatsInput::new(
+                Tensor::from_data(
+                    [
+                        [0.11, 0.57, 0.9],
+                        [0.13, 0.66, 0.37],
+                        [0.71, 0.85, 0.6],
+                        [0.29, 0.69, 0.49],
+                        [0.68, 0.45, 0.25],
+                        [0.33, 0.36, 0.31],
+                    ],
+                    &dev,
+                ),
+                Tensor::from_data(
+                    [
+                        [1, 1, 1],
+                        [0, 0, 1],
+                        [0, 1, 0],
+                        [1, 1, 0],
+                        [0, 1, 1],
+                        [1, 1, 1],
+                    ],
+                    &dev,
+                ),
+            ),
+        }
+    }
 
-        let input = AurocInput::new(
+    #[rstest]
+    // Binary is a single column -> Macro == Micro.
+    #[case::binary_macro(Data::Binary, Macro, 0.75)]
+    #[case::binary_micro(Data::Binary, Micro, 0.75)]
+    #[case::multiclass_macro(Data::Multiclass, Macro, 0.5666666666666667)]
+    #[case::multiclass_micro(Data::Multiclass, Micro, 0.6458333333333333)]
+    #[case::multilabel_macro(Data::Multilabel, Macro, 0.2907407407407407)]
+    #[case::multilabel_micro(Data::Multilabel, Micro, 0.3611111111111111)]
+    fn test_auroc(
+        #[case] data: Data,
+        #[case] class_reduction: ClassReduction,
+        #[case] expected: f64,
+    ) {
+        let mut metric = AurocMetric::new(class_reduction);
+
+        let _entry = metric
+            .update(&input(data), &MetricMetadata::fake())
+            .unwrap();
+        let _entry = metric.compute().unwrap();
+
+        TensorData::from([metric.final_value().current()])
+            .assert_approx_eq::<f64>(&TensorData::from([expected * 100.0]), Tolerance::default());
+    }
+
+    #[rstest]
+    #[case::macro_reduction(Macro)]
+    #[case::micro_reduction(Micro)]
+    fn test_auroc_perfect_separation(#[case] class_reduction: ClassReduction) {
+        let device = Default::default();
+        let mut metric = AurocMetric::new(class_reduction);
+
+        let input = ConfusionStatsInput::new(
             Tensor::from_data([[0.0, 1.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], &device),
-            Tensor::from_data([1, 0, 0, 1], &device),
+            Tensor::from_data([[0, 1], [1, 0], [1, 0], [0, 1]], &device),
         );
 
-        let _entry = metric.update(&input, &MetricMetadata::fake());
-        assert_eq!(metric.value().current(), 100.0); // Perfect AUC
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
+        let _entry = metric.compute().unwrap();
+        assert_eq!(metric.final_value().current(), 100.0);
+    }
+
+    #[rstest]
+    #[case::macro_reduction(Macro)]
+    #[case::micro_reduction(Micro)]
+    fn test_auroc_chance_level(#[case] class_reduction: ClassReduction) {
+        let device = Default::default();
+        let mut metric = AurocMetric::new(class_reduction);
+
+        // All scores tied -> every pair is a tie -> AUROC = 0.5.
+        let input = ConfusionStatsInput::new(
+            Tensor::from_data([[0.5, 0.5], [0.5, 0.5], [0.5, 0.5], [0.5, 0.5]], &device),
+            Tensor::from_data([[0, 1], [1, 0], [1, 0], [0, 1]], &device),
+        );
+
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
+        let _entry = metric.compute().unwrap();
+        assert_eq!(metric.final_value().current(), 50.0);
     }
 
     #[test]
-    fn test_auroc_random() {
+    fn test_auroc_mixed_ties() {
         let device = Default::default();
-        let mut metric = AurocMetric::<TestBackend>::new();
-
-        let input = AurocInput::new(
-            Tensor::from_data(
-                [
-                    [0.5, 0.5], // Random predictions
-                    [0.5, 0.5],
-                    [0.5, 0.5],
-                    [0.5, 0.5],
-                ],
-                &device,
-            ),
-            Tensor::from_data([1, 0, 0, 1], &device),
+        let mut metric = AurocMetric::binary();
+        let input = ConfusionStatsInput::new(
+            Tensor::from_data([[0.9], [0.5], [0.5], [0.1]], &device),
+            Tensor::from_data([[1], [0], [1], [0]], &device),
         );
 
-        let _entry = metric.update(&input, &MetricMetadata::fake());
-        assert_eq!(metric.value().current(), 50.0);
+        metric.update(&input, &MetricMetadata::fake()).unwrap();
+        metric.compute().unwrap();
+
+        // Three wins and one tie among four positive-negative pairs.
+        assert_eq!(metric.final_value().current(), 87.5);
     }
 
     #[test]
-    fn test_auroc_all_one_class() {
+    fn test_auroc_signed_zero_tie() {
         let device = Default::default();
-        let mut metric = AurocMetric::<TestBackend>::new();
-
-        let input = AurocInput::new(
-            Tensor::from_data(
-                [
-                    [0.1, 0.9], // All positives predictions
-                    [0.2, 0.8],
-                    [0.3, 0.7],
-                    [0.4, 0.6],
-                ],
-                &device,
-            ),
-            Tensor::from_data([1, 1, 1, 1], &device), // All positive class
+        let mut metric = AurocMetric::binary();
+        let input = ConfusionStatsInput::new(
+            Tensor::from_data([[0.0], [-0.0]], &device),
+            Tensor::from_data([[1], [0]], &device),
         );
 
-        let _entry = metric.update(&input, &MetricMetadata::fake());
-        assert_eq!(metric.value().current(), 0.0);
+        metric.update(&input, &MetricMetadata::fake()).unwrap();
+        metric.compute().unwrap();
+
+        assert_eq!(metric.final_value().current(), 50.0);
     }
 
     #[test]
-    #[should_panic(expected = "Currently only binary classification is supported")]
-    fn test_auroc_multiclass_error() {
+    fn test_auroc_nan_keeps_pairwise_semantics() {
         let device = Default::default();
-        let mut metric = AurocMetric::<TestBackend>::new();
+        let mut metric = AurocMetric::binary();
+        let input = ConfusionStatsInput::new(
+            Tensor::from_data([[f32::NAN], [0.9], [0.8]], &device),
+            Tensor::from_data([[1], [1], [0]], &device),
+        );
 
-        let input = AurocInput::new(
+        metric.update(&input, &MetricMetadata::fake()).unwrap();
+        metric.compute().unwrap();
+
+        // The NaN pair stays in the denominator but contributes no win or tie.
+        assert_eq!(metric.final_value().current(), 50.0);
+    }
+
+    #[test]
+    fn test_auroc_large_epoch() {
+        let device = Default::default();
+        let n = 20_000;
+        let scores = (0..n).map(|i| i as f32 / n as f32).collect();
+        let targets = (0..n).map(|i| i32::from(i >= n / 2)).collect();
+        let input = ConfusionStatsInput::new(
+            Tensor::from_data(TensorData::new(scores, [n, 1]), &device),
+            Tensor::from_data(TensorData::new(targets, [n, 1]), &device),
+        );
+        let mut metric = AurocMetric::binary();
+
+        metric.update(&input, &MetricMetadata::fake()).unwrap();
+        metric.compute().unwrap();
+
+        assert_eq!(metric.final_value().current(), 100.0);
+    }
+
+    #[test]
+    fn test_auroc_macro_drops_degenerate_class() {
+        let device = Default::default();
+        let mut metric = AurocMetric::new(Macro);
+
+        // Class 2 never appears (column all-negative) -> its AUROC is undefined
+        // and must be dropped, leaving the two well-separated classes at 1.0.
+        let input = ConfusionStatsInput::new(
             Tensor::from_data(
                 [
-                    [0.1, 0.2, 0.7], // More than 2 classes not supported
-                    [0.3, 0.5, 0.2],
+                    [0.9, 0.1, 0.0],
+                    [0.2, 0.8, 0.0],
+                    [0.7, 0.3, 0.0],
+                    [0.1, 0.6, 0.0],
                 ],
                 &device,
             ),
-            Tensor::from_data([2, 1], &device),
+            Tensor::from_data([[1, 0, 0], [0, 1, 0], [1, 0, 0], [0, 1, 0]], &device),
         );
 
-        let _entry = metric.update(&input, &MetricMetadata::fake());
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
+        let _entry = metric.compute().unwrap();
+        assert_eq!(metric.final_value().current(), 100.0);
+    }
+
+    #[test]
+    fn test_auroc_all_degenerate_is_chance() {
+        let device = Default::default();
+        let mut metric = AurocMetric::binary();
+
+        // Only positives -> no valid pair in any column -> undefined ->
+        // reported as chance level (0.5).
+        let input = ConfusionStatsInput::new(
+            Tensor::from_data([[0.9], [0.8], [0.7], [0.6]], &device),
+            Tensor::from_data([[1], [1], [1], [1]], &device),
+        );
+
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
+        let _entry = metric.compute().unwrap();
+        assert_eq!(metric.final_value().current(), 50.0);
+    }
+
+    #[test]
+    fn test_auroc_reduction_changes_name() {
+        let macro_metric = AurocMetric::new(Macro);
+        let micro_metric = AurocMetric::new(Micro);
+
+        assert_ne!(macro_metric.name(), micro_metric.name());
+    }
+
+    #[test]
+    fn test_auroc_accumulates_across_batches() {
+        let dev = Default::default();
+
+        // Whole dataset as a single batch.
+        let mut single = AurocMetric::binary();
+        single
+            .update(
+                &ConfusionStatsInput::new(
+                    Tensor::from_data([[0.9], [0.4], [0.8], [0.2], [0.6], [0.1]], &dev),
+                    Tensor::from_data([[1], [0], [1], [0], [1], [0]], &dev),
+                ),
+                &MetricMetadata::fake(),
+            )
+            .unwrap();
+        single.compute().unwrap();
+
+        // Same dataset split across two batches.
+        let mut split = AurocMetric::binary();
+        split
+            .update(
+                &ConfusionStatsInput::new(
+                    Tensor::from_data([[0.9], [0.4], [0.8]], &dev),
+                    Tensor::from_data([[1], [0], [1]], &dev),
+                ),
+                &MetricMetadata::fake(),
+            )
+            .unwrap();
+        split
+            .update(
+                &ConfusionStatsInput::new(
+                    Tensor::from_data([[0.2], [0.6], [0.1]], &dev),
+                    Tensor::from_data([[0], [1], [0]], &dev),
+                ),
+                &MetricMetadata::fake(),
+            )
+            .unwrap();
+        split.compute().unwrap();
+
+        TensorData::from([split.final_value().current()]).assert_approx_eq::<f64>(
+            &TensorData::from([single.final_value().current()]),
+            Tolerance::default(),
+        );
+    }
+
+    #[test]
+    #[should_panic = "Compute must be called to get final value"]
+    fn test_auroc_should_panic_before_compute() {
+        let dev = Default::default();
+
+        let mut split = AurocMetric::binary();
+        split
+            .update(
+                &ConfusionStatsInput::new(
+                    Tensor::from_data([[0.9], [0.4], [0.8]], &dev),
+                    Tensor::from_data([[1], [0], [1]], &dev),
+                ),
+                &MetricMetadata::fake(),
+            )
+            .unwrap();
+
+        // AUROC is not valid for a batch, and is not meaningful until all statistics have been accumulated
+        assert!(split.value().is_none());
+        assert!(split.running_value().is_none());
+
+        split.final_value();
     }
 }

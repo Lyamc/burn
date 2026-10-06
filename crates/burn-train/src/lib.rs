@@ -1,7 +1,28 @@
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-//! A library for training neural networks using the burn crate.
+//! Training and evaluation for Burn models.
+//!
+//! Applications enable the `train` feature of `burn` and use this crate as `burn::train`.
+//!
+//! - [`Learner`] bundles a model, optimizer and learning rate scheduler, and [`SupervisedTraining`]
+//!   runs it over training and validation data loaders on one or several devices.
+//! - [`metric`]: loss, accuracy, precision and recall, F-scores, AUROC, BLEU, CER, WER, perplexity,
+//!   system usage and more; with the `vision` feature, image metrics such as PSNR, SSIM, LPIPS and
+//!   FID.
+//! - [`renderer`]: a terminal dashboard (`tui` feature) or plain CLI output for training progress.
+//! - [`checkpoint`]: periodic and metric-based checkpointing, and resuming from a checkpoint.
+//! - Early stopping, interruption and an [`Evaluator`] for test sets.
+//!
+//! Failures on a device during training are returned as errors rather than panics.
+//!
+//! # Feature flags
+//!
+//! - `tui` (default): terminal dashboard.
+//! - `sys-metrics` (default): CPU, memory and GPU usage metrics.
+//! - `vision`: image quality metrics.
+//! - `rl`: reinforcement learning training through `burn-rl`.
+//! - `tracing`: instrument operations with the `tracing` crate.
 
 #[macro_use]
 extern crate derive_new;
@@ -33,15 +54,9 @@ pub use evaluator::*;
 pub use components::*;
 
 #[cfg(test)]
-pub(crate) type TestBackend = burn_flex::Flex;
-
-#[cfg(test)]
 pub(crate) mod tests {
-    use crate::TestBackend;
     use burn_core::{prelude::Tensor, tensor::Bool};
     use std::default::Default;
-
-    pub type TestAutodiffBackend = burn_autodiff::Autodiff<TestBackend>;
 
     /// Probability of tp before adding errors
     pub const THRESHOLD: f64 = 0.5;
@@ -58,7 +73,7 @@ pub(crate) mod tests {
     /// classification metrics testing
     pub fn dummy_classification_input(
         classification_type: &ClassificationType,
-    ) -> (Tensor<TestBackend, 2>, Tensor<TestBackend, 2, Bool>) {
+    ) -> (Tensor<2>, Tensor<2, Bool>) {
         match classification_type {
             ClassificationType::Binary => {
                 (

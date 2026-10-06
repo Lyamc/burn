@@ -1,14 +1,11 @@
-#[cfg(target_has_atomic = "ptr")]
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
-#[cfg(not(target_has_atomic = "ptr"))]
-use portable_atomic_util::Arc;
 
 use burn_backend::{DType, Element, TensorData, TensorMetadata};
+use burn_std::sync::Arc;
 use burn_std::{Bytes, Shape, bf16, f16};
 
-use crate::layout::Layout;
+use crate::{FlexDevice, layout::Layout};
 
 /// CPU tensor primitive for the Flex backend.
 ///
@@ -47,11 +44,10 @@ impl FlexTensor {
 
     /// Create a tensor from TensorData.
     pub fn from_data(data: TensorData) -> Self {
-        let shape = data.shape.clone();
+        let (bytes, shape, dtype) = data.into_parts();
         let layout = Layout::contiguous(shape);
-        let dtype = data.dtype;
         Self {
-            data: Arc::new(data.bytes),
+            data: Arc::new(bytes),
             layout,
             dtype,
         }
@@ -70,33 +66,18 @@ impl FlexTensor {
                 self.layout.num_elements(),
                 self.dtype
             );
-            if self.data.len() == expected_bytes {
+            let bytes = if self.data.len() == expected_bytes {
                 // Buffer exactly matches logical size; try zero-copy unwrap
                 match Arc::try_unwrap(self.data) {
-                    Ok(bytes) => TensorData {
-                        bytes,
-                        shape: self.layout.shape().clone(),
-                        dtype: self.dtype,
-                    },
-                    Err(arc) => {
-                        let bytes = Bytes::from_bytes_vec((*arc)[..expected_bytes].to_vec());
-                        TensorData {
-                            bytes,
-                            shape: self.layout.shape().clone(),
-                            dtype: self.dtype,
-                        }
-                    }
+                    Ok(bytes) => bytes,
+                    Err(arc) => Bytes::from_bytes_vec((*arc)[..expected_bytes].to_vec()),
                 }
             } else {
                 // Contiguous at offset 0 but buffer is oversized (e.g., narrowed view).
                 // Truncate to exact logical size.
-                let bytes = Bytes::from_bytes_vec(self.data[..expected_bytes].to_vec());
-                TensorData {
-                    bytes,
-                    shape: self.layout.shape().clone(),
-                    dtype: self.dtype,
-                }
-            }
+                Bytes::from_bytes_vec(self.data[..expected_bytes].to_vec())
+            };
+            TensorData::from_bytes(bytes, self.layout.shape().clone(), self.dtype)
         } else {
             // Non-contiguous or non-zero offset: copy to contiguous layout
             self.to_contiguous().into_data()
@@ -287,8 +268,13 @@ impl FlexTensor {
         }
     }
 
-    /// Copy to contiguous layout if needed.
-    pub fn to_contiguous(&self) -> Self {
+    /// Copy to contiguous layout if needed, consuming `self`.
+    ///
+    /// Prefer this over [`Self::to_contiguous`] when you own the tensor and
+    /// will mutate it through [`Self::storage_mut`]: the borrowing form has
+    /// to hand back a second `Arc` handle, which makes the later
+    /// copy-on-write check see a shared buffer.
+    pub(crate) fn into_contiguous(self) -> Self {
         // Fast path requires the logical tensor to cover the whole buffer.
         // A contiguous prefix view (e.g. [8, 5] sliced to [5, 5]) has
         // canonical strides and offset 0 but an oversized buffer, and would
@@ -298,7 +284,7 @@ impl FlexTensor {
             && self.layout.start_offset() == 0
             && self.data.len() == self.layout.num_elements() * dtype_size(self.dtype)
         {
-            return self.clone();
+            return self;
         }
 
         // Copy data to new contiguous buffer
@@ -325,6 +311,11 @@ impl FlexTensor {
         }
     }
 
+    /// Copy to contiguous layout if needed.
+    pub fn to_contiguous(&self) -> Self {
+        self.clone().into_contiguous()
+    }
+
     fn copy_contiguous<E: Element + bytemuck::Pod>(&self) -> Self {
         let src: &[E] = bytemuck::cast_slice(&self.data);
         let n = self.layout.num_elements();
@@ -340,11 +331,12 @@ impl FlexTensor {
         let offset = self.layout.start_offset() as isize;
         let all_positive = strides.iter().all(|&s| s >= 0);
 
-        if shape.len() <= 1 && all_positive {
-            // 0-D scalar or 1-D run with a uniform stride. Empty
-            // collapsed shape means rank 0 (numel 1); otherwise
-            // numel is the single dim's size (which may be 0 for
-            // zero-sized 1D tensors, so don't clamp via `.max(1)`).
+        if n == 0 {
+            return Self::empty(self.layout.shape().clone(), self.dtype);
+        }
+
+        if shape.len() <= 1 {
+            // 0-D scalar or 1-D run with a uniform stride (positive or negative).
             let collapsed_numel = if shape.is_empty() { 1 } else { shape[0] };
             debug_assert_eq!(n, collapsed_numel);
             // SAFETY: capacity is n; we fill every position below.
@@ -358,6 +350,12 @@ impl FlexTensor {
                 let stride = strides[0];
                 if stride == 1 {
                     dst[..len].copy_from_slice(&src[offset as usize..offset as usize + len]);
+                } else if stride == -1 {
+                    let start = (offset - (len as isize - 1)) as usize;
+                    let src_slice = &src[start..start + len];
+                    for (slot, &val) in dst[..len].iter_mut().zip(src_slice.iter().rev()) {
+                        *slot = val;
+                    }
                 } else {
                     for (i, slot) in dst.iter_mut().take(len).enumerate() {
                         let idx = (offset + i as isize * stride) as usize;
@@ -377,6 +375,22 @@ impl FlexTensor {
             copy_2d_tiled(
                 &mut dst, src, offset, shape[0], shape[1], strides[0], strides[1],
             );
+        } else if shape.len() == 2 && !all_positive {
+            // 2D negative-stride (flipped): fast row-based copies.
+            debug_assert_eq!(shape[0] * shape[1], n);
+            unsafe { dst.set_len(n) };
+            copy_2d_negative(
+                &mut dst, src, offset, shape[0], shape[1], strides[0], strides[1],
+            );
+        } else if shape.len() >= 3 && all_positive && is_transposed_2d(shape, strides) {
+            // Batched 2D transpose: iterate over leading batch dims and execute copy_2d_tiled per slice.
+            unsafe { dst.set_len(n) };
+            copy_batched_2d_tiled(&mut dst, src, offset, shape, strides);
+        } else if all_positive && strides.last().copied() == Some(1) {
+            // Since the inner stride is 1, we can bulk-copy
+            // the contiguous inner run for each outer index.
+            unsafe { dst.set_len(n) };
+            copy_inner_contiguous_run(&mut dst, src, offset, shape, strides);
         } else {
             // General fallback: covers negative strides (flipped
             // tensors) and ND layouts that can't collapse to ≤2D.
@@ -443,6 +457,8 @@ impl FlexTensor {
 }
 
 impl TensorMetadata for FlexTensor {
+    type Device = FlexDevice;
+
     fn dtype(&self) -> DType {
         self.dtype
     }
@@ -453,6 +469,14 @@ impl TensorMetadata for FlexTensor {
 
     fn rank(&self) -> usize {
         self.layout.num_dims()
+    }
+
+    fn device(&self) -> Self::Device {
+        FlexDevice
+    }
+
+    fn can_mut(&self) -> bool {
+        self.is_unique()
     }
 }
 
@@ -530,6 +554,8 @@ fn collapse_for_copy(shape: &[usize], strides: &[isize]) -> CollapsedLayout {
             continue;
         }
         let merge = out.ndim > 0
+            && st > 0
+            && out.strides[out.ndim - 1] > 0
             && (s as isize)
                 .checked_mul(st)
                 .is_some_and(|run| out.strides[out.ndim - 1] == run);
@@ -546,12 +572,226 @@ fn collapse_for_copy(shape: &[usize], strides: &[isize]) -> CollapsedLayout {
     out
 }
 
+#[inline]
+fn is_transposed_2d(shape: &[usize], strides: &[isize]) -> bool {
+    let rank = shape.len();
+    if rank < 3 {
+        return false;
+    }
+    let r_st = strides[rank - 2];
+    let c_st = strides[rank - 1];
+    (r_st == 1 && c_st > 1) || (c_st == 1 && r_st > 1 && r_st != shape[rank - 1] as isize)
+}
+
+fn copy_batched_2d_tiled<E: Copy + Send + Sync>(
+    dst: &mut [E],
+    src: &[E],
+    offset: isize,
+    shape: &[usize],
+    strides: &[isize],
+) {
+    let rank = shape.len();
+    let rows = shape[rank - 2];
+    let cols = shape[rank - 1];
+    let r_st = strides[rank - 2];
+    let c_st = strides[rank - 1];
+    let slice_len = rows * cols;
+
+    let batch_shape = &shape[..rank - 2];
+    let batch_strides = &strides[..rank - 2];
+    #[cfg(feature = "rayon")]
+    {
+        let batch_count: usize = batch_shape.iter().product();
+        if batch_count * slice_len >= crate::ops::PARALLEL_THRESHOLD && batch_count > 1 {
+            use rayon::prelude::*;
+            dst.par_chunks_mut(slice_len)
+                .enumerate()
+                .for_each(|(b, slice_dst)| {
+                    let mut remaining = b;
+                    let mut batch_offset = offset;
+                    for d in (0..batch_shape.len()).rev() {
+                        let coord = remaining % batch_shape[d];
+                        remaining /= batch_shape[d];
+                        batch_offset += coord as isize * batch_strides[d];
+                    }
+                    copy_2d_tiled(slice_dst, src, batch_offset, rows, cols, r_st, c_st);
+                });
+            return;
+        }
+    }
+
+    for (b, slice_dst) in dst.chunks_mut(slice_len).enumerate() {
+        let mut remaining = b;
+        let mut batch_offset = offset;
+        for d in (0..batch_shape.len()).rev() {
+            let coord = remaining % batch_shape[d];
+            remaining /= batch_shape[d];
+            batch_offset += coord as isize * batch_strides[d];
+        }
+        copy_2d_tiled(slice_dst, src, batch_offset, rows, cols, r_st, c_st);
+    }
+}
+
+fn copy_2d_negative<E: Copy + Send + Sync>(
+    dst: &mut [E],
+    src: &[E],
+    offset: isize,
+    rows: usize,
+    cols: usize,
+    row_stride: isize,
+    col_stride: isize,
+) {
+    #[cfg(feature = "rayon")]
+    let n = rows * cols;
+    if row_stride < 0 && col_stride == 1 {
+        #[cfg(feature = "rayon")]
+        if n >= crate::ops::PARALLEL_THRESHOLD {
+            use rayon::prelude::*;
+            dst.par_chunks_mut(cols)
+                .enumerate()
+                .for_each(|(r, dst_row)| {
+                    let row_src = (offset + r as isize * row_stride) as usize;
+                    dst_row.copy_from_slice(&src[row_src..row_src + cols]);
+                });
+            return;
+        }
+        for r in 0..rows {
+            let row_src = (offset + r as isize * row_stride) as usize;
+            let dst_start = r * cols;
+            dst[dst_start..dst_start + cols].copy_from_slice(&src[row_src..row_src + cols]);
+        }
+    } else if col_stride == -1 {
+        #[cfg(feature = "rayon")]
+        if n >= crate::ops::PARALLEL_THRESHOLD {
+            use rayon::prelude::*;
+            dst.par_chunks_mut(cols)
+                .enumerate()
+                .for_each(|(r, dst_row)| {
+                    let row_src_end = (offset + r as isize * row_stride) as usize;
+                    let row_src_start = row_src_end + 1 - cols;
+                    let src_slice = &src[row_src_start..=row_src_end];
+                    for (slot, &val) in dst_row.iter_mut().zip(src_slice.iter().rev()) {
+                        *slot = val;
+                    }
+                });
+            return;
+        }
+        for r in 0..rows {
+            let row_src_end = (offset + r as isize * row_stride) as usize;
+            let row_src_start = row_src_end + 1 - cols;
+            let src_slice = &src[row_src_start..=row_src_end];
+            let dst_row = &mut dst[r * cols..(r + 1) * cols];
+            for (slot, &val) in dst_row.iter_mut().zip(src_slice.iter().rev()) {
+                *slot = val;
+            }
+        }
+    } else {
+        for r in 0..rows {
+            let row_base = offset + r as isize * row_stride;
+            let dst_row = &mut dst[r * cols..(r + 1) * cols];
+            for (c, slot) in dst_row.iter_mut().enumerate() {
+                let idx = (row_base + c as isize * col_stride) as usize;
+                *slot = src[idx];
+            }
+        }
+    }
+}
+
+/// Copy a strided source into a contiguous destination by treating the
+/// layout as a set of strided outer dims wrapping a contiguous inner run.
+///
+/// Precondition: strides are all positive and the innermost stride is 1
+#[inline]
+fn copy_inner_contiguous_run<E: Copy>(
+    dst: &mut [E],
+    src: &[E],
+    offset: isize,
+    shape: &[usize],
+    strides: &[isize],
+) {
+    debug_assert!(!shape.is_empty());
+    debug_assert_eq!(*strides.last().unwrap(), 1, "innermost stride must be 1");
+
+    // We want the maximal trailing run that is contiguous in src.
+    // Walk inward-out, a dim dim_idx extends the contiguous run if AND ONLY IF ("iff")
+    // strides[dim_idx] == product of inner shapes seen so far.
+    let mut expected_stride: isize = 1;
+    let mut split = shape.len(); // first OUTER index (dims [split..] are inner)
+    while split > 0 {
+        let dim_idx = split - 1;
+        if strides[dim_idx] == expected_stride {
+            expected_stride = expected_stride
+                .checked_mul(shape[dim_idx] as isize)
+                .expect("contiguous run length overflows isize");
+            split -= 1;
+        } else {
+            break;
+        }
+    }
+
+    let outer_shape = &shape[..split];
+    let outer_strides = &strides[..split];
+    let inner_run_length: usize = shape[split..].iter().product();
+
+    // Whole tensor is one contiguous run! We can bulk-copy the whole thing.
+    if outer_shape.is_empty() {
+        let src_index = offset as usize;
+        dst[..inner_run_length].copy_from_slice(&src[src_index..src_index + inner_run_length]);
+        return;
+    }
+
+    if inner_run_length == 0 || outer_shape.contains(&0) {
+        return;
+    }
+
+    // Walk the outer index space in row-major order via an odometer:
+    // each iteration ticks the rightmost counter, and so on overflow we
+    // reset it and carry +1 into the dim to its left.
+    // Row-major is what we want because dst is contiguous (consecutive outer-index
+    // tuples land in consecutive inner_run_length slots, so we just bump
+    // dst_position each step instead of recomputing it)
+    // We use this instead of N nested for loops because the rank isn't
+    // known at compile time.
+    let mut counter = [0usize; COLLAPSE_MAX_RANK];
+    let outer_dim_count = outer_shape.len();
+    let mut dst_position = 0usize;
+
+    loop {
+        let mut src_start = offset;
+        for dim_idx in 0..outer_dim_count {
+            src_start += counter[dim_idx] as isize * outer_strides[dim_idx];
+        }
+        let src_index = src_start as usize;
+        dst[dst_position..dst_position + inner_run_length]
+            .copy_from_slice(&src[src_index..src_index + inner_run_length]);
+        dst_position += inner_run_length;
+
+        let mut dim_idx = outer_dim_count;
+        loop {
+            if dim_idx == 0 {
+                return;
+            }
+            dim_idx -= 1;
+            counter[dim_idx] += 1;
+            if counter[dim_idx] < outer_shape[dim_idx] {
+                break;
+            }
+            counter[dim_idx] = 0;
+        }
+    }
+}
+
+/// Minimum number of elements required to trigger parallel 2D tiled copy.
+/// Avoids thread fork/steal overhead on ~1MB cache-resident tensors.
+#[cfg(any(feature = "rayon", test))]
+pub(crate) const COPY_2D_PARALLEL_THRESHOLD: usize = 1_048_576;
+
 /// Tiled 2D copy from a strided source into a contiguous destination.
 /// The loop nesting is chosen so the innermost read walks whichever
 /// source stride is smaller, which keeps the hot loop in cache even
 /// for transpose-like layouts.
 #[inline]
-fn copy_2d_tiled<E: Copy>(
+fn copy_2d_tiled<E: Copy + Send + Sync>(
     dst: &mut [E],
     src: &[E],
     offset: isize,
@@ -561,6 +801,67 @@ fn copy_2d_tiled<E: Copy>(
     col_stride: isize,
 ) {
     const TILE: usize = 16;
+
+    #[cfg(feature = "rayon")]
+    if rows * cols >= COPY_2D_PARALLEL_THRESHOLD {
+        use rayon::prelude::*;
+        let total_tile_rows = rows.div_ceil(TILE);
+        let num_threads = rayon::current_num_threads();
+        let tile_rows_per_task = total_tile_rows.div_ceil(num_threads).max(1);
+        let chunk_len = tile_rows_per_task * TILE * cols;
+
+        dst.par_chunks_mut(chunk_len)
+            .enumerate()
+            .for_each(|(task_idx, dst_chunk)| {
+                let row_start = task_idx * tile_rows_per_task * TILE;
+                let chunk_rows = dst_chunk.len() / cols;
+                if row_stride <= col_stride {
+                    // row-inside-col: the inner loop walks `row_stride` (smaller).
+                    for col_tile in (0..cols).step_by(TILE) {
+                        let col_end = (col_tile + TILE).min(cols);
+                        for r_tile in (0..chunk_rows).step_by(TILE) {
+                            let r_end = (r_tile + TILE).min(chunk_rows);
+                            for col in col_tile..col_end {
+                                let col_base = offset + col as isize * col_stride;
+                                for r in r_tile..r_end {
+                                    let row = row_start + r;
+                                    let idx = (col_base + row as isize * row_stride) as usize;
+                                    // SAFETY: caller set `dst.len() == rows * cols`
+                                    // and each `(r, col)` is visited once in this chunk.
+                                    unsafe {
+                                        *dst_chunk.get_unchecked_mut(r * cols + col) = src[idx];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // col-inside-row: the inner loop walks `col_stride` (smaller).
+                    for r_tile in (0..chunk_rows).step_by(TILE) {
+                        let r_end = (r_tile + TILE).min(chunk_rows);
+                        for col_tile in (0..cols).step_by(TILE) {
+                            let col_end = (col_tile + TILE).min(cols);
+                            for r in r_tile..r_end {
+                                let row = row_start + r;
+                                let row_base = offset
+                                    + row as isize * row_stride
+                                    + col_tile as isize * col_stride;
+                                let dst_base = r * cols + col_tile;
+                                for c in 0..(col_end - col_tile) {
+                                    let idx = (row_base + c as isize * col_stride) as usize;
+                                    // SAFETY: caller set `dst.len() == rows * cols`
+                                    // and each `(r, col)` is visited once in this chunk.
+                                    unsafe {
+                                        *dst_chunk.get_unchecked_mut(dst_base + c) = src[idx];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        return;
+    }
 
     if row_stride <= col_stride {
         // row-inside-col: the inner loop walks `row_stride` (smaller).
@@ -593,7 +894,8 @@ fn copy_2d_tiled<E: Copy>(
                     let dst_base = row * cols + col_tile;
                     for c in 0..(col_end - col_tile) {
                         let idx = (row_base + c as isize * col_stride) as usize;
-                        // SAFETY: same as above.
+                        // SAFETY: caller set `dst.len() == rows * cols`
+                        // and each `(row, col)` is visited once.
                         unsafe {
                             *dst.get_unchecked_mut(dst_base + c) = src[idx];
                         }
@@ -641,8 +943,8 @@ mod tests {
         let data = TensorData::from([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let tensor = FlexTensor::from_data(data.clone());
         let result = tensor.into_data();
-        assert_eq!(data.shape, result.shape);
-        assert_eq!(data.dtype, result.dtype);
+        assert_eq!(data.shape(), result.shape());
+        assert_eq!(data.dtype(), result.dtype());
     }
 
     #[test]
@@ -700,7 +1002,20 @@ mod tests {
         let contig = empty_view.to_contiguous();
         assert_eq!(contig.shape().to_vec(), vec![0]);
         assert_eq!(contig.layout().start_offset(), 0);
-        assert_eq!(contig.into_data().bytes.len(), 0);
+        assert_eq!(contig.into_data().bytes().len(), 0);
+    }
+
+    #[test]
+    fn test_to_contiguous_zero_sized_negative_stride() {
+        let t = FlexTensor::from_data(TensorData::new(
+            (0..6).map(|i| i as f32).collect::<Vec<_>>(),
+            vec![6],
+        ));
+        let empty_neg = crate::ops::slice::slice(t, &[burn_std::Slice::new(3, Some(3), -1)]);
+        assert_eq!(empty_neg.shape().to_vec(), vec![0]);
+        let contig = empty_neg.to_contiguous();
+        assert_eq!(contig.shape().to_vec(), vec![0]);
+        assert_eq!(contig.into_data().bytes().len(), 0);
     }
 
     /// Regression for #4855: a prefix view (e.g. `narrow(dim, 0, n)`) has
@@ -763,6 +1078,43 @@ mod tests {
         assert_eq!(values, expected.as_slice());
     }
 
+    /// Regression: the ShuffleNet channel shuffle (reshape -> permute([0,2,1,3,4]) -> reshape)
+    /// collapses to a 3D layout with stride-1 innermost.
+    /// Before this fix that went into the StridedIter scalar walk in the final else in copy_contiguous
+    /// Now, we use a new inner-contiguous branch that bulk-copies the trailing run
+    #[test]
+    fn test_to_contiguous_3d_inner_stride1_matches_naive() {
+        let dims = [1, 2, 4, 3, 3]; // [N, G, C, H, W]
+        let n: usize = dims.iter().product();
+        let data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let t = FlexTensor::from_data(TensorData::new(data.clone(), dims.to_vec()));
+        let permuted = t.permute(&[0, 2, 1, 3, 4]); // swap G and C from the original dims in the permute
+        assert!(!permuted.is_contiguous());
+
+        let contiguous_data = permuted.to_contiguous();
+        assert!(contiguous_data.is_contiguous());
+        assert_eq!(contiguous_data.shape().to_vec(), vec![1, 4, 2, 3, 3]);
+
+        // Now we manually do a strided walk to be able to check that against a naive solution.
+        // output[0, c, g, h, w] = input[0, g, c, h, w].
+        let mut expected = Vec::with_capacity(n);
+        for c in 0..4 {
+            for g in 0..2 {
+                for h in 0..3 {
+                    for w in 0..3 {
+                        let idx = g * 36 + c * 9 + h * 3 + w;
+                        expected.push(data[idx]);
+                    }
+                }
+            }
+        }
+
+        // Verify the naive solution matches (the manual strided walk).
+        let result_data = contiguous_data.into_data();
+        let values = result_data.as_slice::<f32>().unwrap();
+        assert_eq!(values, expected.as_slice());
+    }
+
     /// Exercise the `row_stride > col_stride` branch of the 2D tiled
     /// copy (the ConvNeXt case hits the other branch).
     #[test]
@@ -799,6 +1151,95 @@ mod tests {
         assert_eq!(values, expected.as_slice());
     }
 
+    /// Exercise the `row_stride < col_stride` branch of the 2D tiled
+    /// copy (e.g. transposed 2D layout).
+    #[test]
+    fn test_to_contiguous_2d_row_stride_lt_col_stride() {
+        let data: Vec<f32> = (0..18).map(|i| i as f32).collect();
+        let t = FlexTensor::from_data(TensorData::new(data, vec![3, 6]));
+        let transposed = t.transpose(0, 1);
+        assert_eq!(transposed.layout().strides(), &[1, 6]);
+        assert!(!transposed.layout().is_contiguous());
+
+        let contig = transposed.to_contiguous();
+        assert!(contig.is_contiguous());
+        assert_eq!(contig.shape().to_vec(), vec![6, 3]);
+
+        let result_data = contig.into_data();
+        let values = result_data.as_slice::<f32>().unwrap();
+        let mut expected = Vec::with_capacity(18);
+        for c in 0..6 {
+            for r in 0..3 {
+                expected.push((r * 6 + c) as f32);
+            }
+        }
+        assert_eq!(values, expected.as_slice());
+    }
+
+    /// Parallel 2D tiled copy when `row_stride <= col_stride` (>= 1M elements).
+    #[test]
+    fn test_to_contiguous_2d_parallel_row_stride_le_col_stride() {
+        let rows = 1024;
+        let cols = 1024;
+        let n = rows * cols;
+        assert!(n >= COPY_2D_PARALLEL_THRESHOLD);
+
+        let data: Vec<f32> = (0..n).map(|i| (i % 997) as f32).collect();
+        let t = FlexTensor::from_data(TensorData::new(data.clone(), vec![rows, cols]));
+        let transposed = t.transpose(0, 1);
+        assert_eq!(transposed.layout().strides(), &[1, rows as isize]);
+        assert!(!transposed.layout().is_contiguous());
+
+        let contig = transposed.to_contiguous();
+        assert!(contig.is_contiguous());
+        assert_eq!(contig.shape().to_vec(), vec![cols, rows]);
+
+        let result_data = contig.into_data();
+        let values = result_data.as_slice::<f32>().unwrap();
+        for r in 0..cols {
+            for c in 0..rows {
+                let expected = data[c * cols + r];
+                assert_eq!(values[r * rows + c], expected);
+            }
+        }
+    }
+
+    /// Parallel 2D tiled copy when `row_stride > col_stride` (>= 1M elements).
+    #[test]
+    fn test_to_contiguous_2d_parallel_row_stride_gt_col_stride() {
+        let rows = 1024;
+        let cols = 1024;
+        let n = rows * cols;
+        assert!(n >= COPY_2D_PARALLEL_THRESHOLD);
+
+        // [1024, 2048] tensor sliced to [1024, 1024] => row_stride = 2048, col_stride = 1
+        let full_cols = 2048;
+        let data: Vec<f32> = (0..rows * full_cols).map(|i| (i % 997) as f32).collect();
+        let t = FlexTensor::from_data(TensorData::new(data.clone(), vec![rows, full_cols]));
+        let sliced = crate::ops::slice::slice(
+            t,
+            &[
+                burn_std::Slice::new(0, Some(rows as isize), 1),
+                burn_std::Slice::new(0, Some(cols as isize), 1),
+            ],
+        );
+        assert_eq!(sliced.layout().strides(), &[full_cols as isize, 1]);
+        assert!(!sliced.layout().is_contiguous());
+
+        let contig = sliced.to_contiguous();
+        assert!(contig.is_contiguous());
+        assert_eq!(contig.shape().to_vec(), vec![rows, cols]);
+
+        let result_data = contig.into_data();
+        let values = result_data.as_slice::<f32>().unwrap();
+        for r in 0..rows {
+            for c in 0..cols {
+                let expected = data[r * full_cols + c];
+                assert_eq!(values[r * cols + c], expected);
+            }
+        }
+    }
+
     #[test]
     fn test_reshape() {
         let data = TensorData::new(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
@@ -832,7 +1273,7 @@ mod tests {
         // Both point to same data
         assert!(core::ptr::eq(
             tensor.bytes().as_ptr(),
-            cloned.bytes().as_ptr()
+            cloned.bytes().as_ptr(),
         ));
     }
 
@@ -871,10 +1312,107 @@ mod tests {
         assert_eq!(narrowed.layout().start_offset(), 0);
 
         let result = narrowed.into_data();
-        assert_eq!(result.shape.to_vec(), vec![1, 3]);
+        assert_eq!(result.shape().to_vec(), vec![1, 3]);
         // Must have exactly 3 f32s = 12 bytes, not 24
-        assert_eq!(result.bytes.len(), 3 * core::mem::size_of::<f32>());
-        let values: Vec<f32> = result.to_vec().unwrap();
+        assert_eq!(result.bytes().len(), 3 * core::mem::size_of::<f32>());
+        let values: Vec<f32> = result.try_into_vec().unwrap();
         assert_eq!(values, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_reshape_preserves_offset_zero_copy() {
+        let data: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let tensor = FlexTensor::from_data(TensorData::new(data, vec![4, 4]));
+        // Slice rows 1..3: shape [2, 4], contiguous, start_offset = 4
+        let sliced = tensor.narrow(0, 1, 2);
+        assert!(sliced.is_contiguous());
+        assert_eq!(sliced.layout().start_offset(), 4);
+
+        // Reshape [2, 4] -> [8] preserving non-zero offset
+        let reshaped = sliced.reshape(Shape::from(vec![8]));
+        assert!(reshaped.is_contiguous());
+        assert_eq!(reshaped.layout().start_offset(), 4);
+        assert_eq!(reshaped.shape().to_vec(), vec![8]);
+
+        // Guarantees zero-copy pointer identity
+        assert!(core::ptr::eq(
+            sliced.bytes().as_ptr(),
+            reshaped.bytes().as_ptr()
+        ));
+
+        let values: Vec<f32> = reshaped.into_data().try_into_vec().unwrap();
+        assert_eq!(values, vec![4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0]);
+    }
+
+    #[test]
+    fn test_transpose_unit_dim_zero_copy() {
+        // [6, 1] tensor transposed to [1, 6] has stride [1, 6].
+        // Squeezing the size-1 dimension makes it contiguous!
+        let data: Vec<f32> = (0..6).map(|i| i as f32).collect();
+        let tensor = FlexTensor::from_data(TensorData::new(data, vec![6, 1]));
+        let transposed = tensor.transpose(0, 1);
+        assert_eq!(transposed.shape().to_vec(), vec![1, 6]);
+        assert_eq!(transposed.layout().strides(), &[1, 1]);
+        assert!(transposed.is_contiguous());
+
+        // to_contiguous should be a no-op that reuses the existing storage
+        let contig = transposed.to_contiguous();
+        assert!(core::ptr::eq(
+            transposed.bytes().as_ptr(),
+            contig.bytes().as_ptr()
+        ));
+    }
+
+    #[test]
+    fn test_batched_transpose_parity() {
+        // [2, 3, 4] transposed on trailing dims (1, 2) -> [2, 4, 3]
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let tensor = FlexTensor::from_data(TensorData::new(data, vec![2, 3, 4]));
+        let transposed = tensor.transpose(1, 2);
+        assert_eq!(transposed.shape().to_vec(), vec![2, 4, 3]);
+        assert!(!transposed.is_contiguous());
+
+        let contig = transposed.to_contiguous();
+        assert!(contig.is_contiguous());
+
+        let values: Vec<f32> = contig.into_data().try_into_vec().unwrap();
+        // Compute manual reference
+        let mut expected = Vec::with_capacity(24);
+        for b in 0..2 {
+            for j in 0..4 {
+                for i in 0..3 {
+                    expected.push((b * 12 + i * 4 + j) as f32);
+                }
+            }
+        }
+        assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn test_negative_stride_flip_acceleration() {
+        let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let tensor = FlexTensor::from_data(TensorData::new(data, vec![3, 4]));
+        // Negative step on axis 0: reverse rows
+        let flipped = crate::ops::slice::slice(
+            tensor,
+            &[
+                burn_std::Slice::new(0, None, -1),
+                burn_std::Slice::new(0, None, 1),
+            ],
+        );
+        assert_eq!(flipped.shape().to_vec(), vec![3, 4]);
+        assert_eq!(flipped.layout().strides(), &[-4, 1]);
+        assert!(!flipped.is_contiguous());
+
+        let contig = flipped.to_contiguous();
+        assert!(contig.is_contiguous());
+
+        let values: Vec<f32> = contig.into_data().try_into_vec().unwrap();
+        let expected = vec![
+            8.0, 9.0, 10.0, 11.0, // row 2
+            4.0, 5.0, 6.0, 7.0, // row 1
+            0.0, 1.0, 2.0, 3.0, // row 0
+        ];
+        assert_eq!(values, expected);
     }
 }

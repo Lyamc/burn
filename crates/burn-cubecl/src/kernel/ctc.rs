@@ -1,8 +1,7 @@
+use burn_backend::cubecl::dtype_to_storage_type;
 use cubecl::prelude::*;
 
-use crate::{
-    CubeRuntime, kernel::into_contiguous, ops::numeric::empty_device_dtype, tensor::CubeTensor,
-};
+use crate::{kernel::into_contiguous, ops::numeric::empty_device_dtype, tensor::CubeTensor};
 use burn_backend::{Shape, TensorMetadata};
 
 /// Maximum `2 * max_target_len + 1` the kernel supports. The alpha/beta state is
@@ -105,7 +104,7 @@ fn finalize_nll<F: Float>(
     if mx < unreachable_threshold {
         (F::new(1000.0_f32) * F::cast_from(target_len as u32)).exp()
     } else {
-        F::new(0.0) - (mx + (one + (mn - mx).exp()).ln())
+        F::new(0.0_f32) - (mx + (one + (mn - mx).exp()).ln())
     }
 }
 
@@ -115,7 +114,7 @@ fn finalize_nll<F: Float>(
 #[cube]
 fn empty_input_nll<F: Float>(target_len: usize) -> F {
     if target_len == 0 {
-        F::new(0.0)
+        F::new(0.0_f32)
     } else {
         (F::new(1000.0_f32) * F::cast_from(target_len as u32)).exp()
     }
@@ -149,7 +148,7 @@ fn ctc_loss_kernel<F: Float, I: Numeric>(
     output: &mut Tensor<F>,     // [N]
     blank: u32,
     #[comptime] alpha_capacity: u32,
-    #[define(F, I)] _dtypes: [StorageType; 2],
+    #[define(F, I)] _dtypes: [ElemType; 2],
 ) {
     let n = CUBE_POS_X as usize;
     let cube_dim = CUBE_DIM_X as usize;
@@ -180,7 +179,7 @@ fn ctc_loss_kernel<F: Float, I: Numeric>(
     // to the active region after a sync. This avoids RAW hazards across stride
     // batches in the t-loop (a thread writing alpha[s] races with another
     // thread still reading alpha[s-1] or alpha[s-2] for its own s).
-    let mut alpha = SharedMemory::<F>::new(2 * alpha_cap);
+    let mut alpha = Shared::new_slice(2 * alpha_cap);
     // Sentinel for unreachable states. f16 caps at ~65504 magnitude, so we
     // can't go lower than `-6e4` without blowing past that range; WGSL also
     // rejects `f32(-inf)` as an identifier, so a real -inf literal isn't an
@@ -190,7 +189,7 @@ fn ctc_loss_kernel<F: Float, I: Numeric>(
     // checking `== neg_inf`. See `log_sum_exp2` for the long-sequence caveat.
     let neg_inf = F::new(-6.0e4_f32);
     let unreachable_threshold = F::new(-1.0e4_f32);
-    let one = F::new(1.0);
+    let one = F::new(1.0_f32);
 
     // Initialize alpha at t = 0 for s < l_prime_len; positions beyond that
     // are never read by the recurrence (s < l_prime_len in every read) so
@@ -281,13 +280,13 @@ fn ctc_loss_kernel<F: Float, I: Numeric>(
 /// alpha recursion across all timesteps.
 ///
 /// Panics if `2 * max_target_len + 1` exceeds `SHARED_ALPHA_CAPACITY` (8192).
-pub fn ctc_loss<R: CubeRuntime>(
-    log_probs: CubeTensor<R>,
-    targets: CubeTensor<R>,
-    input_lengths: CubeTensor<R>,
-    target_lengths: CubeTensor<R>,
+pub fn ctc_loss(
+    log_probs: CubeTensor,
+    targets: CubeTensor,
+    input_lengths: CubeTensor,
+    target_lengths: CubeTensor,
     blank: usize,
-) -> CubeTensor<R> {
+) -> CubeTensor {
     // Manual stride indexing below requires a contiguous physical layout;
     // fusion-produced tensors may arrive with layouts that break that
     // assumption. No-op when already contiguous.
@@ -319,7 +318,7 @@ pub fn ctc_loss<R: CubeRuntime>(
     let device = log_probs.device.clone();
     let f_dtype = log_probs.dtype;
     let i_dtype = targets.dtype;
-    let output = empty_device_dtype::<R>(client.clone(), device, Shape::new([batch_size]), f_dtype);
+    let output = empty_device_dtype(client.clone(), device, Shape::new([batch_size]), f_dtype);
 
     let cube_count = CubeCount::Static(batch_size as u32, 1, 1);
     let cube_dim = CubeDim::new_1d(cube_dim_x);
@@ -330,7 +329,7 @@ pub fn ctc_loss<R: CubeRuntime>(
     // Apple GPUs. Different max_l_prime values trigger separate kernel
     // compilations (it's a comptime param), but that's fine: target lengths
     // are stable within a dataset.
-    ctc_loss_kernel::launch::<R>(
+    ctc_loss_kernel::launch(
         &client,
         cube_count,
         cube_dim,
@@ -341,7 +340,10 @@ pub fn ctc_loss<R: CubeRuntime>(
         output.clone().into_tensor_arg(),
         blank as u32,
         max_l_prime as u32,
-        [f_dtype.into(), i_dtype.into()],
+        [
+            dtype_to_storage_type(f_dtype),
+            dtype_to_storage_type(i_dtype),
+        ],
     );
 
     output
@@ -372,7 +374,7 @@ fn ctc_alpha_beta_kernel<F: Float, I: Numeric>(
     nll_out: &mut Tensor<F>,    // [N]
     blank: u32,
     #[comptime] alpha_capacity: u32,
-    #[define(F, I)] _dtypes: [StorageType; 2],
+    #[define(F, I)] _dtypes: [ElemType; 2],
 ) {
     let n = CUBE_POS_X as usize;
     let cube_dim = CUBE_DIM_X as usize;
@@ -409,13 +411,13 @@ fn ctc_alpha_beta_kernel<F: Float, I: Numeric>(
     // reads are guarded by `s + 1 < l_prime_len` / `s + 2 < l_prime_len`, so the
     // residual alpha values sitting in the active row between phases are never
     // observed by beta (its boundary init overwrites every slot it reads).
-    let mut state = SharedMemory::<F>::new(2 * alpha_cap);
+    let mut state = Shared::new_slice(2 * alpha_cap);
     // Sentinel for unreachable states. See ctc_loss_kernel for the full
     // rationale: f16's 65504 magnitude cap forces the -6e4 floor, WGSL
     // rejects f32(-inf) literals, and the threshold catches sentinel drift.
     let neg_inf = F::new(-6.0e4_f32);
     let unreachable_threshold = F::new(-1.0e4_f32);
-    let one = F::new(1.0);
+    let one = F::new(1.0_f32);
 
     // Alpha phase (forward).
     //
@@ -581,13 +583,13 @@ fn ctc_alpha_beta_kernel<F: Float, I: Numeric>(
 /// pre-fill value `-inf`, matching the default backend's convention.
 ///
 /// Panics if `2 * max_target_len + 1` exceeds `SHARED_ALPHA_CAPACITY`.
-pub fn ctc_alpha_beta<R: CubeRuntime>(
-    log_probs: CubeTensor<R>,
-    targets: CubeTensor<R>,
-    input_lengths: CubeTensor<R>,
-    target_lengths: CubeTensor<R>,
+pub fn ctc_alpha_beta(
+    log_probs: CubeTensor,
+    targets: CubeTensor,
+    input_lengths: CubeTensor,
+    target_lengths: CubeTensor,
     blank: usize,
-) -> (CubeTensor<R>, CubeTensor<R>, CubeTensor<R>) {
+) -> (CubeTensor, CubeTensor, CubeTensor) {
     // Manual stride indexing below requires a contiguous physical layout;
     // fusion-produced tensors may arrive with layouts that break that
     // assumption. No-op when already contiguous.
@@ -622,28 +624,27 @@ pub fn ctc_alpha_beta<R: CubeRuntime>(
     // (s >= 2U+1, or t outside the valid range for an individual batch
     // element) are not read as stale zeros by the gradient composition.
     let shape_abt = Shape::new([max_input_length, batch_size, max_l_prime]);
-    let neg_inf = InputScalar::new(f32::NEG_INFINITY, f_dtype);
-    let alpha_out = crate::ops::numeric::full_device_dtype::<R>(
+    let neg_inf = InputScalar::new(f32::NEG_INFINITY, dtype_to_storage_type(f_dtype));
+    let alpha_out = crate::ops::numeric::full_device_dtype(
         client.clone(),
         shape_abt.clone(),
         device.clone(),
         neg_inf,
         f_dtype,
     );
-    let beta_out = crate::ops::numeric::full_device_dtype::<R>(
+    let beta_out = crate::ops::numeric::full_device_dtype(
         client.clone(),
         shape_abt,
         device.clone(),
         neg_inf,
         f_dtype,
     );
-    let nll_out =
-        empty_device_dtype::<R>(client.clone(), device, Shape::new([batch_size]), f_dtype);
+    let nll_out = empty_device_dtype(client.clone(), device, Shape::new([batch_size]), f_dtype);
 
     let cube_count = CubeCount::Static(batch_size as u32, 1, 1);
     let cube_dim = CubeDim::new_1d(cube_dim_x);
 
-    ctc_alpha_beta_kernel::launch::<R>(
+    ctc_alpha_beta_kernel::launch(
         &client,
         cube_count,
         cube_dim,
@@ -656,7 +657,10 @@ pub fn ctc_alpha_beta<R: CubeRuntime>(
         nll_out.clone().into_tensor_arg(),
         blank as u32,
         max_l_prime as u32,
-        [f_dtype.into(), i_dtype.into()],
+        [
+            dtype_to_storage_type(f_dtype),
+            dtype_to_storage_type(i_dtype),
+        ],
     );
 
     (alpha_out, beta_out, nll_out)

@@ -1,6 +1,19 @@
 #![warn(missing_docs)]
 
-//! The derive crate of Burn.
+//! Derive and procedural macros for Burn.
+//!
+//! Use these through `burn`, which re-exports them; this crate is not meant to be a direct
+//! dependency.
+//!
+//! - `#[derive(Module)]` implements `Module` for a struct or enum of modules, parameters and
+//!   constants. `#[module(skip)]` excludes a field.
+//! - `#[derive(Config)]` makes a struct a serializable configuration with a generated `new`
+//!   constructor and `with_*` setters for optional fields and fields marked `#[config(default = ...)]`.
+//! - `#[derive(RecordState)]` decomposes an optimizer or scheduler state into named tensors and
+//!   scalars for the burnpack format.
+//!
+//! The function-like macros below implement `burn::tensor::assert_shape!`,
+//! `debug_assert_shape!` and `einsum!`, and are not part of the public API.
 
 #[macro_use]
 extern crate derive_new;
@@ -8,8 +21,10 @@ extern crate derive_new;
 use proc_macro::TokenStream;
 
 pub(crate) mod config;
+pub(crate) mod einsum;
 pub(crate) mod module;
-pub(crate) mod record;
+pub(crate) mod record_state;
+pub(crate) mod shape;
 pub(crate) mod shared;
 
 /// Derive macro for the `Module` trait.
@@ -44,13 +59,13 @@ pub(crate) mod shared;
 ///
 /// ```ignore
 /// #[derive(Module, Debug)]
-/// pub struct MyModule<B: Backend, M, N: NonModuleTrait> {
+/// pub struct MyModule<M, N: NonModuleTrait> {
 ///     /// A normal parameter.
-///     weights: Param<Tensor<B, 2>>,
+///     weights: Param<Tensor<2>>,
 ///     /// A field configured at runtime.
 ///     dropout_prob: f64,
 ///     /// A field that is recomputed at runtime.
-///     cached_mask: Option<Tensor<B, 2>>,
+///     cached_mask: Option<Tensor<2>>,
 ///     /// A field that contains some debug state.
 ///     debug_state: String,
 ///     /// Treated as a module (default for generics).
@@ -66,16 +81,53 @@ pub fn module_derive(input: TokenStream) -> TokenStream {
     module::derive_impl(&input)
 }
 
-/// Derive macro for the record.
-#[proc_macro_derive(Record)]
-pub fn record_derive(input: TokenStream) -> TokenStream {
-    let input = syn::parse(input).unwrap();
-    record::derive_impl(&input)
-}
-
 /// Derive macro for the config.
 #[proc_macro_derive(Config, attributes(config))]
 pub fn config_derive(input: TokenStream) -> TokenStream {
     let item = syn::parse(input).unwrap();
     config::derive_impl(&item)
+}
+
+/// Derive macro for a recordable state (optimizer or learning-rate scheduler), decomposing it
+/// into named tensors and scalars for the burnpack format.
+///
+/// Supported field shapes: `Tensor<D>`, `Option<Tensor<D>>`, `Vec<Tensor<D>>`, scalars
+/// (`usize`/`isize`/`u8`..`u64`/`i8`..`i64`/`f32`/`f64`/`bool`), `Option<scalar>`, a nested
+/// `RecordState`, and `Option<Nested>`. Scalar fields must use a concrete primitive type, not a
+/// type alias (e.g. `f64`, not `LearningRate`): classification is syntactic, so an alias is treated
+/// as a nested state.
+#[proc_macro_derive(RecordState)]
+pub fn record_state_derive(input: TokenStream) -> TokenStream {
+    let input = syn::parse(input).unwrap();
+    record_state::derive_impl(&input)
+}
+
+/// Implementation of `burn_tensor::assert_shape!`. Not part of the public API.
+#[doc(hidden)]
+#[proc_macro]
+pub fn __assert_shape(input: TokenStream) -> TokenStream {
+    shape_macro(input, shape::Mode::Assert)
+}
+
+/// Implementation of `burn_tensor::debug_assert_shape!`. Not part of the public API.
+#[doc(hidden)]
+#[proc_macro]
+pub fn __debug_assert_shape(input: TokenStream) -> TokenStream {
+    shape_macro(input, shape::Mode::DebugAssert)
+}
+
+/// The input is `$crate, tensor, [pattern]`, see the wrappers in burn-tensor.
+fn shape_macro(input: TokenStream, mode: shape::Mode) -> TokenStream {
+    let input = syn::parse_macro_input!(input as shape::ShapeInput);
+    shape::expand(input, mode).into()
+}
+
+/// Implementation of `burn_tensor::einsum!`. Not part of the public API.
+#[doc(hidden)]
+#[proc_macro]
+pub fn __einsum(input: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(input as einsum::EinsumInput);
+    einsum::expand(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }

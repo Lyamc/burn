@@ -1,9 +1,9 @@
 use alloc::vec::Vec;
 
-use burn_backend::{DType, QTensorPrimitive, TensorMetadata, quantization::QuantStore};
-use burn_std::{QuantScheme, Shape};
+use burn_backend::{DType, TensorMetadata};
+use burn_std::{QuantScheme, Shape, quantization::global_scale_dtype};
 
-use crate::tensor::FlexTensor;
+use crate::{FlexDevice, tensor::FlexTensor};
 
 /// Quantized tensor for the Flex backend.
 ///
@@ -17,13 +17,22 @@ pub struct FlexQTensor {
     pub(crate) scheme: QuantScheme,
     /// Per-tensor or per-block scale factors.
     pub(crate) scales: Vec<f32>,
+    /// The per-tensor scale that [`scales`](Self::scales) are expressed relative to, for a
+    /// two-level scheme.
+    pub(crate) global: Option<f32>,
 }
 
 impl FlexQTensor {
     /// Create a new quantized tensor.
     ///
-    /// The tensor must store i8 data and scales must be non-empty.
-    pub fn new(tensor: FlexTensor, scheme: QuantScheme, scales: Vec<f32>) -> Self {
+    /// The tensor must store i8 data and scales must be non-empty. A two-level scheme takes a
+    /// per-tensor scale, and no other level does.
+    pub fn new(
+        tensor: FlexTensor,
+        scheme: QuantScheme,
+        scales: Vec<f32>,
+        global: Option<f32>,
+    ) -> Self {
         assert_eq!(
             tensor.dtype(),
             DType::I8,
@@ -34,10 +43,16 @@ impl FlexQTensor {
             !scales.is_empty(),
             "quantized tensor must have at least one scale factor"
         );
+        assert_eq!(
+            global_scale_dtype(&scheme).is_some(),
+            global.is_some(),
+            "{scheme:?} does not match a per-tensor scale of {global:?}"
+        );
         Self {
             tensor,
             scheme,
             scales,
+            global,
         }
     }
 
@@ -52,17 +67,9 @@ impl FlexQTensor {
     }
 }
 
-impl QTensorPrimitive for FlexQTensor {
-    fn scheme(&self) -> &QuantScheme {
-        &self.scheme
-    }
-
-    fn default_scheme() -> QuantScheme {
-        QuantScheme::default().with_store(QuantStore::Native)
-    }
-}
-
 impl TensorMetadata for FlexQTensor {
+    type Device = FlexDevice;
+
     fn dtype(&self) -> DType {
         DType::QFloat(self.scheme)
     }
@@ -73,5 +80,13 @@ impl TensorMetadata for FlexQTensor {
 
     fn rank(&self) -> usize {
         self.tensor.rank()
+    }
+
+    fn device(&self) -> Self::Device {
+        FlexDevice
+    }
+
+    fn can_mut(&self) -> bool {
+        self.tensor.is_unique()
     }
 }

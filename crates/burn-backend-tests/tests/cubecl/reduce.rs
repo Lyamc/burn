@@ -1,7 +1,6 @@
 use super::*;
 use burn_tensor::Distribution;
 use burn_tensor::Shape;
-use burn_tensor::TensorData;
 use burn_tensor::Tolerance;
 
 const RANK: usize = 4;
@@ -28,7 +27,7 @@ fn reduction_argtopk_simple() {
     let device = Default::default();
 
     let tensor = TestTensor::<2>::from_data([[1, 7, 3], [8, 2, 8]], &device);
-    let actual = tensor.argtopk(2, 1);
+    let actual = tensor.argtopk(2, -1_i64);
     let expected = TestTensor::<2>::from_data([[1, 2], [0, 2]], &device);
 
     let output_shape = Shape::new([2, 2]);

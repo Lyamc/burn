@@ -9,16 +9,16 @@
 
 use crate::cache::TensorCache;
 use crate::modules::{Linear, LinearConfig};
-use crate::{Dropout, DropoutConfig};
+use crate::{Dropout, DropoutConfig, Initializer};
+use burn::tensor::assert_shape;
 use burn_core as burn;
 
 use burn::{
     config::Config,
-    module::{Initializer, Module},
+    module::Module,
     tensor::{
-        Bool, Tensor,
+        Bool, Device, Tensor,
         activation::{quiet_softmax, softmax},
-        backend::Backend,
     },
 };
 
@@ -61,11 +61,11 @@ pub struct CrossAttentionConfig {
 /// - `output`: [`Linear`] layer with `d_model` input and output features.
 ///
 /// Should be created with [CrossAttentionConfig].
-pub struct CrossAttention<B: Backend> {
-    query: Linear<B>,
-    key: Linear<B>,
-    value: Linear<B>,
-    output: Linear<B>,
+pub struct CrossAttention {
+    query: Linear,
+    key: Linear,
+    value: Linear,
+    output: Linear,
     dropout: Dropout,
 
     n_heads: usize,
@@ -79,14 +79,14 @@ pub struct CrossAttention<B: Backend> {
 /// Cache for the [Cross Attention](CrossAttention) layer.
 ///
 /// To be used during inference when context is constant.
-pub struct CrossAttentionCache<B: Backend> {
+pub struct CrossAttentionCache {
     /// Cached key tensor.
-    pub k: TensorCache<B, 4>,
+    pub k: TensorCache<4>,
     /// Cached value tensor.
-    pub v: TensorCache<B, 4>,
+    pub v: TensorCache<4>,
 }
 
-impl<B: Backend> CrossAttentionCache<B> {
+impl CrossAttentionCache {
     /// Create a new empty cache.
     pub fn new() -> Self {
         Self {
@@ -96,7 +96,7 @@ impl<B: Backend> CrossAttentionCache<B> {
     }
 }
 
-impl<B: Backend> Default for CrossAttentionCache<B> {
+impl Default for CrossAttentionCache {
     fn default() -> Self {
         Self::new()
     }
@@ -112,7 +112,7 @@ impl CrossAttentionConfig {
     /// # Returns
     ///
     /// A new [CrossAttention] module.
-    pub fn init<B: Backend>(&self, device: &B::Device) -> CrossAttention<B> {
+    pub fn init(&self, device: &Device) -> CrossAttention {
         // Safety Rail for GQA
         assert_eq!(
             self.n_heads % self.n_heads_kv,
@@ -147,7 +147,7 @@ impl CrossAttentionConfig {
     }
 }
 
-impl<B: Backend> CrossAttention<B> {
+impl CrossAttention {
     /// Applies cross-attention to query using context as key and value.
     ///
     /// # Arguments
@@ -159,14 +159,19 @@ impl<B: Backend> CrossAttention<B> {
     /// # Returns
     ///
     /// Output tensor of shape `[batch, seq_len_query, d_model]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the batch size of `context` differs from `query`.
     pub fn forward(
         &self,
-        query: Tensor<B, 3>,
-        context: Tensor<B, 3>,
-        mask: Option<Tensor<B, 2, Bool>>,
-    ) -> Tensor<B, 3> {
+        query: Tensor<3>,
+        context: Tensor<3>,
+        mask: Option<Tensor<2, Bool>>,
+    ) -> Tensor<3> {
         let [batch, l_q, _] = query.dims();
         let [_, l_k, _] = context.dims();
+        assert_shape!(context, [batch, _, _]);
 
         // 1. Projections
         let q = self.query.forward(query);
@@ -241,26 +246,31 @@ impl<B: Backend> CrossAttention<B> {
     /// # Returns
     ///
     /// Output tensor of shape `[batch, seq_len_query, d_model]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the batch size of `context` differs from `query`.
     pub fn forward_cache(
         &self,
-        query: Tensor<B, 3>,
-        context: Tensor<B, 3>,
-        mask: Option<Tensor<B, 2, Bool>>,
-        cache: &mut CrossAttentionCache<B>,
-    ) -> Tensor<B, 3> {
+        query: Tensor<3>,
+        context: Tensor<3>,
+        mask: Option<Tensor<2, Bool>>,
+        cache: &mut CrossAttentionCache,
+    ) -> Tensor<3> {
         let [batch, l_q, _] = query.dims();
+        assert_shape!(context, [batch, _, _]);
 
         // 1. Projections
         let q = self.query.forward(query);
 
-        let k_compute = |context: Tensor<B, 3>| {
+        let k_compute = |context: Tensor<3>| {
             let [batch, l_k, _] = context.dims();
             self.key
                 .forward(context)
                 .reshape([batch, l_k, self.n_heads_kv, self.d_head])
                 .swap_dims(1, 2)
         };
-        let v_compute = |context: Tensor<B, 3>| {
+        let v_compute = |context: Tensor<3>| {
             let [batch, l_k, _] = context.dims();
             self.value
                 .forward(context)
@@ -322,7 +332,7 @@ impl<B: Backend> CrossAttention<B> {
     }
 
     /// Helper for Grouped Query Attention
-    fn repeat_kv(&self, x: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
+    fn repeat_kv(&self, x: Tensor<4>, n_rep: usize) -> Tensor<4> {
         let [b, h, l, d] = x.dims();
         x.reshape([b, h, 1, l, d])
             .expand([b, h, n_rep, l, d])
@@ -333,7 +343,6 @@ impl<B: Backend> CrossAttention<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestBackend;
     use burn::tensor::{Distribution, Int, Shape, Tensor, Tolerance};
 
     #[test]
@@ -358,7 +367,7 @@ mod tests {
             min_float: -1.0e4,
             quiet_softmax: false,
         };
-        let cross_attn = config.init::<TestBackend>(&device);
+        let cross_attn = config.init(&device);
 
         let query = Tensor::random(
             [batch_size, seq_len_query, d_model],
@@ -403,7 +412,7 @@ mod tests {
             min_float: -1.0e4,
             quiet_softmax: false,
         };
-        let cross_attn = config.init::<TestBackend>(&device);
+        let cross_attn = config.init(&device);
 
         let query = Tensor::random(
             [batch_size, seq_len_query, d_model],
@@ -447,7 +456,7 @@ mod tests {
             min_float: -1.0e4,
             quiet_softmax: false,
         };
-        let cross_attn = config.init::<TestBackend>(&device);
+        let cross_attn = config.init(&device);
 
         let query = Tensor::random(
             [batch_size, seq_len_query, d_model],
@@ -492,24 +501,23 @@ mod tests {
             min_float: -1.0e4,
             quiet_softmax: false,
         };
-        let cross_attn = config.init::<TestBackend>(&device);
+        let cross_attn = config.init(&device);
 
         // Create a padding mask for the context
-        let mut mask: Tensor<TestBackend, 2, Int> =
-            Tensor::zeros([batch_size, seq_len_context], &device);
+        let mut mask: Tensor<2, Int> = Tensor::zeros([batch_size, seq_len_context], &device);
         mask = mask.slice_assign(
             [0..batch_size, seq_len_context - num_padded..seq_len_context],
             Tensor::ones([batch_size, num_padded], &device),
         );
-        let mask_bool = mask.equal_elem(1);
+        let mask_bool = mask.equal_scalar(1);
 
-        let query = Tensor::<TestBackend, 3>::random(
+        let query = Tensor::<3>::random(
             [batch_size, seq_len_query, d_model],
             Distribution::Default,
             &device,
         );
 
-        let context_1 = Tensor::<TestBackend, 3>::random(
+        let context_1 = Tensor::<3>::random(
             [batch_size, seq_len_context, d_context],
             Distribution::Default,
             &device,
@@ -539,6 +547,27 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "assert_shape!(context, [batch, _, _]): axis 0 expected 2, got 1")]
+    fn context_batch_must_match_query_batch() {
+        let device = Default::default();
+        let attn = CrossAttentionConfig::new(16, 16, 2, 2, 8).init(&device);
+        let query = Tensor::zeros([2, 3, 16], &device);
+        let context = Tensor::zeros([1, 4, 16], &device);
+        let _ = attn.forward(query, context, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "assert_shape!(context, [batch, _, _]): axis 0 expected 2, got 1")]
+    fn cache_context_batch_must_match_query_batch() {
+        let device = Default::default();
+        let attn = CrossAttentionConfig::new(16, 16, 2, 2, 8).init(&device);
+        let mut cache = CrossAttentionCache::new();
+        let query = Tensor::zeros([2, 3, 16], &device);
+        let context = Tensor::zeros([1, 4, 16], &device);
+        let _ = attn.forward_cache(query, context, None, &mut cache);
+    }
+
+    #[test]
     #[should_panic]
     fn test_gqa_panic_if_n_heads_not_divisible_by_n_heads_kv() {
         let device = Default::default();
@@ -552,7 +581,7 @@ mod tests {
             min_float: -1.0e4,
             quiet_softmax: false,
         };
-        config.init::<TestBackend>(&device);
+        config.init(&device);
     }
 
     #[test]
@@ -577,14 +606,14 @@ mod tests {
             min_float: -1.0e4,
             quiet_softmax: false,
         };
-        let cross_attn = config.init::<TestBackend>(&device);
+        let cross_attn = config.init(&device);
 
-        let query1 = Tensor::<TestBackend, 3>::random(
+        let query1 = Tensor::<3>::random(
             [batch_size, seq_len_query, d_model],
             Distribution::Default,
             &device,
         );
-        let context = Tensor::<TestBackend, 3>::random(
+        let context = Tensor::<3>::random(
             [batch_size, seq_len_context, d_context],
             Distribution::Default,
             &device,
@@ -603,7 +632,7 @@ mod tests {
             .assert_approx_eq(&output2.into_data(), Tolerance::<f32>::default());
 
         // Third forward pass with different query, but same context and cache
-        let query2 = Tensor::<TestBackend, 3>::random(
+        let query2 = Tensor::<3>::random(
             [batch_size, seq_len_query, d_model],
             Distribution::Default,
             &device,

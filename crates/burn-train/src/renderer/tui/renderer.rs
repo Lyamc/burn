@@ -1,15 +1,14 @@
-use crate::metric::{MetricDefinition, MetricId};
+use crate::logger::{EvaluationProgressLogger, ProgressSnapshot, TrainingProgressLogger};
+use crate::metric::{MetricAttributes, MetricDefinition, MetricId};
 use crate::renderer::tui::TuiSplit;
-use crate::renderer::{
-    EvaluationName, EvaluationProgress, MetricState, MetricsRenderer, MetricsRendererEvaluation,
-    ProgressType, TrainingProgress,
-};
+use crate::renderer::{EvaluationName, MetricState, MetricsRenderer, MetricsRendererEvaluation};
 use crate::renderer::{MetricsRendererTraining, tui::NumericMetricsState};
 use crate::{Interrupter, LearnerSummary};
+use burn_core::data::dataloader::Progress;
 use ratatui::{
     Terminal,
     crossterm::{
-        event::{self, Event, KeyCode},
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
         execute,
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     },
@@ -17,6 +16,8 @@ use ratatui::{
 };
 use std::collections::HashMap;
 use std::panic::{set_hook, take_hook};
+use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -28,7 +29,7 @@ use std::{
 
 use super::{
     Callback, CallbackFn, ControlsView, MetricsView, PopupState, ProgressBarState, StatusState,
-    TextMetricsState, TuiGroup, TuiTag,
+    TextEventOutcome, TextMetricsState, TuiGroup, TuiTag,
 };
 
 /// The current terminal backend.
@@ -40,16 +41,23 @@ type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + 'static + Sync + S
 
 const MAX_REFRESH_RATE_MILLIS: u64 = 100;
 
+static USER_KILL_REQUESTED: AtomicBool = AtomicBool::new(false);
+// `Once` to have a single error message while subsequent threads silently unwind
+static USER_KILL_NOTIFICATION: Once = Once::new();
+
 enum TuiRendererEvent {
     MetricRegistration(MetricDefinition),
     MetricsUpdate((TuiSplit, TuiGroup, MetricState)),
-    StatusUpdateTrain((TuiSplit, TrainingProgress, Vec<ProgressType>)),
-    StatusUpdateTest((EvaluationProgress, Vec<ProgressType>)),
+    StatusUpdateTrain((TuiSplit, ProgressSnapshot)),
+    StatusUpdateTest(ProgressSnapshot),
     ProcessEnd {
         summary: Option<LearnerSummary>,
         /// Interrupter reset.
         reset: bool,
     },
+    CounterUpdate(String),
+    LabelUpdate(Option<String>),
+    SplitEnd,
     ManualClose,
     Close,
     Persistent,
@@ -61,6 +69,9 @@ pub struct TuiMetricsRendererWrapper {
     interrupter: Interrupter,
     handle_join: Option<JoinHandle<()>>,
     kill_signal: Arc<Mutex<Receiver<()>>>,
+    current_split: TuiSplit,
+    training_progress: ProgressSnapshot,
+    eval_progress: ProgressSnapshot,
 }
 
 impl TuiMetricsRendererWrapper {
@@ -78,10 +89,11 @@ impl TuiMetricsRendererWrapper {
 
                 let tick_rate = Duration::from_millis(MAX_REFRESH_RATE_MILLIS);
                 loop {
-                    match receiver.try_recv() {
+                    let remaining_time = tick_rate.saturating_sub(renderer.last_update.elapsed());
+                    match receiver.recv_timeout(remaining_time) {
                         Ok(event) => renderer.handle_event(event),
-                        Err(mpsc::TryRecvError::Empty) => (),
-                        Err(mpsc::TryRecvError::Disconnected) => {
+                        Err(mpsc::RecvTimeoutError::Timeout) => (),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
                             log::error!("Renderer thread disconnected.");
                             break;
                         }
@@ -104,20 +116,31 @@ impl TuiMetricsRendererWrapper {
             })
             .unwrap();
 
+        let init = Progress::new(0, 0, None);
         Self {
             sender,
             interrupter,
             handle_join: Some(handle_join),
             kill_signal: Arc::new(Mutex::new(kill_signal_receiver)),
+            current_split: TuiSplit::Train,
+            training_progress: ProgressSnapshot::new(init.clone(), init.clone()),
+            eval_progress: ProgressSnapshot::new(init.clone(), init),
         }
     }
 
     fn send_event(&self, event: TuiRendererEvent) {
-        if self.kill_signal.lock().unwrap().try_recv().is_ok() {
-            panic!("Killing training from user input.")
+        if self.kill_signal.lock().unwrap().try_recv().is_ok()
+            || USER_KILL_REQUESTED.load(Ordering::Relaxed)
+        {
+            USER_KILL_REQUESTED.store(true, Ordering::Relaxed);
+            panic!("Killing training from user input.");
         }
+
         if let Err(e) = self.sender.send(event) {
-            log::warn!("Failed to send TUI event: {e}");
+            // Ignore send errors if we are already in the middle of killing
+            if !USER_KILL_REQUESTED.load(Ordering::Relaxed) {
+                log::warn!("Failed to send TUI event: {e}");
+            }
         }
     }
 
@@ -125,6 +148,17 @@ impl TuiMetricsRendererWrapper {
     pub fn persistent(self) -> Self {
         self.send_event(TuiRendererEvent::Persistent);
         self
+    }
+
+    /// Joins the render thread if it hasn't already been joined.
+    ///
+    /// Both `manual_close` and `drop` can trigger this, so the handle may already have been
+    /// taken by the time either one runs. Safe to call multiple times: only the first call
+    /// actually joins the thread, subsequent calls are a no-op.
+    fn join_render_thread(&mut self) {
+        if let Some(handle) = self.handle_join.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -155,13 +189,6 @@ impl MetricsRendererEvaluation for TuiMetricsRendererWrapper {
         )));
     }
 
-    fn render_test(&mut self, item: EvaluationProgress, progress_indicators: Vec<ProgressType>) {
-        self.send_event(TuiRendererEvent::StatusUpdateTest((
-            item,
-            progress_indicators,
-        )));
-    }
-
     fn on_test_end(&mut self, summary: Option<LearnerSummary>) -> Result<(), Box<dyn Error>> {
         // Update the summary
         self.send_event(TuiRendererEvent::ProcessEnd {
@@ -175,7 +202,7 @@ impl MetricsRendererEvaluation for TuiMetricsRendererWrapper {
 impl MetricsRenderer for TuiMetricsRendererWrapper {
     fn manual_close(&mut self) {
         self.send_event(TuiRendererEvent::ManualClose);
-        let _ = self.handle_join.take().unwrap().join();
+        self.join_render_thread();
     }
 
     fn register_metric(&mut self, definition: MetricDefinition) {
@@ -200,22 +227,6 @@ impl MetricsRendererTraining for TuiMetricsRendererWrapper {
         )));
     }
 
-    fn render_train(&mut self, item: TrainingProgress, progress_indicators: Vec<ProgressType>) {
-        self.send_event(TuiRendererEvent::StatusUpdateTrain((
-            TuiSplit::Train,
-            item,
-            progress_indicators,
-        )));
-    }
-
-    fn render_valid(&mut self, item: TrainingProgress, progress_indicators: Vec<ProgressType>) {
-        self.send_event(TuiRendererEvent::StatusUpdateTrain((
-            TuiSplit::Valid,
-            item,
-            progress_indicators,
-        )));
-    }
-
     fn on_train_end(&mut self, summary: Option<LearnerSummary>) -> Result<(), Box<dyn Error>> {
         // Reset for following steps.
         self.interrupter.reset();
@@ -228,11 +239,99 @@ impl MetricsRendererTraining for TuiMetricsRendererWrapper {
     }
 }
 
+impl TrainingProgressLogger for TuiMetricsRendererWrapper {
+    fn start(
+        &mut self,
+        total_epochs: usize,
+        starting_epoch: usize,
+        total_items: Option<usize>,
+        label: Option<&str>,
+    ) {
+        self.send_event(TuiRendererEvent::LabelUpdate(label.map(str::to_string)));
+        self.training_progress.global =
+            Progress::new(starting_epoch, total_epochs, Some("epochs".to_string()));
+        if let Some(items) = total_items {
+            self.training_progress.split = Progress::new(0, items, Some("items".to_string()));
+        }
+    }
+
+    fn update_epoch(&mut self, epoch: usize) {
+        let total = self.training_progress.global.items_total;
+        let unit = self.training_progress.global.unit.clone();
+        self.training_progress.global = Progress::new(epoch + 1, total, unit);
+    }
+
+    fn start_split(&mut self, split: &str, total_items: usize) {
+        self.training_progress.split = Progress::new(0, total_items, Some("items".to_string()));
+        self.current_split = if split == "train" {
+            TuiSplit::Train
+        } else {
+            TuiSplit::Valid
+        };
+    }
+
+    fn update_split(&mut self, items_processed: usize) {
+        let total = self.training_progress.split.items_total;
+        let unit = self.training_progress.split.unit.clone();
+        self.training_progress.split = Progress::new(items_processed, total, unit);
+        if self.training_progress.global.items_total == 0 {
+            self.training_progress.global = self.training_progress.split.clone();
+        }
+        self.send_event(TuiRendererEvent::StatusUpdateTrain((
+            self.current_split,
+            self.training_progress.clone(),
+        )));
+    }
+
+    fn end_split(&mut self) {
+        self.send_event(TuiRendererEvent::SplitEnd);
+        self.current_split = TuiSplit::Train;
+    }
+
+    fn end(&mut self) {}
+
+    fn log_event_training(&mut self, event: String) {
+        self.send_event(TuiRendererEvent::CounterUpdate(event));
+    }
+}
+
+impl EvaluationProgressLogger for TuiMetricsRendererWrapper {
+    fn start_global_progress(&mut self, total_tests: usize) {
+        self.eval_progress.global = Progress::new(0, total_tests, Some("tests".to_string()));
+    }
+
+    fn start_test(&mut self, _name: &str, total_items: usize) {
+        let current = self.eval_progress.global.items_processed + 1;
+        let total = self.eval_progress.global.items_total;
+        self.eval_progress.global = Progress::new(current, total, Some("tests".to_string()));
+        self.eval_progress.split = Progress::new(0, total_items, Some("items".to_string()));
+    }
+
+    fn update_test_progress(&mut self, items_processed: usize) {
+        let total = self.eval_progress.split.items_total;
+        let unit = self.eval_progress.split.unit.clone();
+        self.eval_progress.split = Progress::new(items_processed, total, unit);
+        self.send_event(TuiRendererEvent::StatusUpdateTest(
+            self.eval_progress.clone(),
+        ));
+    }
+
+    fn end_test(&mut self) {
+        self.send_event(TuiRendererEvent::SplitEnd);
+    }
+
+    fn end_global_progress(&mut self) {}
+
+    fn log_event_evaluation(&mut self, event: String) {
+        self.send_event(TuiRendererEvent::CounterUpdate(event));
+    }
+}
+
 impl Drop for TuiMetricsRendererWrapper {
     fn drop(&mut self) {
         if !std::thread::panicking() {
             self.send_event(TuiRendererEvent::Close);
-            let _ = self.handle_join.take().unwrap().join();
+            self.join_render_thread();
         }
     }
 }
@@ -246,8 +345,7 @@ impl TuiMetricsRenderer {
                     .get(&entry.metric_id)
                     .unwrap()
                     .name
-                    .clone()
-                    .into();
+                    .clone();
                 self.metrics_text.update(split, group, entry, name);
             }
             MetricState::Numeric(entry, value) => {
@@ -256,8 +354,7 @@ impl TuiMetricsRenderer {
                     .get(&entry.metric_id)
                     .unwrap()
                     .name
-                    .clone()
-                    .into();
+                    .clone();
                 self.metrics_numeric
                     .push(TuiTag::new(split, group.clone()), name.clone(), value);
                 self.metrics_text.update(split, group, entry, name);
@@ -271,7 +368,7 @@ impl TuiMetricsRenderer {
         kill_signal: Sender<()>,
     ) -> Self {
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen).unwrap();
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture).unwrap();
         enable_raw_mode().unwrap();
         let terminal = Terminal::new(CrosstermBackend::new(stdout)).unwrap();
 
@@ -282,7 +379,19 @@ impl TuiMetricsRenderer {
             let previous_panic_hook = previous_panic_hook.clone();
             move |panic_info| {
                 let _ = disable_raw_mode();
-                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+
+                if USER_KILL_REQUESTED.load(Ordering::Relaxed) {
+                    USER_KILL_NOTIFICATION.call_once(|| {
+                        log::warn!("Training killed by user.");
+                        eprintln!("\nTraining killed by user.");
+                    });
+                    // A user-requested kill causes several threads (main, renderer, worker, ...) to panic.
+                    // Suppress the normal panic hook so the user sees a single message instead of a
+                    // cascade of panic reports.
+                    return;
+                }
+
                 previous_panic_hook(panic_info);
             }
         }));
@@ -309,29 +418,34 @@ impl TuiMetricsRenderer {
     fn handle_event(&mut self, event: TuiRendererEvent) {
         match event {
             TuiRendererEvent::MetricRegistration(definition) => {
+                if let MetricAttributes::Numeric(_) = &definition.attributes {
+                    // Register numeric metrics so even epoch-level metrics already appear
+                    // in the registry (i.e., TUI tabs) before a value is actually pushed.
+                    self.metrics_numeric.register(definition.name.clone());
+                }
                 self.metric_definitions
                     .insert(definition.metric_id.clone(), definition);
             }
             TuiRendererEvent::MetricsUpdate((split, group, state)) => {
                 self.update_metric(split, group, state);
             }
-            TuiRendererEvent::StatusUpdateTrain((split, item, status)) => match split {
+            TuiRendererEvent::StatusUpdateTrain((split, item)) => match split {
                 TuiSplit::Train => {
                     self.progress.update_train(&item);
                     self.metrics_numeric.update_progress_train(&item);
-                    self.status.update_train(status);
+                    self.status.update_train(&item);
                 }
                 TuiSplit::Valid => {
                     self.progress.update_valid(&item);
                     self.metrics_numeric.update_progress_valid(&item);
-                    self.status.update_valid(status);
+                    self.status.update_valid(&item);
                 }
                 _ => (),
             },
-            TuiRendererEvent::StatusUpdateTest((item, status)) => {
+            TuiRendererEvent::StatusUpdateTest(item) => {
                 self.progress.update_test(&item);
                 self.metrics_numeric.update_progress_test(&item);
-                self.status.update_test(status);
+                self.status.update_test(&item);
             }
             TuiRendererEvent::ProcessEnd { summary, reset } => {
                 match (self.summary.take(), summary) {
@@ -345,6 +459,13 @@ impl TuiMetricsRenderer {
                 if reset {
                     self.interrupter.reset();
                 }
+            }
+            TuiRendererEvent::CounterUpdate(event) => {
+                self.status.update_counter(event);
+            }
+            TuiRendererEvent::LabelUpdate(label) => self.status.update_label(label.as_deref()),
+            TuiRendererEvent::SplitEnd => {
+                self.status.reset_counters();
             }
             TuiRendererEvent::ManualClose => self.manual_close = true,
             TuiRendererEvent::Persistent => self.persistent = true,
@@ -384,45 +505,61 @@ impl TuiMetricsRenderer {
         Ok(())
     }
 
+    /// Dispatch a single user event to the popup / numeric / text components.
+    /// Returns `true` when something visible changed and a redraw is warranted.
+    /// The training loop ignores this (it is tick-gated); the post-training loop
+    /// uses it to skip redraws on inert events like mouse jitter.
+    fn dispatch_user_event(&mut self, event: &Event) -> bool {
+        let mut redraw = self.popup.on_event(event);
+        if self.popup.is_empty() {
+            redraw |= self.metrics_numeric.on_event(event);
+            redraw |= match self.metrics_text.on_event(event) {
+                TextEventOutcome::Clicked(name) => {
+                    self.metrics_numeric.select_by_name(&name);
+                    true
+                }
+                TextEventOutcome::HoverChanged => true,
+                TextEventOutcome::Ignored => false,
+            };
+        }
+        redraw
+    }
+
     fn handle_user_input(&mut self) -> Result<(), Box<dyn Error>> {
         while event::poll(Duration::from_secs(0))? {
             let event = event::read()?;
-            self.popup.on_event(&event);
+            let _ = self.dispatch_user_event(&event);
 
-            if self.popup.is_empty() {
-                self.metrics_numeric.on_event(&event);
-
-                if let Event::Key(key) = event
-                    && let KeyCode::Char('q') = key.code
-                {
-                    self.popup = PopupState::Full(
-                        "Quit".to_string(),
-                        vec![
-                            Callback::new(
-                                "Stop the training.",
-                                "Stop the training immediately. This will break from the \
-                                     training loop, but any remaining code after the loop will be \
-                                     executed.",
-                                's',
-                                QuitPopupAccept(self.interrupter.clone()),
-                            ),
-                            Callback::new(
-                                "Stop the training immediately.",
-                                "Kill the program. This will create a panic! which will make \
-                                     the current training fails. Any code following the training \
-                                     won't be executed.",
-                                'k',
-                                KillPopupAccept(self.kill_signal.clone()),
-                            ),
-                            Callback::new(
-                                "Cancel",
-                                "Cancel the action, continue the training.",
-                                'c',
-                                PopupCancel,
-                            ),
-                        ],
-                    );
-                }
+            if self.popup.is_empty()
+                && let Event::Key(key) = event
+                && let KeyCode::Char('q') = key.code
+            {
+                self.popup = PopupState::Full(
+                    "Quit".to_string(),
+                    vec![
+                        Callback::new(
+                            "Stop the training.",
+                            "Stop the training immediately. This will break from the \
+                                 training loop, but any remaining code after the loop will be \
+                                 executed.",
+                            's',
+                            QuitPopupAccept(self.interrupter.clone()),
+                        ),
+                        Callback::new(
+                            "Stop the training immediately.",
+                            "Kill the program. This will abort the current training instantly. \
+                                 Any code following the training won't be executed.",
+                            'k',
+                            KillPopupAccept(self.kill_signal.clone()),
+                        ),
+                        Callback::new(
+                            "Cancel",
+                            "Cancel the action, continue the training.",
+                            'c',
+                            PopupCancel,
+                        ),
+                    ],
+                );
             }
         }
 
@@ -447,15 +584,21 @@ impl TuiMetricsRenderer {
             if let Ok(true) = event::poll(Duration::from_millis(MAX_REFRESH_RATE_MILLIS)) {
                 match event::read() {
                     Ok(event @ Event::Key(key)) => {
-                        if self.popup.is_empty() {
-                            self.metrics_numeric.on_event(&event);
-                            if let KeyCode::Char('q') = key.code {
-                                break;
-                            }
-                        } else {
-                            self.popup.on_event(&event);
+                        let redraw = self.dispatch_user_event(&event);
+                        if self.popup.is_empty()
+                            && let KeyCode::Char('q') = key.code
+                        {
+                            break;
                         }
-                        self.draw().ok();
+                        if redraw {
+                            self.draw().ok();
+                        }
+                    }
+
+                    Ok(event @ Event::Mouse(_)) => {
+                        if self.dispatch_user_event(&event) {
+                            self.draw().ok();
+                        }
                     }
 
                     Ok(Event::Resize(..)) => {
@@ -483,7 +626,11 @@ impl TuiMetricsRenderer {
             }
 
             disable_raw_mode()?;
-            execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+            execute!(
+                self.terminal.backend_mut(),
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            )?;
             self.terminal.show_cursor()?;
 
             // Reinstall the previous panic hook
@@ -504,6 +651,7 @@ struct PopupCancel;
 
 impl CallbackFn for KillPopupAccept {
     fn call(&self) -> bool {
+        USER_KILL_REQUESTED.store(true, Ordering::Relaxed);
         self.0.send(()).unwrap();
         panic!("Killing training from user input.");
     }
@@ -534,5 +682,50 @@ impl Drop for TuiMetricsRenderer {
                 log::info!("{summary}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `TuiMetricsRendererWrapper::new` spawns a `TuiMetricsRenderer`, which requires a real
+    // terminal (raw mode + alternate screen), unavailable in CI. Build the wrapper directly
+    // instead, with a plain no-op thread standing in for the render thread, to exercise the
+    // `handle_join` shutdown logic on its own.
+    fn wrapper_with_dummy_thread() -> TuiMetricsRendererWrapper {
+        let (sender, _receiver) = mpsc::channel();
+        let (_kill_signal_sender, kill_signal_receiver) = mpsc::channel();
+        let handle_join = std::thread::spawn(|| {});
+
+        let init = Progress::new(0, 0, None);
+        TuiMetricsRendererWrapper {
+            sender,
+            interrupter: Interrupter::new(),
+            handle_join: Some(handle_join),
+            kill_signal: Arc::new(Mutex::new(kill_signal_receiver)),
+            current_split: TuiSplit::Train,
+            training_progress: ProgressSnapshot::new(init.clone(), init.clone()),
+            eval_progress: ProgressSnapshot::new(init.clone(), init),
+        }
+    }
+
+    #[test]
+    fn manual_close_twice_does_not_panic() {
+        let mut renderer = wrapper_with_dummy_thread();
+
+        // The first call takes and joins the render thread's handle.
+        renderer.manual_close();
+        // Regression test for #4793: a second call used to panic on
+        // `handle_join.take().unwrap()` since the handle was already taken.
+        renderer.manual_close();
+    }
+
+    #[test]
+    fn drop_after_manual_close_does_not_panic() {
+        let mut renderer = wrapper_with_dummy_thread();
+
+        renderer.manual_close();
+        drop(renderer);
     }
 }

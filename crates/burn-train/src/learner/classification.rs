@@ -1,10 +1,9 @@
 use crate::metric::{
-    AccuracyInput, Adaptor, AurocInput, ConfusionStatsInput, HammingScoreInput, LossInput,
-    PerplexityInput, TopKAccuracyInput, processor::ItemLazy,
+    AccuracyInput, Adaptor, ConfusionStatsInput, HammingScoreInput, LossInput, PerplexityInput,
+    TopKAccuracyInput, processor::ItemLazy,
 };
-use burn_core::tensor::backend::Backend;
-use burn_core::tensor::{Int, Tensor, Transaction};
-use burn_flex::Flex;
+use burn_core::tensor::{Int, Tensor};
+use burn_std::ExecutionError;
 
 /// Simple classification output adapted for multiple metrics.
 ///
@@ -18,72 +17,61 @@ use burn_flex::Flex;
 /// - FBetaScore (via ConfusionStatsInput)
 /// - Loss.
 #[derive(new)]
-pub struct ClassificationOutput<B: Backend> {
+pub struct ClassificationOutput {
     /// The loss.
-    pub loss: Tensor<B, 1>,
+    pub loss: Tensor<1>,
 
     /// The class logits or probabilities. Shape: \[batch_size, num_classes\].
-    pub output: Tensor<B, 2>,
+    pub output: Tensor<2>,
 
     /// The ground truth class index for each sample. Shape: \[batch_size\].
-    pub targets: Tensor<B, 1, Int>,
+    pub targets: Tensor<1, Int>,
 }
 
-impl<B: Backend> ItemLazy for ClassificationOutput<B> {
-    // Flex's IntElem is i32; class indices > i32::MAX would truncate on sync.
-    type ItemSync = ClassificationOutput<Flex>;
+impl ItemLazy for ClassificationOutput {
+    fn sync(self) -> Result<Self, ExecutionError> {
+        // No readback: the metrics compute on the device the tensors live on
+        // and read back only their final scalars. Flushing dispatches the
+        // producing stream's buffered work so the metric thread doesn't wait
+        // on an idle queue; all tensors in a training item come off the
+        // autodiff backend entirely, so the metric thread neither retains the
+        // tape nor carries its dispatch context.
+        self.loss.device().flush()?;
 
-    fn sync(self) -> Self::ItemSync {
-        let [output, loss, targets] = Transaction::default()
-            .register(self.output)
-            .register(self.loss)
-            .register(self.targets)
-            .execute()
-            .try_into()
-            .expect("Correct amount of tensor data");
-
-        let device = &Default::default();
-
-        ClassificationOutput {
-            output: Tensor::from_data(output, device),
-            loss: Tensor::from_data(loss, device),
-            targets: Tensor::from_data(targets, device),
-        }
+        Ok(ClassificationOutput {
+            output: self.output.without_autodiff(),
+            loss: self.loss.without_autodiff(),
+            targets: self.targets.without_autodiff(),
+        })
     }
 }
 
-impl<B: Backend> Adaptor<AccuracyInput<B>> for ClassificationOutput<B> {
-    fn adapt(&self) -> AccuracyInput<B> {
+impl Adaptor<AccuracyInput> for ClassificationOutput {
+    fn adapt(&self) -> AccuracyInput {
         AccuracyInput::new(self.output.clone(), self.targets.clone())
     }
 }
 
-impl<B: Backend> Adaptor<AurocInput<B>> for ClassificationOutput<B> {
-    fn adapt(&self) -> AurocInput<B> {
-        AurocInput::new(self.output.clone(), self.targets.clone())
-    }
-}
-
-impl<B: Backend> Adaptor<LossInput<B>> for ClassificationOutput<B> {
-    fn adapt(&self) -> LossInput<B> {
+impl Adaptor<LossInput> for ClassificationOutput {
+    fn adapt(&self) -> LossInput {
         LossInput::new(self.loss.clone())
     }
 }
 
-impl<B: Backend> Adaptor<TopKAccuracyInput<B>> for ClassificationOutput<B> {
-    fn adapt(&self) -> TopKAccuracyInput<B> {
+impl Adaptor<TopKAccuracyInput> for ClassificationOutput {
+    fn adapt(&self) -> TopKAccuracyInput {
         TopKAccuracyInput::new(self.output.clone(), self.targets.clone())
     }
 }
 
-impl<B: Backend> Adaptor<PerplexityInput<B>> for ClassificationOutput<B> {
-    fn adapt(&self) -> PerplexityInput<B> {
+impl Adaptor<PerplexityInput> for ClassificationOutput {
+    fn adapt(&self) -> PerplexityInput {
         PerplexityInput::new(self.output.clone(), self.targets.clone())
     }
 }
 
-impl<B: Backend> Adaptor<ConfusionStatsInput<B>> for ClassificationOutput<B> {
-    fn adapt(&self) -> ConfusionStatsInput<B> {
+impl Adaptor<ConfusionStatsInput> for ClassificationOutput {
+    fn adapt(&self) -> ConfusionStatsInput {
         let [_, num_classes] = self.output.dims();
         if num_classes > 1 {
             ConfusionStatsInput::new(
@@ -108,54 +96,45 @@ impl<B: Backend> Adaptor<ConfusionStatsInput<B>> for ClassificationOutput<B> {
 /// - FBetaScore (via ConfusionStatsInput)
 /// - Loss
 #[derive(new)]
-pub struct MultiLabelClassificationOutput<B: Backend> {
+pub struct MultiLabelClassificationOutput {
     /// The loss.
-    pub loss: Tensor<B, 1>,
+    pub loss: Tensor<1>,
 
     /// The label logits or probabilities. Shape: \[batch_size, num_classes\].
-    pub output: Tensor<B, 2>,
+    pub output: Tensor<2>,
 
     /// The ground truth labels. Shape: \[batch_size, num_classes\].
-    pub targets: Tensor<B, 2, Int>,
+    pub targets: Tensor<2, Int>,
 }
 
-impl<B: Backend> ItemLazy for MultiLabelClassificationOutput<B> {
-    // Flex's IntElem is i32; label indices > i32::MAX would truncate on sync.
-    type ItemSync = MultiLabelClassificationOutput<Flex>;
+impl ItemLazy for MultiLabelClassificationOutput {
+    fn sync(self) -> Result<Self, ExecutionError> {
+        // Same contract as `ClassificationOutput::sync`: flush and take every
+        // tensor off the autodiff backend, no readback.
+        self.loss.device().flush()?;
 
-    fn sync(self) -> Self::ItemSync {
-        let [output, loss, targets] = Transaction::default()
-            .register(self.output)
-            .register(self.loss)
-            .register(self.targets)
-            .execute()
-            .try_into()
-            .expect("Correct amount of tensor data");
-
-        let device = &Default::default();
-
-        MultiLabelClassificationOutput {
-            output: Tensor::from_data(output, device),
-            loss: Tensor::from_data(loss, device),
-            targets: Tensor::from_data(targets, device),
-        }
+        Ok(MultiLabelClassificationOutput {
+            output: self.output.without_autodiff(),
+            loss: self.loss.without_autodiff(),
+            targets: self.targets.without_autodiff(),
+        })
     }
 }
 
-impl<B: Backend> Adaptor<HammingScoreInput<B>> for MultiLabelClassificationOutput<B> {
-    fn adapt(&self) -> HammingScoreInput<B> {
+impl Adaptor<HammingScoreInput> for MultiLabelClassificationOutput {
+    fn adapt(&self) -> HammingScoreInput {
         HammingScoreInput::new(self.output.clone(), self.targets.clone())
     }
 }
 
-impl<B: Backend> Adaptor<LossInput<B>> for MultiLabelClassificationOutput<B> {
-    fn adapt(&self) -> LossInput<B> {
+impl Adaptor<LossInput> for MultiLabelClassificationOutput {
+    fn adapt(&self) -> LossInput {
         LossInput::new(self.loss.clone())
     }
 }
 
-impl<B: Backend> Adaptor<ConfusionStatsInput<B>> for MultiLabelClassificationOutput<B> {
-    fn adapt(&self) -> ConfusionStatsInput<B> {
+impl Adaptor<ConfusionStatsInput> for MultiLabelClassificationOutput {
+    fn adapt(&self) -> ConfusionStatsInput {
         ConfusionStatsInput::new(self.output.clone(), self.targets.clone().bool())
     }
 }

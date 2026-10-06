@@ -1,9 +1,7 @@
 use super::state::{FormatOptions, NumericMetricState};
 use super::{MetricMetadata, SerializedEntry};
 use crate::metric::{Metric, MetricAttributes, MetricName, Numeric, NumericEntry};
-use burn_core::tensor::backend::Backend;
-use burn_core::tensor::{Int, Tensor};
-use core::marker::PhantomData;
+use burn_core::tensor::{Int, Tensor, TensorReadError};
 use std::sync::Arc;
 
 /// Computes the edit distance (Levenshtein distance) between two sequences of integers.
@@ -36,36 +34,34 @@ pub(crate) fn edit_distance(reference: &[i32], prediction: &[i32]) -> usize {
 /// to quantify how closely the predicted output matches the ground truth at a character level.
 ///
 #[derive(Clone)]
-pub struct CharErrorRate<B: Backend> {
+pub struct CharErrorRate {
     name: MetricName,
     state: NumericMetricState,
     pad_token: Option<usize>,
-    _b: PhantomData<B>,
 }
 
 /// The [character error rate metric](CharErrorRate) input type.
 #[derive(new)]
-pub struct CerInput<B: Backend> {
+pub struct CerInput {
     /// The predicted token sequences (as a 2-D tensor of token indices).
-    pub outputs: Tensor<B, 2, Int>,
+    pub outputs: Tensor<2, Int>,
     /// The target token sequences (as a 2-D tensor of token indices).
-    pub targets: Tensor<B, 2, Int>,
+    pub targets: Tensor<2, Int>,
 }
 
-impl<B: Backend> Default for CharErrorRate<B> {
+impl Default for CharErrorRate {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<B: Backend> CharErrorRate<B> {
+impl CharErrorRate {
     /// Creates the metric.
     pub fn new() -> Self {
         Self {
             name: Arc::new("CER".to_string()),
             state: NumericMetricState::default(),
             pad_token: None,
-            _b: PhantomData,
         }
     }
 
@@ -77,45 +73,40 @@ impl<B: Backend> CharErrorRate<B> {
 }
 
 /// The [character error rate metric](CharErrorRate) implementation.
-impl<B: Backend> Metric for CharErrorRate<B> {
-    type Input = CerInput<B>;
+impl Metric for CharErrorRate {
+    type Input = CerInput;
 
-    fn update(&mut self, input: &CerInput<B>, _metadata: &MetricMetadata) -> SerializedEntry {
+    fn update(
+        &mut self,
+        input: &CerInput,
+        _metadata: &MetricMetadata,
+    ) -> Result<SerializedEntry, TensorReadError> {
         let outputs = &input.outputs;
         let targets = &input.targets;
         let [batch_size, seq_len] = targets.dims();
 
         let (output_lengths, target_lengths) = if let Some(pad) = self.pad_token {
             // Create boolean masks for non-padding tokens.
-            let output_mask = outputs.clone().not_equal_elem(pad as i64);
-            let target_mask = targets.clone().not_equal_elem(pad as i64);
+            let output_mask = outputs.clone().not_equal_scalar(pad as i64);
+            let target_mask = targets.clone().not_equal_scalar(pad as i64);
 
             let output_lengths_tensor = output_mask.int().sum_dim(1);
             let target_lengths_tensor = target_mask.int().sum_dim(1);
 
             (
-                output_lengths_tensor
-                    .to_data()
-                    .iter::<i64>()
-                    .collect::<Vec<_>>(),
-                target_lengths_tensor
-                    .to_data()
-                    .iter::<i64>()
-                    .collect::<Vec<_>>(),
+                output_lengths_tensor.try_into_vec_as::<i32>()?,
+                target_lengths_tensor.try_into_vec_as::<i32>()?,
             )
         } else {
             // If there's no padding, all sequences have the full length.
             (
-                vec![seq_len as i64; batch_size],
-                vec![seq_len as i64; batch_size],
+                vec![seq_len as i32; batch_size],
+                vec![seq_len as i32; batch_size],
             )
         };
 
-        // `TensorData::iter::<i32>()` dispatches on the stored DType and
-        // narrows to i32 per element; token IDs in any reasonable vocabulary
-        // fit in i32 regardless of the backend's native IntElem.
-        let outputs_data = outputs.to_data().iter::<i32>().collect::<Vec<_>>();
-        let targets_data = targets.to_data().iter::<i32>().collect::<Vec<_>>();
+        let outputs_data: Vec<i32> = outputs.try_to_vec_as()?;
+        let targets_data: Vec<i32> = targets.try_to_vec_as()?;
 
         let total_edit_distance: usize = (0..batch_size)
             .map(|i| {
@@ -125,26 +116,31 @@ impl<B: Backend> Metric for CharErrorRate<B> {
                 let output_len = output_lengths[i] as usize;
                 let target_len = target_lengths[i] as usize;
 
-                let output_seq = &outputs_data[start..(start + output_len)];
-                let target_seq = &targets_data[start..(start + target_len)];
+                let output_seq_slice = &outputs_data[start..(start + output_len)];
+                let target_seq_slice = &targets_data[start..(start + target_len)];
 
-                edit_distance(target_seq, output_seq)
+                edit_distance(target_seq_slice, output_seq_slice)
             })
             .sum();
 
-        let total_target_length = target_lengths.iter().map(|&x| x as f64).sum::<f64>();
+        let total_target_length = target_lengths.iter().map(|&x| x as usize).sum::<usize>();
 
-        let value = if total_target_length > 0.0 {
-            100.0 * total_edit_distance as f64 / total_target_length
+        let value = if total_target_length > 0 {
+            100.0 * total_edit_distance as f64 / total_target_length as f64
         } else {
             0.0
         };
 
-        self.state.update(
-            value,
-            batch_size,
-            FormatOptions::new(self.name()).unit("%").precision(2),
-        )
+        self.state.update(value, total_target_length);
+        Ok(self
+            .state
+            .compute_update(FormatOptions::new(self.name()).unit("%").precision(2)))
+    }
+
+    fn compute(&mut self) -> Result<SerializedEntry, TensorReadError> {
+        Ok(self
+            .state
+            .compute_final(FormatOptions::new(self.name()).unit("%").precision(2)))
     }
 
     fn clear(&mut self) {
@@ -164,50 +160,57 @@ impl<B: Backend> Metric for CharErrorRate<B> {
     }
 }
 
-impl<B: Backend> Numeric for CharErrorRate<B> {
-    fn value(&self) -> NumericEntry {
-        self.state.current_value()
+impl Numeric for CharErrorRate {
+    fn value(&self) -> Option<NumericEntry> {
+        Some(self.state.current_value())
     }
 
-    fn running_value(&self) -> NumericEntry {
-        self.state.running_value()
+    fn running_value(&self) -> Option<NumericEntry> {
+        Some(self.state.running_value())
+    }
+
+    fn final_value(&self) -> NumericEntry {
+        self.state.final_value()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestBackend;
 
     /// Perfect match ⇒ CER = 0 %.
     #[test]
     fn test_cer_without_padding() {
         let device = Default::default();
-        let mut metric = CharErrorRate::<TestBackend>::new();
+        let mut metric = CharErrorRate::new();
 
         // Batch size = 2, sequence length = 2
         let preds = Tensor::from_data([[1, 2], [3, 4]], &device);
         let tgts = Tensor::from_data([[1, 2], [3, 4]], &device);
 
-        metric.update(&CerInput::new(preds, tgts), &MetricMetadata::fake());
+        metric
+            .update(&CerInput::new(preds, tgts), &MetricMetadata::fake())
+            .unwrap();
 
-        assert_eq!(0.0, metric.value().current());
+        assert_eq!(0.0, metric.value().unwrap().current());
     }
 
     /// Two edits in four target tokens ⇒ 50 %.
     #[test]
     fn test_cer_without_padding_two_errors() {
         let device = Default::default();
-        let mut metric = CharErrorRate::<TestBackend>::new();
+        let mut metric = CharErrorRate::new();
 
         // One substitution in each sequence.
         let preds = Tensor::from_data([[1, 2], [3, 5]], &device);
         let tgts = Tensor::from_data([[1, 3], [3, 4]], &device);
 
-        metric.update(&CerInput::new(preds, tgts), &MetricMetadata::fake());
+        metric
+            .update(&CerInput::new(preds, tgts), &MetricMetadata::fake())
+            .unwrap();
 
         // 2 edits / 4 tokens = 50 %
-        assert_eq!(50.0, metric.value().current());
+        assert_eq!(50.0, metric.value().unwrap().current());
     }
 
     /// Same scenario as above, but with right-padding (token 9) ignored.
@@ -215,32 +218,36 @@ mod tests {
     fn test_cer_with_padding() {
         let device = Default::default();
         let pad = 9_i64;
-        let mut metric = CharErrorRate::<TestBackend>::new().with_pad_token(pad as usize);
+        let mut metric = CharErrorRate::new().with_pad_token(pad as usize);
 
         // Each row has three columns, last one is the pad token.
         let preds = Tensor::from_data([[1, 2, pad], [3, 5, pad]], &device);
         let tgts = Tensor::from_data([[1, 3, pad], [3, 4, pad]], &device);
 
-        metric.update(&CerInput::new(preds, tgts), &MetricMetadata::fake());
-        assert_eq!(50.0, metric.value().current());
+        metric
+            .update(&CerInput::new(preds, tgts), &MetricMetadata::fake())
+            .unwrap();
+        assert_eq!(50.0, metric.value().unwrap().current());
     }
 
     /// `clear()` must reset the running statistics to zero.
     #[test]
     fn test_clear_resets_state() {
         let device = Default::default();
-        let mut metric = CharErrorRate::<TestBackend>::new();
+        let mut metric = CharErrorRate::new();
 
         let preds = Tensor::from_data([[1, 2]], &device);
         let tgts = Tensor::from_data([[1, 3]], &device); // one error
 
-        metric.update(
-            &CerInput::new(preds.clone(), tgts.clone()),
-            &MetricMetadata::fake(),
-        );
-        assert!(metric.value().current() > 0.0);
+        metric
+            .update(
+                &CerInput::new(preds.clone(), tgts.clone()),
+                &MetricMetadata::fake(),
+            )
+            .unwrap();
+        assert!(metric.value().unwrap().current() > 0.0);
 
         metric.clear();
-        assert!(metric.value().current().is_nan());
+        assert!(metric.value().unwrap().current().is_nan());
     }
 }

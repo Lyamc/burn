@@ -4,7 +4,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use burn_tensor::{DType, Shape};
+use burn_core::tensor::{DType, Shape};
 
 /// Error types that can occur during tensor application
 #[derive(Debug, Clone)]
@@ -80,7 +80,7 @@ impl core::fmt::Display for ApplyError {
 
 impl core::error::Error for ApplyError {}
 
-/// Result of applying tensor snapshots to a module
+/// Result of applying tensors to a module
 #[derive(Clone)]
 pub struct ApplyResult {
     /// Successfully applied tensor paths
@@ -90,7 +90,7 @@ pub struct ApplyResult {
     /// Missing tensor paths with their container stacks in dot notation (path, container_stack)
     /// Container stack shows the hierarchy: "Struct:Model.Struct:Linear" or "Struct:Model.Enum:ConvType.Struct:Linear"
     pub missing: Vec<(String, String)>,
-    /// Unused tensor paths (in snapshots but not in module)
+    /// Unused tensor paths (in the source but not in the module)
     pub unused: Vec<String>,
     /// Errors encountered during application
     pub errors: Vec<ApplyError>,

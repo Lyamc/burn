@@ -1,37 +1,33 @@
-use std::marker::PhantomData;
-
-use burn::backend::Flex;
-use burn::module::Module;
-use burn::record::Record;
 use burn::rl::{
     Batchable, LearnerTransitionBatch, Policy, PolicyLearner, PolicyState, RLTrainOutput,
     SliceAccess,
 };
-use burn::tensor::{Int, Transaction};
+use burn::store::{ModuleRecord, RecordError};
 use burn::tensor::activation::softmax;
+use burn::tensor::{Bytes, Device, Int, Transaction};
 use burn::train::ItemLazy;
+use burn::train::checkpoint::{Checkpoint, CheckpointerError};
 use burn::train::metric::{Adaptor, LossInput};
 use burn::{
     Tensor,
     config::Config,
-    module::AutodiffModule,
+    module::Module,
     nn::{self, loss::MseLoss},
-    optim::{GradientsParams, Optimizer},
-    prelude::Backend,
-    tensor::backend::AutodiffBackend,
+    optim::{GradientsParams, ModuleOptimizer, OptimizerRecord},
 };
 use rand::distr::Distribution;
 use rand::distr::weighted::WeightedIndex;
 use rand::rng;
+use std::path::PathBuf;
 
 use crate::utils::{
     EpsilonGreedyPolicy, EpsilonGreedyPolicyState, create_lin_layers, soft_update_linear,
 };
 
-pub trait DiscreteActionModel<B: Backend>: Module<B> {
+pub trait DiscreteActionModel: Module {
     type Input: Clone + Send + Batchable;
 
-    fn forward(&self, input: Self::Input) -> DiscreteLogitsTensor<B, 2>;
+    fn forward(&self, input: Self::Input) -> DiscreteLogitsTensor<2>;
 }
 
 #[derive(Config, Debug)]
@@ -55,15 +51,15 @@ pub struct MlpNetConfig {
 
 /// Multilayer Perceptron Network.
 #[derive(Module, Debug)]
-pub struct MlpNet<B: Backend> {
-    pub linears: Vec<nn::Linear<B>>,
+pub struct MlpNet {
+    pub linears: Vec<nn::Linear>,
     pub dropout: nn::Dropout,
     pub activation: nn::Relu,
 }
 
-impl<B: Backend> MlpNet<B> {
+impl MlpNet {
     /// Create the module from the given configuration.
-    pub fn new(config: &MlpNetConfig, device: &B::Device) -> Self {
+    pub fn new(config: &MlpNetConfig, device: &Device) -> Self {
         Self {
             linears: create_lin_layers(
                 config.num_layers,
@@ -79,11 +75,11 @@ impl<B: Backend> MlpNet<B> {
 }
 
 #[derive(Clone)]
-pub struct ObservationTensor<B: Backend, const D: usize> {
-    pub state: Tensor<B, D>,
+pub struct ObservationTensor<const D: usize> {
+    pub state: Tensor<D>,
 }
 
-impl<B: Backend, const D: usize> Batchable for ObservationTensor<B, D> {
+impl<const D: usize> Batchable for ObservationTensor<D> {
     fn batch(value: Vec<Self>) -> Self {
         let tensors = value.iter().map(|v| v.state.clone()).collect();
         Self {
@@ -100,28 +96,40 @@ impl<B: Backend, const D: usize> Batchable for ObservationTensor<B, D> {
     }
 }
 
-impl<B: Backend> SliceAccess<B> for ObservationTensor<B, 2> {
-    fn zeros_like(sample: &Self, capacity: usize, device: &B::Device) -> Self {
+impl SliceAccess for ObservationTensor<2> {
+    fn zeros_like(sample: &Self, capacity: usize, device: &Device) -> Self {
         let feature_dim = sample.state.dims()[1];
         Self {
             state: Tensor::zeros([capacity, feature_dim], device),
         }
     }
 
-    fn select(self, dim: usize, indices: Tensor<B, 1, Int>) -> Self {
+    fn select(self, dim: usize, indices: Tensor<1, Int>) -> Self {
         Self {
             state: Tensor::select(self.state, dim, indices),
         }
     }
 
     fn slice_assign_inplace(&mut self, index: usize, value: Self) {
+        // The given value needs to be on the same backend as the state tensor.
+        let device = self.state.device();
+        let state = if value.state.device().is_autodiff() {
+            value.state.inner()
+        } else {
+            value.state
+        };
+        let state = if device.is_autodiff() {
+            Tensor::from_inner(state.to_device(&device.inner()))
+        } else {
+            state.to_device(&device.inner())
+        };
         self.state
-            .inplace(|t| t.slice_assign(index..index + 1, value.state));
+            .inplace(|t| t.slice_assign(index..index + 1, state));
     }
 }
 
-impl<B: Backend> DiscreteActionModel<B> for MlpNet<B> {
-    type Input = ObservationTensor<B, 2>;
+impl DiscreteActionModel for MlpNet {
+    type Input = ObservationTensor<2>;
 
     /// Applies the forward pass on the input tensor.
     ///
@@ -129,7 +137,7 @@ impl<B: Backend> DiscreteActionModel<B> for MlpNet<B> {
     ///
     /// - input: `[batch_size, d_input]`
     /// - output: `[batch_size, d_output]`
-    fn forward(&self, input: Self::Input) -> DiscreteLogitsTensor<B, 2> {
+    fn forward(&self, input: Self::Input) -> DiscreteLogitsTensor<2> {
         let mut x = input.state;
 
         for (i, linear) in self.linears.iter().enumerate() {
@@ -166,11 +174,11 @@ pub struct DqnAgentConfig {
     pub epsilon_decay: f64,
 }
 
-pub trait TargetModel<B: Backend> {
+pub trait TargetModel {
     fn soft_update(&self, that: &Self, tau: f64) -> Self;
 }
 
-impl<B: Backend> TargetModel<B> for MlpNet<B> {
+impl TargetModel for MlpNet {
     fn soft_update(&self, that: &Self, tau: f64) -> Self {
         let mut linears = Vec::with_capacity(self.linears.len());
         for i in 0..self.linears.len() {
@@ -186,13 +194,12 @@ impl<B: Backend> TargetModel<B> for MlpNet<B> {
 }
 
 #[derive(Clone)]
-pub struct DqnState<B: Backend, M: DiscreteActionModel<B>> {
+pub struct DqnState<M: DiscreteActionModel> {
     model: M,
-    _backend: PhantomData<B>,
 }
 
-impl<B: Backend, M: DiscreteActionModel<B>> PolicyState<B> for DqnState<B, M> {
-    type Record = M::Record;
+impl<M: DiscreteActionModel> PolicyState for DqnState<M> {
+    type Record = ModuleRecord;
 
     fn into_record(self) -> Self::Record {
         self.model.clone().into_record()
@@ -201,32 +208,35 @@ impl<B: Backend, M: DiscreteActionModel<B>> PolicyState<B> for DqnState<B, M> {
     fn load_record(&self, record: Self::Record) -> Self {
         Self {
             model: self.model.clone().load_record(record),
-            _backend: PhantomData,
         }
     }
 }
 
 #[derive(Clone)]
-pub struct DQN<B: Backend, M: DiscreteActionModel<B>> {
+pub struct DQN<M: DiscreteActionModel> {
     model: M,
-    _backend: PhantomData<B>,
 }
 
-impl<B: Backend, M: DiscreteActionModel<B>> DQN<B, M> {
+impl<M: DiscreteActionModel> DQN<M> {
     pub fn new(policy: M) -> Self {
-        Self {
-            model: policy,
-            _backend: PhantomData,
-        }
+        Self { model: policy }
+    }
+
+    pub fn model(&self) -> M {
+        self.model.clone()
+    }
+
+    pub fn set_model(&mut self, model: M) {
+        self.model = model;
     }
 }
 
 #[derive(Clone)]
-pub struct DiscreteLogitsTensor<B: Backend, const D: usize> {
-    pub logits: Tensor<B, D>,
+pub struct DiscreteLogitsTensor<const D: usize> {
+    pub logits: Tensor<D>,
 }
 
-impl<B: Backend, const D: usize> Batchable for DiscreteLogitsTensor<B, D> {
+impl<const D: usize> Batchable for DiscreteLogitsTensor<D> {
     fn batch(value: Vec<Self>) -> Self {
         let tensors = value.iter().map(|v| v.logits.clone()).collect();
         Self {
@@ -244,11 +254,11 @@ impl<B: Backend, const D: usize> Batchable for DiscreteLogitsTensor<B, D> {
 }
 
 #[derive(Clone)]
-pub struct DiscreteActionTensor<B: Backend, const D: usize> {
-    pub actions: Tensor<B, D>,
+pub struct DiscreteActionTensor<const D: usize> {
+    pub actions: Tensor<D>,
 }
 
-impl<B: Backend, const D: usize> Batchable for DiscreteActionTensor<B, D> {
+impl<const D: usize> Batchable for DiscreteActionTensor<D> {
     fn batch(value: Vec<Self>) -> Self {
         let tensors = value.iter().map(|v| v.actions.clone()).collect();
         Self {
@@ -265,33 +275,45 @@ impl<B: Backend, const D: usize> Batchable for DiscreteActionTensor<B, D> {
     }
 }
 
-impl<B: Backend> SliceAccess<B> for DiscreteActionTensor<B, 2> {
-    fn zeros_like(sample: &Self, capacity: usize, device: &B::Device) -> Self {
+impl SliceAccess for DiscreteActionTensor<2> {
+    fn zeros_like(sample: &Self, capacity: usize, device: &Device) -> Self {
         let feature_dim = sample.actions.dims()[1];
         Self {
             actions: Tensor::zeros([capacity, feature_dim], device),
         }
     }
 
-    fn select(self, dim: usize, indices: Tensor<B, 1, Int>) -> Self {
+    fn select(self, dim: usize, indices: Tensor<1, Int>) -> Self {
         Self {
             actions: Tensor::select(self.actions, dim, indices),
         }
     }
 
     fn slice_assign_inplace(&mut self, index: usize, value: Self) {
+        // The given value needs to be on the same backend as the state tensor.
+        let device = self.actions.device();
+        let actions = if value.actions.device().is_autodiff() {
+            value.actions.inner()
+        } else {
+            value.actions
+        };
+        let actions = if device.is_autodiff() {
+            Tensor::from_inner(actions.to_device(&device.inner()))
+        } else {
+            actions.to_device(&device.inner())
+        };
         self.actions
-            .inplace(|t| t.slice_assign(index..index + 1, value.actions));
+            .inplace(|t| t.slice_assign(index..index + 1, actions));
     }
 }
 
-impl<B: Backend, M: DiscreteActionModel<B>> Policy<B> for DQN<B, M> {
+impl<M: DiscreteActionModel> Policy for DQN<M> {
     type Observation = M::Input;
-    type ActionDistribution = DiscreteLogitsTensor<B, 2>;
-    type Action = DiscreteActionTensor<B, 2>;
+    type ActionDistribution = DiscreteLogitsTensor<2>;
+    type Action = DiscreteActionTensor<2>;
 
     type ActionContext = ();
-    type PolicyState = DqnState<B, M>;
+    type PolicyState = DqnState<M>;
 
     fn forward(&mut self, states: Self::Observation) -> Self::ActionDistribution {
         self.model.forward(states)
@@ -315,9 +337,9 @@ impl<B: Backend, M: DiscreteActionModel<B>> Policy<B> for DQN<B, M> {
         let probs = probs.split(1, 0);
         let mut rng = rng();
         for p in probs {
-            let dist = WeightedIndex::new(p.to_data().to_vec::<f32>().unwrap()).unwrap();
+            let dist = WeightedIndex::new(p.to_data().try_to_vec::<f32>().unwrap()).unwrap();
             let action = dist.sample(&mut rng);
-            actions.push(Tensor::<B, 1>::from_floats([action], &p.device()));
+            actions.push(Tensor::<1>::from_floats([action], &p.device()));
         }
 
         let output = DiscreteActionTensor {
@@ -333,49 +355,120 @@ impl<B: Backend, M: DiscreteActionModel<B>> Policy<B> for DQN<B, M> {
     fn state(&self) -> Self::PolicyState {
         DqnState {
             model: self.model.clone(),
-            _backend: PhantomData,
         }
     }
 
-    fn load_record(self, record: <Self::PolicyState as PolicyState<B>>::Record) -> Self {
-        let state = self.state().load_record(record);
+    fn to_device(self, device: &Device) -> Self {
         Self {
-            model: state.model,
-            _backend: PhantomData,
+            model: self.model.to_device(device),
         }
+    }
+
+    fn load_record(self, record: <Self::PolicyState as PolicyState>::Record) -> Self {
+        let state = self.state().load_record(record);
+        Self { model: state.model }
     }
 }
 
-#[derive(Record)]
-pub struct DqnLearningRecord<B: AutodiffBackend, M: AutodiffModule<B>, O: Optimizer<M, B>> {
-    policy_model: M::Record,
-    target_model: M::Record,
-    optimizer: O::Record,
+/// The learner state, persisted as a single burnpack checkpoint file.
+///
+/// It bundles the policy and target [`ModuleRecord`]s together with the optimizer
+/// [`OptimizerRecord`]. All three are device-free; the optimizer tensors are re-materialized on a
+/// device when the agent loads the record (see [`DqnLearningAgent::load_record`]).
+pub struct DqnLearningRecord {
+    policy_model: ModuleRecord,
+    target_model: ModuleRecord,
+    optimizer: OptimizerRecord,
+}
+
+/// Encode a little-endian `u64` length prefix followed by the bytes themselves.
+fn frame(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// Read a length-prefixed frame, returning the slice and advancing `offset`.
+fn unframe<'a>(data: &'a [u8], offset: &mut usize) -> Result<&'a [u8], RecordError> {
+    let header_end = *offset + 8;
+    if data.len() < header_end {
+        return Err(RecordError::Io(
+            "Corrupted checkpoint: missing length prefix.".to_string(),
+        ));
+    }
+    let len = u64::from_le_bytes(data[*offset..header_end].try_into().unwrap()) as usize;
+    let body_end = header_end + len;
+    if data.len() < body_end {
+        return Err(RecordError::Io(
+            "Corrupted checkpoint: truncated frame.".to_string(),
+        ));
+    }
+    *offset = body_end;
+    Ok(&data[header_end..body_end])
+}
+
+impl Checkpoint for DqnLearningRecord {
+    fn save(self, path: PathBuf) -> Result<(), CheckpointerError> {
+        let bytes = self
+            .checkpoint_into_bytes()
+            .map_err(CheckpointerError::Record)?;
+        std::fs::write(path, &*bytes).map_err(CheckpointerError::IOError)
+    }
+
+    fn load(path: PathBuf) -> Result<Self, CheckpointerError> {
+        let data = std::fs::read(path).map_err(CheckpointerError::IOError)?;
+        Self::checkpoint_from_bytes(Bytes::from_bytes_vec(data)).map_err(CheckpointerError::Record)
+    }
+
+    fn checkpoint_into_bytes(self) -> Result<Bytes, RecordError> {
+        let policy = self.policy_model.into_bytes()?;
+        let target = self.target_model.into_bytes()?;
+        let optimizer = self.optimizer.into_bytes()?;
+
+        let mut out = Vec::new();
+        frame(&mut out, &policy);
+        frame(&mut out, &target);
+        frame(&mut out, &optimizer);
+
+        Ok(Bytes::from_bytes_vec(out))
+    }
+
+    fn checkpoint_from_bytes(bytes: Bytes) -> Result<Self, RecordError> {
+        let mut offset = 0;
+
+        let policy = unframe(&bytes, &mut offset)?;
+        let policy_model = ModuleRecord::from_bytes(Bytes::from_bytes_vec(policy.to_vec()))?;
+
+        let target = unframe(&bytes, &mut offset)?;
+        let target_model = ModuleRecord::from_bytes(Bytes::from_bytes_vec(target.to_vec()))?;
+
+        let optimizer = unframe(&bytes, &mut offset)?;
+        let optimizer = OptimizerRecord::from_bytes(Bytes::from_bytes_vec(optimizer.to_vec()))?;
+
+        Ok(Self {
+            policy_model,
+            target_model,
+            optimizer,
+        })
+    }
 }
 
 #[derive(Clone)]
-pub struct DqnLearningAgent<B, M, O>
+pub struct DqnLearningAgent<M>
 where
-    B: AutodiffBackend,
-    M: DiscreteActionModel<B> + AutodiffModule<B> + TargetModel<B> + 'static,
-    M::InnerModule: DiscreteActionModel<B::InnerBackend> + TargetModel<B::InnerBackend>,
-    O: Optimizer<M, B> + 'static,
+    M: DiscreteActionModel + Module + TargetModel + 'static,
 {
     policy_model: M,
     target_model: M,
-    agent: EpsilonGreedyPolicy<B, DQN<B, M>>,
-    optimizer: O,
+    agent: EpsilonGreedyPolicy<DQN<M>>,
+    optimizer: ModuleOptimizer,
     config: DqnAgentConfig,
 }
 
-impl<B, M, O> DqnLearningAgent<B, M, O>
+impl<M> DqnLearningAgent<M>
 where
-    B: AutodiffBackend,
-    M: DiscreteActionModel<B> + AutodiffModule<B> + TargetModel<B> + 'static,
-    M::InnerModule: DiscreteActionModel<B::InnerBackend> + TargetModel<B::InnerBackend>,
-    O: Optimizer<M, B> + 'static,
+    M: DiscreteActionModel + Module + TargetModel + 'static,
 {
-    pub fn new(model: M, optimizer: O, config: DqnAgentConfig) -> Self {
+    pub fn new(model: M, optimizer: ModuleOptimizer, config: DqnAgentConfig) -> Self {
         let agent = EpsilonGreedyPolicy::new(
             DQN::new(model.clone()),
             config.epsilon_start,
@@ -393,50 +486,45 @@ where
 }
 
 #[derive(Clone)]
-pub struct SimpleTrainOutput<B: Backend> {
-    pub policy_model_loss: Tensor<B, 1>,
+pub struct SimpleTrainOutput {
+    pub policy_model_loss: Tensor<1>,
 }
 
-impl<B: Backend> ItemLazy for SimpleTrainOutput<B> {
-    type ItemSync = SimpleTrainOutput<Flex>;
-
-    fn sync(self) -> Self::ItemSync {
+impl ItemLazy for SimpleTrainOutput {
+    fn sync(self) -> Result<Self, burn::tensor::ExecutionError> {
         let [loss] = Transaction::default()
             .register(self.policy_model_loss)
             .execute()
             .try_into()
             .expect("Correct amount of tensor data");
 
-        let device = &Default::default();
+        let device = &Device::flex();
 
-        SimpleTrainOutput {
+        Ok(SimpleTrainOutput {
             policy_model_loss: Tensor::from_data(loss, device),
-        }
+        })
     }
 }
 
-impl<B: Backend> Adaptor<LossInput<B>> for SimpleTrainOutput<B> {
-    fn adapt(&self) -> LossInput<B> {
+impl Adaptor<LossInput> for SimpleTrainOutput {
+    fn adapt(&self) -> LossInput {
         LossInput::new(self.policy_model_loss.clone())
     }
 }
 
-impl<B, M, O> PolicyLearner<B> for DqnLearningAgent<B, M, O>
+impl<M> PolicyLearner for DqnLearningAgent<M>
 where
-    B: AutodiffBackend,
-    M: DiscreteActionModel<B> + AutodiffModule<B> + TargetModel<B> + 'static,
+    M: DiscreteActionModel + Module + TargetModel + 'static,
     M::Input: Clone,
-    M::InnerModule: DiscreteActionModel<B::InnerBackend> + TargetModel<B::InnerBackend>,
-    O: Optimizer<M, B> + 'static,
 {
-    type TrainContext = SimpleTrainOutput<B>;
-    type InnerPolicy = EpsilonGreedyPolicy<B, DQN<B, M>>;
-    type Record = DqnLearningRecord<B, M, O>;
+    type TrainContext = SimpleTrainOutput;
+    type InnerPolicy = EpsilonGreedyPolicy<DQN<M>>;
+    type Record = DqnLearningRecord;
 
     fn train(
         &mut self,
-        input: LearnerTransitionBatch<B, Self::InnerPolicy>,
-    ) -> RLTrainOutput<Self::TrainContext, <Self::InnerPolicy as Policy<B>>::PolicyState> {
+        input: LearnerTransitionBatch<Self::InnerPolicy>,
+    ) -> RLTrainOutput<Self::TrainContext, <Self::InnerPolicy as Policy>::PolicyState> {
         let states_batch = input.states;
         let next_states_batch = input.next_states;
         let actions_batch = input.actions.actions;
@@ -471,10 +559,10 @@ where
         self.target_model = self
             .target_model
             .soft_update(&self.policy_model, self.config.tau);
+
         let policy_update = EpsilonGreedyPolicyState::new(
             DqnState {
                 model: self.policy_model.clone(),
-                _backend: PhantomData,
             },
             self.agent.state().step,
         );
@@ -488,7 +576,11 @@ where
     }
 
     fn policy(&self) -> Self::InnerPolicy {
-        self.agent.clone()
+        let mut policy = self.agent.clone();
+        let mut inner_policy = policy.inner_policy();
+        inner_policy.set_model(policy.inner_policy().model().valid());
+        policy.set_inner_policy(inner_policy);
+        policy
     }
 
     fn update_policy(&mut self, update: Self::InnerPolicy) {
@@ -514,5 +606,9 @@ where
             optimizer,
             config: self.config,
         }
+    }
+
+    fn device(&self) -> Device {
+        self.policy_model.devices()[0].clone()
     }
 }

@@ -7,12 +7,12 @@ use std::{
     thread::spawn,
 };
 
-use burn_core::prelude::Backend;
+use burn_core::tensor::Device;
 
 use crate::{ActionContext, Batchable, Policy, PolicyState};
 
 #[derive(Clone)]
-struct PolicyInferenceServer<B: Backend, P: Policy<B>> {
+struct PolicyInferenceServer<P: Policy> {
     // `num_agents` used to make sure autobatching doesn't block the agents if they are less than the autobatch size.
     num_agents: Arc<AtomicUsize>,
     max_autobatch_size: usize,
@@ -21,10 +21,9 @@ struct PolicyInferenceServer<B: Backend, P: Policy<B>> {
     batch_logits: Vec<ForwardItem<P::Observation, P::ActionDistribution>>,
 }
 
-impl<B, P> PolicyInferenceServer<B, P>
+impl<P> PolicyInferenceServer<P>
 where
-    B: Backend,
-    P: Policy<B>,
+    P: Policy,
     P::Observation: Clone + Batchable,
     P::ActionDistribution: Clone + Batchable,
     P::Action: Clone + Batchable,
@@ -76,27 +75,38 @@ where
         if self.len_actions() == 0 {
             return;
         }
-        let input: Vec<_> = self
-            .batch_action
-            .iter()
-            .map(|m| m.inference_state.clone())
-            .collect();
-        // Only deterministic if all actions are requested as deterministic.
-        let deterministic = self.batch_action.iter().all(|item| item.deterministic);
-        let (actions, context) = self
-            .inner_policy
-            .action(P::Observation::batch(input), deterministic);
-        let actions: Vec<_> = actions.unbatch();
+        let batch_action = core::mem::take(&mut self.batch_action);
+        let first_deterministic = batch_action[0].deterministic;
 
-        for (i, item) in self.batch_action.iter().enumerate() {
-            item.sender
-                .send(ActionContext {
-                    context: vec![context[i].clone()],
-                    action: actions[i].clone(),
-                })
-                .expect("Autobatcher should be able to send resulting actions.");
+        // Keep each request's deterministic mode while retaining autobatching within each group.
+        // Process the first queued mode first to avoid unnecessarily reordering policy calls.
+        for deterministic in [first_deterministic, !first_deterministic] {
+            let (indices, input): (Vec<_>, Vec<_>) = batch_action
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item.deterministic == deterministic)
+                .map(|(index, item)| (index, item.inference_state.clone()))
+                .unzip();
+
+            if input.is_empty() {
+                continue;
+            }
+
+            let (actions, context) = self
+                .inner_policy
+                .action(P::Observation::batch(input), deterministic);
+            let actions: Vec<_> = actions.unbatch();
+
+            for (group_index, item_index) in indices.into_iter().enumerate() {
+                batch_action[item_index]
+                    .sender
+                    .send(ActionContext {
+                        context: vec![context[group_index].clone()],
+                        action: actions[group_index].clone(),
+                    })
+                    .expect("Autobatcher should be able to send resulting actions.");
+            }
         }
-        self.batch_action.clear();
     }
 
     pub fn flush_logits(&mut self) {
@@ -128,6 +138,10 @@ where
         self.inner_policy.update(policy_update);
     }
 
+    pub fn policy_to_device(&mut self, device: &Device) {
+        self.inner_policy = self.inner_policy.clone().to_device(device);
+    }
+
     pub fn state(&self) -> P::PolicyState {
         self.inner_policy.state()
     }
@@ -157,10 +171,11 @@ where
     }
 }
 
-enum InferenceMessage<B: Backend, P: Policy<B>> {
+enum InferenceMessage<P: Policy> {
     ActionMessage(ActionItem<P::Observation, P::Action, P::ActionContext>),
     ForwardMessage(ForwardItem<P::Observation, P::ActionDistribution>),
     PolicyUpdate(P::PolicyState),
+    ToDevice(Device),
     PolicyRequest(Sender<P::PolicyState>),
     IncrementAgents(usize),
     DecrementAgents(usize),
@@ -181,14 +196,13 @@ struct ForwardItem<S, O> {
 
 /// An asynchronous policy using an inference server with autobatching.
 #[derive(Clone)]
-pub struct AsyncPolicy<B: Backend, P: Policy<B>> {
-    inference_state_sender: Sender<InferenceMessage<B, P>>,
+pub struct AsyncPolicy<P: Policy> {
+    inference_state_sender: Sender<InferenceMessage<P>>,
 }
 
-impl<B, P> AsyncPolicy<B, P>
+impl<P> AsyncPolicy<P>
 where
-    B: Backend,
-    P: Policy<B> + Clone + Send + 'static,
+    P: Policy + Clone + Send + 'static,
     P::ActionContext: Clone + Send,
     P::PolicyState: Send,
     P::Observation: Clone + Send + Batchable,
@@ -211,6 +225,7 @@ where
                         InferenceMessage::ActionMessage(item) => autobatcher.push_action(item),
                         InferenceMessage::ForwardMessage(item) => autobatcher.push_logits(item),
                         InferenceMessage::PolicyUpdate(update) => autobatcher.update_policy(update),
+                        InferenceMessage::ToDevice(device) => autobatcher.policy_to_device(&device),
                         InferenceMessage::PolicyRequest(sender) => sender
                             .send(autobatcher.state())
                             .expect("Autobatcher should be able to send current policy state."),
@@ -245,10 +260,9 @@ where
     }
 }
 
-impl<B, P> Policy<B> for AsyncPolicy<B, P>
+impl<P> Policy for AsyncPolicy<P>
 where
-    B: Backend,
-    P: Policy<B> + Send + 'static,
+    P: Policy + Send + 'static,
 {
     type ActionContext = P::ActionContext;
     type PolicyState = P::PolicyState;
@@ -307,29 +321,111 @@ where
             .expect("AsyncPolicy should be able to receive policy state.")
     }
 
-    fn load_record(self, _record: <Self::PolicyState as PolicyState<B>>::Record) -> Self {
-        // Not needed for now
-        todo!()
+    fn to_device(self, device: &Device) -> Self {
+        self.inference_state_sender
+            .send(InferenceMessage::ToDevice(device.clone()))
+            .expect("AsyncPolicy should be able to send policy state.");
+        self
+    }
+
+    fn load_record(self, _record: <Self::PolicyState as PolicyState>::Record) -> Self {
+        unimplemented!(
+            "Not implemented yet. Please load the record on the inner policy before creating an async policy."
+        )
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::needless_range_loop)]
 mod tests {
+    use std::sync::Mutex;
     use std::thread::JoinHandle;
     use std::time::Duration;
 
-    use crate::TestBackend;
-    use crate::tests::{MockAction, MockObservation, MockPolicy};
+    use crate::tests::{
+        MockAction, MockActionDistribution, MockObservation, MockPolicy, MockPolicyState,
+    };
 
     use super::*;
 
+    type PolicyCalls = Arc<Mutex<Vec<(bool, Vec<f32>)>>>;
+
+    #[derive(Clone)]
+    struct TrackingContext(i32);
+
+    #[derive(Clone)]
+    struct TrackingPolicy {
+        calls: PolicyCalls,
+        inner: MockPolicy,
+    }
+
+    impl TrackingPolicy {
+        fn new(calls: PolicyCalls) -> Self {
+            Self {
+                calls,
+                inner: MockPolicy::new(),
+            }
+        }
+    }
+
+    impl Policy for TrackingPolicy {
+        type Observation = MockObservation;
+        type ActionDistribution = MockActionDistribution;
+        type Action = MockAction;
+        type ActionContext = TrackingContext;
+        type PolicyState = MockPolicyState;
+
+        fn forward(&mut self, obs: Self::Observation) -> Self::ActionDistribution {
+            self.inner.forward(obs)
+        }
+
+        fn action(
+            &mut self,
+            obs: Self::Observation,
+            deterministic: bool,
+        ) -> (Self::Action, Vec<Self::ActionContext>) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((deterministic, obs.0.clone()));
+
+            let offset = if deterministic { 100 } else { 0 };
+            let contexts = obs
+                .0
+                .iter()
+                .map(|value| TrackingContext(*value as i32))
+                .collect();
+            let actions = obs
+                .0
+                .into_iter()
+                .map(|value| MockAction(vec![value as i32 + offset]))
+                .collect();
+
+            (MockAction::batch(actions), contexts)
+        }
+
+        fn update(&mut self, update: Self::PolicyState) {
+            self.inner.update(update);
+        }
+
+        fn state(&self) -> Self::PolicyState {
+            self.inner.state()
+        }
+
+        fn to_device(mut self, device: &Device) -> Self {
+            self.inner = self.inner.to_device(device);
+            self
+        }
+
+        fn load_record(mut self, record: <Self::PolicyState as PolicyState>::Record) -> Self {
+            self.inner = self.inner.load_record(record);
+            self
+        }
+    }
+
     #[test]
     fn test_multiple_actions_before_flush() {
-        fn launch_thread(
-            policy: &AsyncPolicy<TestBackend, MockPolicy>,
-            handles: &mut Vec<JoinHandle<()>>,
-        ) {
+        fn launch_thread(policy: &AsyncPolicy<MockPolicy>, handles: &mut Vec<JoinHandle<()>>) {
             let mut thread_policy = policy.clone();
             let handle = spawn(move || {
                 thread_policy.action(MockObservation(vec![0.]), false);
@@ -367,10 +463,7 @@ mod tests {
 
     #[test]
     fn test_multiple_forward_before_flush() {
-        fn launch_thread(
-            policy: &AsyncPolicy<TestBackend, MockPolicy>,
-            handles: &mut Vec<JoinHandle<()>>,
-        ) {
+        fn launch_thread(policy: &AsyncPolicy<MockPolicy>, handles: &mut Vec<JoinHandle<()>>) {
             let mut thread_policy = policy.clone();
             let handle = spawn(move || {
                 thread_policy.forward(MockObservation(vec![0.]));
@@ -409,7 +502,7 @@ mod tests {
     #[test]
     fn test_async_policy_deterministic_behaviour() {
         fn launch_thread(
-            policy: &AsyncPolicy<TestBackend, MockPolicy>,
+            policy: &AsyncPolicy<MockPolicy>,
             handles: &mut Vec<JoinHandle<MockAction>>,
             deterministic: bool,
         ) {
@@ -427,26 +520,57 @@ mod tests {
         let mut handles = vec![];
         launch_thread(&policy, &mut handles, true);
         launch_thread(&policy, &mut handles, false);
-        for _ in 0..2 {
-            let action = handles.pop().unwrap().join().unwrap();
-            assert_eq!(action.0, vec![0]);
-        }
+        let deterministic_action = handles.remove(0).join().unwrap();
+        let stochastic_action = handles.remove(0).join().unwrap();
+        assert_eq!(deterministic_action.0, vec![1]);
+        assert_eq!(stochastic_action.0, vec![0]);
 
-        let mut handles = vec![];
-        launch_thread(&policy, &mut handles, true);
-        launch_thread(&policy, &mut handles, true);
-        for _ in 0..2 {
-            let action = handles.pop().unwrap().join().unwrap();
-            assert_eq!(action.0, vec![1]);
+        for deterministic in [false, true] {
+            let mut handles = vec![];
+            launch_thread(&policy, &mut handles, deterministic);
+            launch_thread(&policy, &mut handles, deterministic);
+            for _ in 0..2 {
+                let action = handles.pop().unwrap().join().unwrap();
+                assert_eq!(action.0, vec![i32::from(deterministic)]);
+            }
         }
     }
 
     #[test]
+    fn test_action_batch_preserves_request_mapping_and_group_order() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut server = PolicyInferenceServer::new(4, TrackingPolicy::new(calls.clone()));
+        server.increment_agents(1000);
+
+        let requests = [(10., true), (20., false), (30., true), (40., false)];
+        let mut receivers = Vec::new();
+        for (value, deterministic) in requests {
+            let (sender, receiver) = mpsc::channel();
+            receivers.push(receiver);
+            server.push_action(ActionItem {
+                sender,
+                inference_state: MockObservation(vec![value]),
+                deterministic,
+            });
+        }
+
+        let results: Vec<_> = receivers
+            .into_iter()
+            .map(|receiver| {
+                let result = receiver.recv().unwrap();
+                (result.action.0[0], result.context[0].0)
+            })
+            .collect();
+        assert_eq!(results, vec![(110, 10), (20, 20), (130, 30), (40, 40)]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(true, vec![10., 30.]), (false, vec![20., 40.])]
+        );
+    }
+
+    #[test]
     fn flush_when_running_agents_smaller_than_autobatch_size() {
-        fn launch_thread(
-            policy: &AsyncPolicy<TestBackend, MockPolicy>,
-            handles: &mut Vec<JoinHandle<()>>,
-        ) {
+        fn launch_thread(policy: &AsyncPolicy<MockPolicy>, handles: &mut Vec<JoinHandle<()>>) {
             let mut thread_policy = policy.clone();
             let handle = spawn(move || {
                 thread_policy.action(MockObservation(vec![0.]), false);

@@ -7,7 +7,7 @@ edition.workspace = true
 keywords = ["deep-learning", "machine-learning", "gpu"]
 license.workspace = true
 name = "burn-cubecl"
-readme.workspace = true
+readme = "README.md"
 repository = "https://github.com/tracel-ai/burn/tree/main/crates/burn-cubecl"
 version.workspace = true
 
@@ -30,8 +30,23 @@ std = [
     "burn-fusion?/std",
     "burn-cubecl-fusion?/std",
 ]
-doc = ["default"]
-memory-checks = ["burn-fusion?/memory-checks"]
+doc = ["default", "wgpu", "fft"]
+# Native FFT kernels, enabled by burn-signal.
+fft = ["cubek/fft"]
+
+# The runtime to compile against. A backend no longer carries its runtime in its type, but
+# `cubecl::Device` — and through it `CubeBackend` — exists only once at least one runtime is
+# compiled in, so a build of this crate has to name one. The runtime crates (`burn-cuda`,
+# `burn-wgpu`, `burn-rocm`, `burn-cpu`) each turn one on for their own dependents; these are here
+# so that this crate also builds, and documents, on its own. `doc` picks wgpu as the portable one.
+cuda = ["cubecl/cuda", "burn-backend/cubecl-cuda"]
+hip = ["cubecl/hip", "burn-backend/cubecl-hip"]
+cpu = ["cubecl/cpu", "burn-backend/cubecl-cpu"]
+wgpu = ["cubecl/wgpu", "burn-backend/cubecl-wgpu"]
+metal = ["wgpu", "cubecl/metal", "burn-backend/cubecl-metal"]
+vulkan = ["wgpu", "cubecl/vulkan", "burn-backend/cubecl-vulkan"]
+webgpu = ["wgpu", "cubecl/webgpu", "burn-backend/cubecl-webgpu"]
+
 tracing = [
     "dep:tracing",
     "cubecl/tracing",
@@ -53,32 +68,30 @@ fusion-experimental = ["fusion"]
 
 template = []
 
-distributed = [
-    "std",
-    "burn-backend/distributed",
-    "burn-fusion?/distributed",
-]
 
 [dependencies]
 burn-cubecl-fusion = { workspace = true, optional = true }
 burn-fusion = { workspace = true, optional = true }
 burn-ir = { workspace = true }
-burn-std = { workspace = true, features = [
-    "cubecl",
-] }
+burn-std = { workspace = true }
 burn-backend = { workspace = true, features = [
     "cubecl",
+    # `CubeBackend`'s device *is* `cubecl::Device`, so it has to be a burn device.
+    "cubecl-device",
 ] }
 cubecl = { workspace = true, features = ["stdlib"] }
 cubek = { workspace = true, features = [
     "attention",
     "matmul",
+    "matmul-multi-level",
+    "matmul-tiled",
     "convolution",
+    "interpolate",
+    "pool",
     "reduce",
     "random",
     "quantization",
     "stdlib",
-    "fft",
 ] }
 tracing = { workspace = true, features = ["attributes"], optional = true }
 
@@ -91,6 +104,9 @@ futures-lite = { workspace = true, features = ["std"] }
 # Template
 serde = { workspace = true }
 text_placeholder = { workspace = true, features = ["struct_context"] }
+
+[dev-dependencies]
+cubecl = { workspace = true, features = ["test-runtime"] }
 
 [package.metadata.docs.rs]
 features = ["doc"]

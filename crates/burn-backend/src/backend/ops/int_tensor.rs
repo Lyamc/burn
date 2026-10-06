@@ -1,11 +1,12 @@
 use super::cat::cat_with_slice_assign;
 use super::repeat_dim::repeat_with_slice_assign;
 use super::sort::{argsort, sort, sort_with_indices};
-use crate::tensor::{BoolTensor, Device, FloatTensor, Int, IntElem, IntTensor};
-use crate::{Backend, Distribution, TensorData, TensorMetadata, element::ElementConversion};
-use crate::{ExecutionError, Scalar, get_device_settings};
+use crate::tensor::{BoolTensor, Device, FloatTensor, IntTensor};
+use crate::{Backend, Distribution, TensorData, TensorMetadata};
+use crate::{ExecutionError, Scalar, get_or_init_device_settings};
 use alloc::vec::Vec;
-use burn_std::{BoolDType, FloatDType, IntDType, Shape, Slice};
+use burn_std::reader::try_read_sync;
+use burn_std::{BoolDType, FloatDType, IndexingUpdateOp, IntDType, PadMode, Shape, Slice};
 use core::ops::Range;
 
 /// Int Tensor API for basic and numeric operations, see
@@ -50,17 +51,6 @@ pub trait IntTensorOps<B: Backend> {
     ///
     /// The tensor with the data.
     fn int_from_data(data: TensorData, device: &Device<B>) -> IntTensor<B>;
-
-    /// Gets the device of the tensor.
-    ///
-    /// # Arguments
-    ///
-    /// * `tensor` - The tensor.
-    ///
-    /// # Returns
-    ///
-    /// The device of the tensor.
-    fn int_device(tensor: &IntTensor<B>) -> Device<B>;
 
     /// Moves the tensor to the given device.
     fn int_to_device(tensor: IntTensor<B>, device: &Device<B>) -> IntTensor<B>;
@@ -159,6 +149,38 @@ pub trait IntTensorOps<B: Backend> {
     /// The tensor with the values filled.
     fn int_mask_fill(tensor: IntTensor<B>, mask: BoolTensor<B>, value: Scalar) -> IntTensor<B>;
 
+    /// Selects the elements of the tensor where the mask is true, returned as a 1D tensor.
+    ///
+    /// The elements are collected in row-major order. Because the number of selected elements
+    /// depends on the mask values, the output shape is data-dependent: computing it may require
+    /// synchronizing with the device, which is why this operation is asynchronous.
+    ///
+    /// # Arguments
+    ///
+    /// * `tensor` - The tensor to select from.
+    /// * `mask` - The boolean mask, with the same shape as the tensor.
+    ///
+    /// # Returns
+    ///
+    /// A 1D tensor containing the selected elements.
+    fn int_mask_select(
+        tensor: IntTensor<B>,
+        mask: BoolTensor<B>,
+    ) -> impl Future<Output = IntTensor<B>> + 'static + Send {
+        async move {
+            // Data-dependent output length, so we defer to `bool_argwhere` (the only pre-existing
+            // data-dependent op) to collect the flat indices of the true mask values, then select.
+            let n = mask.shape().num_elements();
+            let int_dtype = get_or_init_device_settings::<B>(&mask.device()).int_dtype;
+            let mask = B::bool_reshape(mask, Shape::new([n]));
+            let indices = B::bool_argwhere(mask, int_dtype).await; // [count, 1]
+            let count = indices.shape()[0];
+            let indices = B::int_reshape(indices, Shape::new([count])); // squeeze to [count]
+            let tensor = B::int_reshape(tensor, Shape::new([n]));
+            B::int_select(tensor, 0, indices)
+        }
+    }
+
     /// Gather elements from the tensor at the given indices.
     ///
     /// # Arguments
@@ -168,23 +190,13 @@ pub trait IntTensorOps<B: Backend> {
     /// * `indices` - The indices.
     fn int_gather(dim: usize, tensor: IntTensor<B>, indices: IntTensor<B>) -> IntTensor<B>;
 
-    /// Scatter a given value to the tensor at the given indices using sum reduction.
-    ///
-    /// # Arguments
-    ///
-    /// * `dim` - The dimension to scatter to.
-    /// * `tensor` - The tensor.
-    /// * `indices` - The indices.
-    /// * `value` - The value.
-    ///
-    /// # Returns
-    ///
-    /// The tensor with the values scattered.
-    fn int_scatter_add(
+    /// Scatter elements into a tensor using the specified update operation.
+    fn int_scatter(
         dim: usize,
         tensor: IntTensor<B>,
         indices: IntTensor<B>,
         value: IntTensor<B>,
+        update: IndexingUpdateOp,
     ) -> IntTensor<B>;
 
     /// Multi-dimensional scatter for int tensors.
@@ -215,24 +227,13 @@ pub trait IntTensorOps<B: Backend> {
     /// The tensor with the selected elements.
     fn int_select(tensor: IntTensor<B>, dim: usize, indices: IntTensor<B>) -> IntTensor<B>;
 
-    /// Assign the selected elements along the given dimension corresponding to the given indices
-    /// to the given value using sum reduction.
-    ///
-    /// # Arguments
-    ///
-    /// * `tensor` - The tensor.
-    /// * `dim` - The dimension to select from.
-    /// * `indices` - The indices.
-    /// * `value` - The value.
-    ///
-    /// # Returns
-    ///
-    /// The tensor with the selected elements assigned to the given value.
-    fn int_select_add(
+    /// Assign selected elements along a dimension using the specified update operation.
+    fn int_select_assign(
         tensor: IntTensor<B>,
         dim: usize,
         indices: IntTensor<B>,
         value: IntTensor<B>,
+        update: IndexingUpdateOp,
     ) -> IntTensor<B>;
 
     /// Repeats the tensor along the given dimension the given number of times.
@@ -247,7 +248,15 @@ pub trait IntTensorOps<B: Backend> {
     ///
     /// The tensor with the given dimension repeated the given number of times.
     fn int_repeat_dim(tensor: IntTensor<B>, dim: usize, times: usize) -> IntTensor<B> {
-        repeat_with_slice_assign::<B, Int>(tensor, dim, times)
+        let device = tensor.device();
+        repeat_with_slice_assign::<B, _, _, _>(
+            tensor,
+            dim,
+            times,
+            device,
+            |shape, device, dtype| B::int_empty(shape, device, dtype.into()),
+            B::int_slice_assign,
+        )
     }
 
     /// Concatenates the given tensors along the given dimension.
@@ -267,7 +276,15 @@ pub trait IntTensorOps<B: Backend> {
     /// high-level tensor API and will not be passed to this method. Backend implementations do
     /// not need to handle empty tensors.
     fn int_cat(tensors: Vec<IntTensor<B>>, dim: usize) -> IntTensor<B> {
-        cat_with_slice_assign::<B, Int>(tensors, dim)
+        let first_tensor = tensors.first().expect("Tensors should not be empty");
+        let device = first_tensor.device();
+        cat_with_slice_assign::<B, _, _, _>(
+            tensors,
+            dim,
+            device,
+            |shape, device, dtype| B::int_empty(shape, device, dtype.into()),
+            B::int_slice_assign,
+        )
     }
 
     /// Element-wise equality comparison.
@@ -467,6 +484,19 @@ pub trait IntTensorOps<B: Backend> {
     /// The result of the addition.
     fn int_add_scalar(lhs: IntTensor<B>, rhs: Scalar) -> IntTensor<B>;
 
+    /// Element-wise square with a IntTensor.
+    ///
+    /// # Arguments
+    ///
+    /// * `tensor` - The IntTensor.
+    ///
+    /// # Returns
+    ///
+    /// The element-wise square of `tensor`.
+    fn int_square(tensor: IntTensor<B>) -> IntTensor<B> {
+        Self::int_powi_scalar(tensor, Scalar::from(2))
+    }
+
     /// Element-wise power with a IntTensor.
     ///
     /// # Arguments
@@ -479,7 +509,7 @@ pub trait IntTensorOps<B: Backend> {
     /// The elements of `lhs` raised to the power of the elements of `rhs`.
     fn int_powi(lhs: IntTensor<B>, rhs: IntTensor<B>) -> IntTensor<B> {
         let dtype = lhs.dtype();
-        let float_dtype = get_device_settings::<B>(&B::int_device(&lhs)).float_dtype;
+        let float_dtype = get_or_init_device_settings::<B>(&lhs.device()).float_dtype;
         B::float_into_int(
             B::float_powi(B::int_into_float(lhs, float_dtype), rhs),
             dtype.into(),
@@ -509,7 +539,7 @@ pub trait IntTensorOps<B: Backend> {
     fn int_powi_scalar(lhs: IntTensor<B>, rhs: Scalar) -> IntTensor<B> {
         let exp = rhs.elem::<i32>();
         match exp {
-            0 => Self::int_ones(lhs.shape(), &B::int_device(&lhs), lhs.dtype().into()),
+            0 => Self::int_ones(lhs.shape(), &lhs.device(), lhs.dtype().into()),
             1 => lhs,
             2 => Self::int_mul(lhs.clone(), lhs),
             _ => Self::int_powi_scalar_impl(lhs, rhs),
@@ -542,7 +572,7 @@ pub trait IntTensorOps<B: Backend> {
     /// The elements of `lhs` raised to the value of `rhs`.
     fn int_powi_scalar_impl(lhs: IntTensor<B>, rhs: Scalar) -> IntTensor<B> {
         let dtype = lhs.dtype();
-        let float_dtype = get_device_settings::<B>(&B::int_device(&lhs)).float_dtype;
+        let float_dtype = get_or_init_device_settings::<B>(&lhs.device()).float_dtype;
         B::float_into_int(
             B::float_powi_scalar_impl(B::int_into_float(lhs, float_dtype), rhs),
             dtype.into(),
@@ -560,7 +590,7 @@ pub trait IntTensorOps<B: Backend> {
     ///
     /// The clamped tensor.
     fn int_clamp_min(tensor: IntTensor<B>, min: Scalar) -> IntTensor<B> {
-        let dtype = get_device_settings::<B>(&B::int_device(&tensor)).bool_dtype;
+        let dtype = get_or_init_device_settings::<B>(&tensor.device()).bool_dtype;
         let mask = Self::int_lower_elem(tensor.clone(), min, dtype);
         Self::int_mask_fill(tensor, mask, min)
     }
@@ -576,7 +606,7 @@ pub trait IntTensorOps<B: Backend> {
     ///
     /// The clamped tensor.
     fn int_clamp_max(tensor: IntTensor<B>, max: Scalar) -> IntTensor<B> {
-        let dtype = get_device_settings::<B>(&B::int_device(&tensor)).bool_dtype;
+        let dtype = get_or_init_device_settings::<B>(&tensor.device()).bool_dtype;
         let mask = Self::int_greater_elem(tensor.clone(), max, dtype);
         Self::int_mask_fill(tensor, mask, max)
     }
@@ -668,26 +698,44 @@ pub trait IntTensorOps<B: Backend> {
     /// The result of the division.
     fn int_div_scalar(lhs: IntTensor<B>, rhs: Scalar) -> IntTensor<B>;
 
-    /// Element-wise modulus.
+    /// Element-wise floor modulo.
+    ///
+    /// A nonzero result has the same sign as the divisor and a magnitude less than
+    /// the divisor's magnitude.
+    ///
+    /// # Portability
+    ///
+    /// Portable behavior requires a nonzero divisor and excludes signed `MIN % -1`,
+    /// where `MIN` is the minimum value of the operand dtype. For these excluded
+    /// inputs, no particular result or error behavior is guaranteed across backends.
     ///
     /// # Arguments
-    /// * `lhs` - The left-hand side tensor.
-    /// * `rhs` - The right-hand side scalar.
+    /// * `lhs` - The dividend tensor.
+    /// * `rhs` - The divisor tensor.
     ///
     /// # Returns
     ///
-    /// The result of applying the modulus of the scalar to the tensor.
+    /// The element-wise floor modulo of `lhs` by `rhs`.
     fn int_remainder(lhs: IntTensor<B>, rhs: IntTensor<B>) -> IntTensor<B>;
 
-    /// Element-wise modulus with a scalar.
+    /// Element-wise floor modulo with a scalar.
+    ///
+    /// A nonzero result has the same sign as the divisor and a magnitude less than
+    /// the divisor's magnitude.
+    ///
+    /// # Portability
+    ///
+    /// Portable behavior requires a nonzero divisor and excludes signed `MIN % -1`,
+    /// where `MIN` is the minimum value of the operand dtype. For these excluded
+    /// inputs, no particular result or error behavior is guaranteed across backends.
     ///
     /// # Arguments
-    /// * `lhs` - The left-hand side tensor.
-    /// * `rhs` - The right-hand side scalar.
+    /// * `lhs` - The dividend tensor.
+    /// * `rhs` - The scalar divisor.
     ///
     /// # Returns
     ///
-    /// The result of applying the modulus of the scalar to the tensor.
+    /// The element-wise floor modulo of `lhs` by `rhs`.
     fn int_remainder_scalar(lhs: IntTensor<B>, rhs: Scalar) -> IntTensor<B>;
 
     /// Multiplies two tensors together using matrix multiplication.
@@ -917,7 +965,12 @@ pub trait IntTensorOps<B: Backend> {
     /// # Returns
     ///
     /// The indices of the maximum elements along the dimension.
-    fn int_argtopk(tensor: IntTensor<B>, dim: usize, k: usize) -> IntTensor<B>;
+    fn int_argtopk(tensor: IntTensor<B>, dim: usize, k: usize) -> IntTensor<B> {
+        let device = &tensor.device();
+        let dtype = get_or_init_device_settings::<B>(device).int_dtype;
+        let k_indices = B::int_arange(0..k as i64, device, dtype);
+        Self::int_select(Self::int_argsort(tensor, dim, true), dim, k_indices)
+    }
 
     /// Gets the values of the k maximum elements along a dimension.
     /// # Arguments
@@ -930,10 +983,43 @@ pub trait IntTensorOps<B: Backend> {
     ///
     /// The values of the maximum elements along the dimension.
     fn int_topk(tensor: IntTensor<B>, dim: usize, k: usize) -> IntTensor<B> {
-        let device = Self::int_device(&tensor);
-        let dtype = get_device_settings::<B>(&device).int_dtype;
-        let k_indices = Self::int_arange(0..k as i64, &device, dtype);
+        let device = &tensor.device();
+        let dtype = get_or_init_device_settings::<B>(device).int_dtype;
+        let k_indices = Self::int_arange(0..k as i64, device, dtype);
         Self::int_select(Self::int_sort(tensor, dim, true), dim, k_indices)
+    }
+
+    /// Gets the values of the k maximum elements along a dimension, and their indices.
+    ///
+    /// # Arguments
+    ///
+    /// * `tensor` - The tensor to get the maximum values of.
+    /// * `dim` - The dimension to get the maximum values along.
+    /// * `k` - number of maximum elements.
+    ///
+    /// # Returns
+    ///
+    /// A tuple with the values of the k maximum elements along the dimension, and their indices.
+    ///
+    /// The default sorts once and keeps the first `k` of each half. It deliberately does not
+    /// compose `int_topk` with `int_argtopk`: those default to a sort each, so that would sort
+    /// twice, and `int_argtopk` has no default at all, so backends that only sort could not
+    /// serve this. Backends whose top-k already carries both results should override this and
+    /// produce them in a single pass.
+    fn int_topk_with_indices(
+        tensor: IntTensor<B>,
+        dim: usize,
+        k: usize,
+    ) -> (IntTensor<B>, IntTensor<B>) {
+        let device = tensor.device();
+        let dtype = get_or_init_device_settings::<B>(&device).int_dtype;
+        let k_indices = Self::int_arange(0..k as i64, &device, dtype);
+        let (values, indices) = Self::int_sort_with_indices(tensor, dim, true);
+
+        (
+            Self::int_select(values, dim, k_indices.clone()),
+            Self::int_select(indices, dim, k_indices),
+        )
     }
 
     /// Gets the indices of the minimum elements along a dimension.
@@ -1169,10 +1255,7 @@ pub trait IntTensorOps<B: Backend> {
         device: &Device<B>,
         dtype: IntDType,
     ) -> IntTensor<B> {
-        let value = range
-            .step_by(step)
-            .map(|i| i.elem())
-            .collect::<Vec<IntElem<B>>>();
+        let value = range.step_by(step).collect::<Vec<_>>();
         let shape = Shape::new([value.len()]);
         let data = TensorData::new(value, shape).convert_dtype(dtype.into());
         B::int_from_data(data, device)
@@ -1222,7 +1305,7 @@ pub trait IntTensorOps<B: Backend> {
     ///
     /// # Returns
     ///
-    /// A boolean tensor `Tensor<B, D, Bool>` with the same size as input `tensor`, except in the `dim` axis
+    /// A boolean tensor primitive with the same size as input `tensor`, except in the `dim` axis
     /// where the size is 1. The elem in the `dim` axis is True if any element along this dim in the input
     /// evaluates to True, False otherwise.
     fn int_any_dim(tensor: IntTensor<B>, dim: usize, out_dtype: BoolDType) -> BoolTensor<B> {
@@ -1242,7 +1325,7 @@ pub trait IntTensorOps<B: Backend> {
     ///
     /// # Returns
     ///
-    /// A boolean tensor `Tensor<B, 1, Bool>` with a single element, True if all elements in the input tensor
+    /// A boolean tensor primitive with a single element, True if all elements in the input tensor
     /// evaluate to True, False otherwise.
     fn int_all(tensor: IntTensor<B>, out_dtype: BoolDType) -> BoolTensor<B> {
         let int_dtype = tensor.dtype();
@@ -1263,7 +1346,7 @@ pub trait IntTensorOps<B: Backend> {
     ///
     /// # Returns
     ///
-    /// A boolean tensor `Tensor<B, D, Bool>` with the same size as input `tensor`, except in the `dim` axis
+    /// A boolean tensor primitive with the same size as input `tensor`, except in the `dim` axis
     /// where the size is 1. The elem in the `dim` axis is True if all elements along this dim in the input
     /// evaluates to True, False otherwise.
     fn int_all_dim(tensor: IntTensor<B>, dim: usize, out_dtype: BoolDType) -> BoolTensor<B> {
@@ -1286,9 +1369,9 @@ pub trait IntTensorOps<B: Backend> {
     /// A tensor with the same shape as `tensor` containing the signs of the elements of `tensor`.
     fn int_sign(tensor: IntTensor<B>) -> IntTensor<B> {
         let dtype = tensor.dtype();
-        let device = B::int_device(&tensor);
-        let bool_dtype = get_device_settings::<B>(&B::int_device(&tensor)).bool_dtype;
-        let zeros = B::int_zeros(tensor.shape(), &device, dtype.into());
+        let device = &tensor.device();
+        let bool_dtype = get_or_init_device_settings::<B>(&tensor.device()).bool_dtype;
+        let zeros = B::int_zeros(tensor.shape(), device, dtype.into());
         let less_than_zero = B::int_lower_elem(tensor.clone(), 0.into(), bool_dtype);
         let greater_than_zero = B::int_greater_elem(tensor, 0.into(), bool_dtype);
 
@@ -1314,7 +1397,20 @@ pub trait IntTensorOps<B: Backend> {
     ///
     /// A tensor with the same shape as the input tensor, where the elements are sorted by value.
     fn int_sort(tensor: IntTensor<B>, dim: usize, descending: bool) -> IntTensor<B> {
-        sort::<B, Int>(tensor, dim, descending)
+        let device = tensor.device();
+        sort::<B, _, _, _>(
+            tensor,
+            dim,
+            descending,
+            device,
+            |tensor| {
+                let msg = "Failed to synchronously read tensor data. This operation is not supported until this backend has a GPU sorting implementation.";
+                try_read_sync(B::int_into_data(tensor))
+                    .expect(msg)
+                    .expect(msg)
+            },
+            |data, device, _dtype| B::int_from_data(data, device),
+        )
     }
 
     /// Sort the elements of the input `tensor` by value along a given dimension.
@@ -1336,7 +1432,21 @@ pub trait IntTensorOps<B: Backend> {
         descending: bool,
     ) -> (IntTensor<B>, IntTensor<B>) {
         let dtype = tensor.dtype();
-        sort_with_indices::<B, Int>(tensor, dim, descending, dtype.into())
+        let device = tensor.device();
+        sort_with_indices::<B, _, _, _>(
+            tensor,
+            dim,
+            descending,
+            dtype.into(),
+            device,
+            |tensor| {
+                let msg = "Failed to synchronously read tensor data. This operation is not supported until this backend has a GPU sorting implementation.";
+                try_read_sync(B::int_into_data(tensor))
+                    .expect(msg)
+                    .expect(msg)
+            },
+            |data, device, _dtype| B::int_from_data(data, device),
+        )
     }
 
     /// Returns the indices that sort the elements of the input `tensor` by value
@@ -1355,7 +1465,13 @@ pub trait IntTensorOps<B: Backend> {
     /// A tensor with the same shape as the input tensor the indices map back to the original input tensor.
     fn int_argsort(tensor: IntTensor<B>, dim: usize, descending: bool) -> IntTensor<B> {
         let dtype = tensor.dtype();
-        argsort::<B, Int>(tensor, dim, descending, dtype.into())
+        let device = tensor.device();
+        argsort::<B, _, _>(tensor, dim, descending, dtype.into(), device, |tensor| {
+            let msg = "Failed to synchronously read tensor data. This operation is not supported until this backend has a GPU sorting implementation.";
+            try_read_sync(B::int_into_data(tensor))
+                .expect(msg)
+                .expect(msg)
+        })
     }
 
     /// Bitwise AND operation for Int Tensors
@@ -1408,7 +1524,8 @@ pub trait IntTensorOps<B: Backend> {
     /// Returns a view of the tensor with all complete windows of size `size` in dimension `dim`;
     /// where windows are advanced by `step` at each index.
     ///
-    /// The number of windows is `max(0, (shape[dim] - size).ceil_div(step))`.
+    /// The number of windows is `0` when `shape[dim] < size`, and otherwise
+    /// `(shape[dim] - size) / step + 1`.
     ///
     /// # Arguments
     ///
@@ -1421,4 +1538,9 @@ pub trait IntTensorOps<B: Backend> {
     ///
     /// A tensor view with shape ``[pre=..., windows, size, post=...]``.
     fn int_unfold(tensor: IntTensor<B>, dim: usize, size: usize, step: usize) -> IntTensor<B>;
+
+    /// Pads a tensor with one `(before, after)` pair per dimension.
+    fn int_pad(tensor: IntTensor<B>, padding: &[(usize, usize)], mode: PadMode) -> IntTensor<B> {
+        super::pad::int_pad::<B>(tensor, padding, mode)
+    }
 }

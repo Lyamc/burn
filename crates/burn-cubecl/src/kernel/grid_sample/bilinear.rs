@@ -1,9 +1,8 @@
+use burn_backend::cubecl::dtype_to_storage_type;
 use cubecl::std::FastDivmod;
 use cubecl::{calculate_cube_count_elemwise, prelude::*};
 
-use crate::{
-    CubeRuntime, kernel::utils::address_type, ops::numeric::empty_device_dtype, tensor::CubeTensor,
-};
+use crate::{kernel::utils::address_type, ops::numeric::empty_device_dtype, tensor::CubeTensor};
 use burn_backend::{Shape, ops::GridSampleOptions};
 
 use super::base::{PaddingMode, fetch_value, reflect_coord};
@@ -22,7 +21,7 @@ fn grid_sample_bilinear_kernel<F: Float>(
     shape_spatial: Sequence<FastDivmod<usize>>, // [N, H_out, W_out] for thread decomposition
     #[comptime] align_corners: bool,
     #[comptime] pad_mode: PaddingMode,
-    #[define(F)] _dtype: StorageType,
+    #[define(F)] _dtype: ElemType,
 ) {
     // Thread index maps to spatial position (n, h_out, w_out) only
     let spatial_idx = ABSOLUTE_POS;
@@ -46,12 +45,14 @@ fn grid_sample_bilinear_kernel<F: Float>(
 
     // Convert normalized coordinates to pixel coordinates
     let (px, py) = if align_corners {
-        let px = (gx + F::new(1.0)) * F::cast_from((w_in - 1) as f32) / F::new(2.0);
-        let py = (gy + F::new(1.0)) * F::cast_from((h_in - 1) as f32) / F::new(2.0);
+        let px = (gx + F::new(1.0_f32)) * F::cast_from((w_in - 1) as f32) / F::new(2.0_f32);
+        let py = (gy + F::new(1.0_f32)) * F::cast_from((h_in - 1) as f32) / F::new(2.0_f32);
         (px, py)
     } else {
-        let px = (gx + F::new(1.0)) * F::cast_from(w_in as f32) / F::new(2.0) - F::new(0.5);
-        let py = (gy + F::new(1.0)) * F::cast_from(h_in as f32) / F::new(2.0) - F::new(0.5);
+        let px =
+            (gx + F::new(1.0_f32)) * F::cast_from(w_in as f32) / F::new(2.0_f32) - F::new(0.5_f32);
+        let py =
+            (gy + F::new(1.0_f32)) * F::cast_from(h_in as f32) / F::new(2.0_f32) - F::new(0.5_f32);
         (px, py)
     };
 
@@ -68,14 +69,14 @@ fn grid_sample_bilinear_kernel<F: Float>(
     // Compute floor and ceil indices
     let x0_f = px.floor();
     let y0_f = py.floor();
-    let x1_f = x0_f + F::new(1.0);
-    let y1_f = y0_f + F::new(1.0);
+    let x1_f = x0_f + F::new(1.0_f32);
+    let y1_f = y0_f + F::new(1.0_f32);
 
     // Compute interpolation weights
     let wx = px - x0_f;
     let wy = py - y0_f;
-    let wx_ = F::new(1.0) - wx;
-    let wy_ = F::new(1.0) - wy;
+    let wx_ = F::new(1.0_f32) - wx;
+    let wy_ = F::new(1.0_f32) - wy;
 
     // Convert to integers for indexing
     let x0 = i32::cast_from(x0_f);
@@ -126,11 +127,11 @@ fn grid_sample_bilinear_kernel<F: Float>(
 }
 
 /// Launch the grid sample bilinear kernel
-pub(crate) fn grid_sample_bilinear_launch<R: CubeRuntime>(
-    input: CubeTensor<R>,
-    grid: CubeTensor<R>,
+pub(crate) fn grid_sample_bilinear_launch(
+    input: CubeTensor,
+    grid: CubeTensor,
     options: GridSampleOptions,
-) -> CubeTensor<R> {
+) -> CubeTensor {
     let [batch_size, channels, _h_in, _w_in] = input.meta.shape().dims();
     let [_n, h_out, w_out, two] = grid.meta.shape().dims();
     assert_eq!(two, 2, "Grid last dimension must be 2");
@@ -171,7 +172,7 @@ pub(crate) fn grid_sample_bilinear_launch<R: CubeRuntime>(
         shape_spatial,
         options.align_corners,
         padding_mode,
-        dtype.into(),
+        dtype_to_storage_type(dtype),
     );
 
     output

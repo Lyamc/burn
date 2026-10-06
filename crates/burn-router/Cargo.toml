@@ -9,7 +9,7 @@ edition.workspace = true
 keywords = ["deep-learning", "machine-learning", "data"]
 license.workspace = true
 name = "burn-router"
-readme.workspace = true
+readme = "README.md"
 repository = "https://github.com/tracel-ai/burn/tree/main/crates/burn-router"
 documentation = "https://docs.rs/burn-router"
 version.workspace = true
@@ -20,29 +20,25 @@ workspace = true
 [features]
 default = ["std"]
 std = ["burn-backend/std", "burn-std/std", "burn-ir/std"]
+# Client-side operation fusion / caching for router backends (e.g. the remote backend). Requires
+# std (the fusion engine uses threads).
+fusion = ["std", "dep:burn-fusion", "dep:serde"]
 doc = ["default"]
-tracing = [
-    "burn-backend/tracing",
-    "burn-ir/tracing",
-    "burn-std/tracing",
-]
-distributed = ["burn-ir/distributed"]
+tracing = ["burn-backend/tracing", "burn-ir/tracing", "burn-std/tracing"]
 
 [dependencies]
 burn-ir = { workspace = true }
 burn-backend = { workspace = true }
+burn-fusion = { workspace = true, optional = true }
 burn-std = { workspace = true }
 hashbrown = { workspace = true }
 spin = { workspace = true }
-log = { workspace = true }
+portable-atomic = { workspace = true }
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
-burn-tensor = { workspace = true }
-burn-flex = { workspace = true, features = ["default"] }
-burn-wgpu = { workspace = true, features = [
-    "std",
-] }
-
+# Use path instead of workspace dep (which specifies a version, creating a circular publish dependency chain)
+burn-flex = { path = "../burn-flex", features = ["default"] }
 
 [package.metadata.docs.rs]
 features = ["doc"]

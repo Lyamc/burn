@@ -65,7 +65,7 @@ impl CheckpointingStrategy for MetricCheckpointingStrategy {
 #[cfg(test)]
 mod tests {
     use crate::{
-        EventProcessorTraining, TestBackend,
+        EventProcessorTraining,
         logger::InMemoryMetricLogger,
         metric::{
             LossMetric,
@@ -75,6 +75,7 @@ mod tests {
             },
             store::LogEventStore,
         },
+        test_utils::start_epoch,
     };
 
     use super::*;
@@ -82,7 +83,7 @@ mod tests {
 
     #[test]
     fn always_keep_the_best_epoch() {
-        let loss = LossMetric::<TestBackend>::new();
+        let loss = LossMetric::new();
         let mut store = LogEventStore::default();
         let mut strategy = MetricCheckpointingStrategy::new(
             &loss,
@@ -97,10 +98,17 @@ mod tests {
         metrics.register_train_metric_numeric(loss);
         let store = Arc::new(EventStoreClient::new(store));
         let mut processor = MinimalEventProcessor::new(metrics, store.clone());
-        processor.process_train(crate::LearnerEvent::Start);
+        processor
+            .process_train(crate::LearnerEvent::Start {
+                total_epochs: 0,
+                starting_epoch: 0,
+                label: None,
+            })
+            .unwrap();
 
         // Two points for the first epoch. Mean 0.75
         let mut epoch = 1;
+        start_epoch(&mut processor, epoch, 2);
         process_train(&mut processor, 1.0, epoch);
         process_train(&mut processor, 0.5, epoch);
         end_epoch(&mut processor, epoch);
@@ -113,6 +121,7 @@ mod tests {
 
         // Two points for the second epoch. Mean 0.4
         epoch += 1;
+        start_epoch(&mut processor, epoch, 2);
         process_train(&mut processor, 0.5, epoch);
         process_train(&mut processor, 0.3, epoch);
         end_epoch(&mut processor, epoch);
@@ -125,6 +134,7 @@ mod tests {
 
         // Two points for the last epoch. Mean 2.0
         epoch += 1;
+        start_epoch(&mut processor, epoch, 2);
         process_train(&mut processor, 1.0, epoch);
         process_train(&mut processor, 3.0, epoch);
         end_epoch(&mut processor, epoch);

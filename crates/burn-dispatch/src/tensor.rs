@@ -1,22 +1,25 @@
-use alloc::boxed::Box;
-
-use burn_backend::{
-    Backend, DType, QTensorPrimitive, Shape, TensorMetadata, quantization::QuantScheme,
-};
+use crate::{DispatchDevice, backends::*};
 
 #[cfg(feature = "autodiff")]
-use crate::CheckpointingStrategy;
-use crate::backends::*;
+use burn_autodiff::checkpoint::strategy::{
+    BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
+};
+use burn_backend::{Backend, BackendTypes, DType, Shape, TensorMetadata};
 
+use crate::GradientCheckpointingStrategy;
+#[cfg(feature = "autodiff")]
+use alloc::boxed::Box;
 #[cfg(feature = "autodiff")]
 use burn_backend::tensor::FloatTensor;
+
+use alloc::{format, string::String};
 
 // TODO: if we reduce the different associated types for float/int/bool/quantized tensor primitives down to a single
 // `B::TensorPrimitive` we can simplify this.
 
 /// Tensor which points to a backend tensor primitive kind.
 #[derive(Clone, Debug)]
-pub enum BackendTensor<B: Backend> {
+pub enum BackendTensor<B: BackendTypes> {
     /// Float tensor handle.
     Float(B::FloatTensorPrimitive),
     /// Int tensor handle.
@@ -32,7 +35,7 @@ pub enum BackendTensor<B: Backend> {
 
 impl<B: Backend> BackendTensor<B> {
     /// Returns the inner float tensor primitive.
-    pub(crate) fn float(self) -> B::FloatTensorPrimitive {
+    pub fn float(self) -> B::FloatTensorPrimitive {
         match self {
             BackendTensor::Float(tensor) => tensor,
             BackendTensor::Int(_) => panic!("Should be float, got int"),
@@ -43,7 +46,7 @@ impl<B: Backend> BackendTensor<B> {
         }
     }
     /// Returns the inner float tensor primitive.
-    pub(crate) fn as_float(&self) -> &B::FloatTensorPrimitive {
+    pub fn as_float(&self) -> &B::FloatTensorPrimitive {
         match self {
             BackendTensor::Float(tensor) => tensor,
             BackendTensor::Int(_) => panic!("Should be float, got int"),
@@ -55,7 +58,7 @@ impl<B: Backend> BackendTensor<B> {
     }
 
     /// Returns the inner int tensor primitive.
-    pub(crate) fn int(self) -> B::IntTensorPrimitive {
+    pub fn int(self) -> B::IntTensorPrimitive {
         match self {
             BackendTensor::Int(tensor) => tensor,
             BackendTensor::Float(_) => panic!("Should be int, got float"),
@@ -67,7 +70,7 @@ impl<B: Backend> BackendTensor<B> {
     }
 
     /// Returns the inner bool tensor primitive.
-    pub(crate) fn bool(self) -> B::BoolTensorPrimitive {
+    pub fn bool(self) -> B::BoolTensorPrimitive {
         match self {
             BackendTensor::Bool(tensor) => tensor,
             BackendTensor::Float(_) => panic!("Should be bool, got float"),
@@ -79,7 +82,7 @@ impl<B: Backend> BackendTensor<B> {
     }
 
     /// Returns the inner quantized tensor primitive.
-    pub(crate) fn quantized(self) -> B::QuantizedTensorPrimitive {
+    pub fn quantized(self) -> B::QuantizedTensorPrimitive {
         match self {
             BackendTensor::Quantized(tensor) => tensor,
             _ => unreachable!(),
@@ -88,7 +91,7 @@ impl<B: Backend> BackendTensor<B> {
 
     #[cfg(feature = "autodiff")]
     /// Returns the inner autodiff tensor primitive.
-    pub(crate) fn autodiff(self) -> FloatTensor<Autodiff<B>> {
+    pub fn autodiff(self) -> FloatTensor<Autodiff<B>> {
         match self {
             BackendTensor::Autodiff(tensor) => tensor,
             // NOTE: this is the panicking code reached in tensor.rs:74:18:
@@ -98,7 +101,7 @@ impl<B: Backend> BackendTensor<B> {
 
     #[cfg(feature = "autodiff")]
     /// Returns the inner autodiff tensor primitive.
-    pub(crate) fn as_autodiff(&self) -> &FloatTensor<Autodiff<B>> {
+    pub fn as_autodiff(&self) -> &FloatTensor<Autodiff<B>> {
         match self {
             BackendTensor::Autodiff(tensor) => tensor,
             _ => unreachable!(),
@@ -107,27 +110,57 @@ impl<B: Backend> BackendTensor<B> {
 
     #[cfg(feature = "autodiff")]
     /// Returns the inner autodiff tensor primitive.
-    pub(crate) fn autodiff_inner(self) -> B::FloatTensorPrimitive {
+    pub fn autodiff_inner(self) -> B::FloatTensorPrimitive {
         match self {
-            BackendTensor::Autodiff(tensor) => tensor.primitive,
+            BackendTensor::Autodiff(tensor) => tensor.into_primitive(),
             _ => unreachable!(),
         }
     }
 
-    /// Returns the backend device.
-    pub(crate) fn device(&self) -> B::Device {
+    /// Lift a handle for backend `B` into the equivalent handle for `Autodiff<B>`.
+    ///
+    /// An already-tracked float (`Autodiff`) becomes the `Float` handle of `Autodiff<B>`; int/bool/
+    /// quantized handles are re-tagged unchanged (those primitives are shared between `B` and
+    /// `Autodiff<B>`). An untracked `Float` handle is invalid here (under autodiff, float tensors
+    /// arrive tracked), so it panics.
+    #[cfg(feature = "autodiff")]
+    pub fn into_autodiff(self) -> BackendTensor<Autodiff<B>> {
         match self {
-            BackendTensor::Float(tensor) => B::float_device(tensor),
-            BackendTensor::Int(tensor) => B::int_device(tensor),
-            BackendTensor::Bool(tensor) => B::bool_device(tensor),
-            BackendTensor::Quantized(tensor) => B::q_device(tensor),
+            BackendTensor::Autodiff(tensor) => BackendTensor::Float(tensor),
+            BackendTensor::Int(tensor) => BackendTensor::Int(tensor),
+            BackendTensor::Bool(tensor) => BackendTensor::Bool(tensor),
+            BackendTensor::Quantized(tensor) => BackendTensor::Quantized(tensor),
+            BackendTensor::Float(_) => {
+                unreachable!("an untracked float handle can't be lifted to Autodiff<B>")
+            }
+        }
+    }
+
+    /// Returns the tensor primitive kind name.
+    pub fn name(&self) -> &'static str {
+        match self {
+            BackendTensor::Float(_) => "Float",
+            BackendTensor::Int(_) => "Int",
+            BackendTensor::Bool(_) => "Bool",
+            BackendTensor::Quantized(_) => "Quantized",
             #[cfg(feature = "autodiff")]
-            BackendTensor::Autodiff(tensor) => B::float_device(&tensor.primitive),
+            BackendTensor::Autodiff(_) => "Autodiff",
         }
     }
 }
 
-impl<B: Backend> TensorMetadata for BackendTensor<B> {
+impl<B: BackendTypes> TensorMetadata for BackendTensor<B> {
+    type Device = B::Device;
+    fn device(&self) -> Self::Device {
+        match self {
+            BackendTensor::Float(tensor) => tensor.device(),
+            BackendTensor::Int(tensor) => tensor.device(),
+            BackendTensor::Bool(tensor) => tensor.device(),
+            BackendTensor::Quantized(tensor) => tensor.device(),
+            #[cfg(feature = "autodiff")]
+            BackendTensor::Autodiff(tensor) => tensor.device(),
+        }
+    }
     fn dtype(&self) -> DType {
         match self {
             BackendTensor::Float(tensor) => tensor.dtype(),
@@ -149,32 +182,68 @@ impl<B: Backend> TensorMetadata for BackendTensor<B> {
             BackendTensor::Autodiff(tensor) => tensor.shape(),
         }
     }
+
+    fn can_mut(&self) -> bool {
+        match self {
+            BackendTensor::Float(tensor) => tensor.can_mut(),
+            BackendTensor::Int(tensor) => tensor.can_mut(),
+            BackendTensor::Bool(tensor) => tensor.can_mut(),
+            BackendTensor::Quantized(tensor) => tensor.can_mut(),
+            #[cfg(feature = "autodiff")]
+            BackendTensor::Autodiff(tensor) => tensor.can_mut(),
+        }
+    }
 }
 
-impl<B: Backend> QTensorPrimitive for BackendTensor<B> {
-    fn scheme(&self) -> &QuantScheme {
-        match self {
-            BackendTensor::Quantized(tensor) => tensor.scheme(),
-            _ => panic!(
-                "Quantization scheme is not valid for dtype {:?}",
-                self.dtype(),
-            ),
+/// The autodiff backend associated with a dispatch tensor.
+///
+/// This is backend metadata, not a statement that a float tensor requires
+/// gradients. Enabled float tensors may be tracked or untracked by autodiff.
+///
+/// Tensor inputs to one backend operation merge their autodiff contexts. A disabled context is
+/// compatible with an enabled one and is treated as a constant for that operation. Two enabled
+/// contexts must use the same gradient-checkpointing strategy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DispatchAutodiffContext {
+    /// Route the tensor through its concrete backend.
+    #[default]
+    Disabled,
+    /// Associate the tensor with an autodiff backend using the given strategy.
+    Enabled(GradientCheckpointingStrategy),
+}
+
+impl DispatchAutodiffContext {
+    /// Merge two tensor contexts into the context used to execute an operation and wrap its output.
+    ///
+    /// Disabled tensors don't acquire a new context themselves. When combined with an enabled
+    /// tensor, they are treated as constants while the operation and its output use the enabled
+    /// context.
+    ///
+    /// # Panics
+    ///
+    /// Panics when both contexts are enabled with different gradient-checkpointing strategies.
+    #[doc(hidden)]
+    pub fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Disabled, context) | (context, Self::Disabled) => context,
+            (Self::Enabled(lhs), Self::Enabled(rhs)) => {
+                assert_eq!(
+                    lhs, rhs,
+                    "Gradient checkpointing strategy mismatch: {lhs:?} vs {rhs:?}. Tensors in the same operation must share a strategy."
+                );
+                Self::Enabled(lhs)
+            }
         }
     }
 }
 
 /// A tensor that can dispatch operations to any enabled backend at runtime.
-///
-/// When the `autodiff` feature is enabled, tensors may carry a checkpointing
-/// strategy used to control gradient computation. This is derived from the
-/// device used to create the tensor.
 #[derive(Clone, Debug)]
 pub struct DispatchTensor {
     /// Tensor kind primitive.
-    pub(crate) kind: DispatchTensorKind,
-    // Technically more of a device property, but device is not a dispatch tensor field.
-    #[cfg(feature = "autodiff")]
-    pub(crate) checkpointing: CheckpointingStrategy,
+    pub kind: DispatchTensorKind,
+    /// Autodiff backend association for this tensor.
+    pub autodiff: DispatchAutodiffContext,
 }
 
 /// Internal representation of a [`DispatchTensor`].
@@ -185,30 +254,16 @@ pub struct DispatchTensor {
 ///
 /// Each variant corresponds to a specific backend implementation.
 #[derive(Clone, Debug)]
+// With autodiff and a lone Cube or Remote backend, the only other variant is Autodiff's 8-byte
+// box, so the lint fires. Boxing backend tensors would cost every tensor an allocation.
+#[allow(clippy::large_enum_variant)]
 pub enum DispatchTensorKind {
-    /// The [CPU backend](Cpu) tensor.
-    #[cfg(feature = "cpu")]
-    Cpu(BackendTensor<Cpu>),
-
-    /// The [CUDA backend](Cuda) tensor.
-    #[cfg(feature = "cuda")]
-    Cuda(BackendTensor<Cuda>),
-
-    /// The [Metal backend](Metal) tensor.
-    #[cfg(wgpu_metal)]
-    Metal(BackendTensor<Metal>),
-
-    /// The [ROCm backend](Rocm) tensor.
-    #[cfg(feature = "rocm")]
-    Rocm(BackendTensor<Rocm>),
-
-    /// The [Vulkan backend](Vulkan) tensor.
-    #[cfg(wgpu_vulkan)]
-    Vulkan(BackendTensor<Vulkan>),
-
-    /// The [WebGPU backend](Wgpu) tensor.
-    #[cfg(wgpu_webgpu)]
-    Wgpu(BackendTensor<Wgpu>),
+    #[cfg(not(backend_enabled))]
+    #[doc(hidden)]
+    Unavailable(crate::NoBackend),
+    /// A tensor on the [cubecl backend](Cube) — its device says which runtime.
+    #[cfg(cube_backend)]
+    Cube(BackendTensor<Cube>),
 
     /// The [Flex backend](Flex) tensor.
     #[cfg(feature = "flex")]
@@ -222,32 +277,37 @@ pub enum DispatchTensorKind {
     #[cfg(feature = "tch")]
     LibTorch(BackendTensor<LibTorch>),
 
+    /// The [Remote backend](Remote) tensor (lives on a remote server).
+    #[cfg(feature = "remote")]
+    Remote(BackendTensor<Remote>),
+    /// A tensor recorded by the capture backend.
+    #[cfg(feature = "capture")]
+    Capture(BackendTensor<Capture>),
+
     /// The [autodiff enabled backend](Autodiff) tensor.
     #[cfg(feature = "autodiff")]
     Autodiff(Box<DispatchTensorKind>),
 }
 
 impl TensorMetadata for DispatchTensorKind {
+    type Device = DispatchDevice;
+
     fn dtype(&self) -> DType {
         match self {
-            #[cfg(feature = "cpu")]
-            Self::Cpu(tensor) => tensor.dtype(),
-            #[cfg(feature = "cuda")]
-            Self::Cuda(tensor) => tensor.dtype(),
-            #[cfg(wgpu_metal)]
-            Self::Metal(tensor) => tensor.dtype(),
-            #[cfg(feature = "rocm")]
-            Self::Rocm(tensor) => tensor.dtype(),
-            #[cfg(wgpu_vulkan)]
-            Self::Vulkan(tensor) => tensor.dtype(),
-            #[cfg(wgpu_webgpu)]
-            Self::Wgpu(tensor) => tensor.dtype(),
+            #[cfg(not(backend_enabled))]
+            Self::Unavailable(never) => never.unreachable(),
+            #[cfg(cube_backend)]
+            Self::Cube(tensor) => tensor.dtype(),
             #[cfg(feature = "flex")]
             Self::Flex(tensor) => tensor.dtype(),
             #[cfg(feature = "ndarray")]
             Self::NdArray(tensor) => tensor.dtype(),
             #[cfg(feature = "tch")]
             Self::LibTorch(tensor) => tensor.dtype(),
+            #[cfg(feature = "remote")]
+            Self::Remote(tensor) => tensor.dtype(),
+            #[cfg(feature = "capture")]
+            Self::Capture(tensor) => tensor.dtype(),
             #[cfg(feature = "autodiff")]
             Self::Autodiff(tensor) => tensor.dtype(),
         }
@@ -255,53 +315,64 @@ impl TensorMetadata for DispatchTensorKind {
 
     fn shape(&self) -> Shape {
         match self {
-            #[cfg(feature = "cpu")]
-            Self::Cpu(tensor) => tensor.shape(),
-            #[cfg(feature = "cuda")]
-            Self::Cuda(tensor) => tensor.shape(),
-            #[cfg(wgpu_metal)]
-            Self::Metal(tensor) => tensor.shape(),
-            #[cfg(feature = "rocm")]
-            Self::Rocm(tensor) => tensor.shape(),
-            #[cfg(wgpu_vulkan)]
-            Self::Vulkan(tensor) => tensor.shape(),
-            #[cfg(wgpu_webgpu)]
-            Self::Wgpu(tensor) => tensor.shape(),
+            #[cfg(not(backend_enabled))]
+            Self::Unavailable(never) => never.unreachable(),
+            #[cfg(cube_backend)]
+            Self::Cube(tensor) => tensor.shape(),
             #[cfg(feature = "flex")]
             Self::Flex(tensor) => tensor.shape(),
             #[cfg(feature = "ndarray")]
             Self::NdArray(tensor) => tensor.shape(),
             #[cfg(feature = "tch")]
             Self::LibTorch(tensor) => tensor.shape(),
+            #[cfg(feature = "remote")]
+            Self::Remote(tensor) => tensor.shape(),
+            #[cfg(feature = "capture")]
+            Self::Capture(tensor) => tensor.shape(),
             #[cfg(feature = "autodiff")]
             Self::Autodiff(tensor) => tensor.shape(),
         }
     }
-}
 
-impl QTensorPrimitive for DispatchTensorKind {
-    fn scheme(&self) -> &QuantScheme {
+    fn device(&self) -> DispatchDevice {
         match self {
-            #[cfg(feature = "cpu")]
-            Self::Cpu(tensor) => tensor.scheme(),
-            #[cfg(feature = "cuda")]
-            Self::Cuda(tensor) => tensor.scheme(),
-            #[cfg(wgpu_metal)]
-            Self::Metal(tensor) => tensor.scheme(),
-            #[cfg(feature = "rocm")]
-            Self::Rocm(tensor) => tensor.scheme(),
-            #[cfg(wgpu_vulkan)]
-            Self::Vulkan(tensor) => tensor.scheme(),
-            #[cfg(wgpu_webgpu)]
-            Self::Wgpu(tensor) => tensor.scheme(),
+            #[cfg(not(backend_enabled))]
+            Self::Unavailable(never) => never.unreachable(),
+            #[cfg(cube_backend)]
+            DispatchTensorKind::Cube(tensor) => DispatchDevice::Cube(tensor.device()),
             #[cfg(feature = "flex")]
-            Self::Flex(tensor) => tensor.scheme(),
+            DispatchTensorKind::Flex(tensor) => DispatchDevice::Flex(tensor.device()),
             #[cfg(feature = "ndarray")]
-            Self::NdArray(tensor) => tensor.scheme(),
+            DispatchTensorKind::NdArray(tensor) => DispatchDevice::NdArray(tensor.device()),
             #[cfg(feature = "tch")]
-            Self::LibTorch(tensor) => tensor.scheme(),
+            DispatchTensorKind::LibTorch(tensor) => DispatchDevice::LibTorch(tensor.device()),
+            #[cfg(feature = "remote")]
+            DispatchTensorKind::Remote(tensor) => DispatchDevice::Remote(tensor.device()),
+            #[cfg(feature = "capture")]
+            DispatchTensorKind::Capture(tensor) => DispatchDevice::Capture(tensor.device()),
             #[cfg(feature = "autodiff")]
-            Self::Autodiff(tensor) => tensor.scheme(),
+            DispatchTensorKind::Autodiff(tensor) => DispatchDevice::autodiff(tensor.device()),
+        }
+    }
+
+    fn can_mut(&self) -> bool {
+        match self {
+            #[cfg(not(backend_enabled))]
+            Self::Unavailable(never) => never.unreachable(),
+            #[cfg(cube_backend)]
+            Self::Cube(tensor) => tensor.can_mut(),
+            #[cfg(feature = "flex")]
+            Self::Flex(tensor) => tensor.can_mut(),
+            #[cfg(feature = "ndarray")]
+            Self::NdArray(tensor) => tensor.can_mut(),
+            #[cfg(feature = "tch")]
+            Self::LibTorch(tensor) => tensor.can_mut(),
+            #[cfg(feature = "remote")]
+            Self::Remote(tensor) => tensor.can_mut(),
+            #[cfg(feature = "capture")]
+            Self::Capture(tensor) => tensor.can_mut(),
+            #[cfg(feature = "autodiff")]
+            Self::Autodiff(tensor) => tensor.can_mut(),
         }
     }
 }
@@ -314,10 +385,220 @@ impl TensorMetadata for DispatchTensor {
     fn shape(&self) -> Shape {
         self.kind.shape()
     }
-}
 
-impl QTensorPrimitive for DispatchTensor {
-    fn scheme(&self) -> &QuantScheme {
-        self.kind.scheme()
+    fn can_mut(&self) -> bool {
+        self.kind.can_mut()
+    }
+
+    type Device = DispatchDevice;
+
+    fn device(&self) -> Self::Device {
+        #[allow(unused_mut)]
+        let mut device = self.kind.device();
+
+        #[cfg(feature = "autodiff")]
+        match (&self.kind, self.autodiff) {
+            (DispatchTensorKind::Autodiff(_), DispatchAutodiffContext::Disabled) => {
+                panic!("an autodiff float primitive must have an enabled autodiff context")
+            }
+            (DispatchTensorKind::Autodiff(_), DispatchAutodiffContext::Enabled(strategy)) => {
+                let DispatchDevice::Autodiff(device) = &mut device else {
+                    unreachable!("autodiff primitive must report an autodiff device")
+                };
+                device.checkpointing = strategy;
+            }
+            (_, DispatchAutodiffContext::Enabled(strategy)) => {
+                if self.dtype().is_float() {
+                    panic!("an enabled float tensor must use an autodiff primitive")
+                }
+                device = DispatchDevice::autodiff(device);
+                let DispatchDevice::Autodiff(device) = &mut device else {
+                    unreachable!()
+                };
+                device.checkpointing = strategy;
+            }
+            (_, DispatchAutodiffContext::Disabled) => {}
+        }
+
+        device
     }
 }
+
+impl DispatchTensorKind {
+    /// Returns the backend tensor kind name.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            #[cfg(not(backend_enabled))]
+            Self::Unavailable(never) => never.unreachable(),
+            #[cfg(cube_backend)]
+            DispatchTensorKind::Cube(_) => "Cube",
+            #[cfg(feature = "flex")]
+            DispatchTensorKind::Flex(_) => "Flex",
+            #[cfg(feature = "ndarray")]
+            DispatchTensorKind::NdArray(_) => "NdArray",
+            #[cfg(feature = "tch")]
+            DispatchTensorKind::LibTorch(_) => "LibTorch",
+            #[cfg(feature = "remote")]
+            DispatchTensorKind::Remote(_) => "Remote",
+            #[cfg(feature = "capture")]
+            DispatchTensorKind::Capture(_) => "Capture",
+            #[cfg(feature = "autodiff")]
+            DispatchTensorKind::Autodiff(_) => "Autodiff",
+        }
+    }
+}
+
+#[cfg(feature = "autodiff")]
+trait IntoGradientCheckpointingStrategy {
+    const STRATEGY: GradientCheckpointingStrategy;
+}
+
+#[cfg(feature = "autodiff")]
+impl IntoGradientCheckpointingStrategy for NoCheckpointing {
+    const STRATEGY: GradientCheckpointingStrategy = GradientCheckpointingStrategy::Disabled;
+}
+
+#[cfg(feature = "autodiff")]
+impl IntoGradientCheckpointingStrategy for BalancedCheckpointing {
+    const STRATEGY: GradientCheckpointingStrategy = GradientCheckpointingStrategy::Balanced;
+}
+
+/// Trait to execute runtime routing conversions between the dynamic dispatch layer and specific backends.
+pub trait DispatchKindConversion<B: Backend> {
+    /// Attempts to extract a backend-specific [`BackendTensor`] wrapper from a generic, dynamically-routed [`DispatchTensor`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dynamic routing state does not match the requested backend `B`.
+    fn try_into_backend(tensor: DispatchTensor) -> Result<BackendTensor<B>, String>;
+
+    /// Encapsulates a backend-specific tensor variant back into a globally routing [`DispatchTensor`].
+    fn from_backend(tensor: BackendTensor<B>) -> DispatchTensor;
+}
+
+macro_rules! impl_dispatch_conversion {
+    ($backend:ident, $cfg:meta) => {
+        #[cfg($cfg)]
+        impl DispatchKindConversion<$backend> for DispatchTensor {
+            fn try_into_backend(tensor: DispatchTensor) -> Result<BackendTensor<$backend>, String> {
+                if tensor.autodiff != DispatchAutodiffContext::Disabled {
+                    return Err(format!(
+                        "Expected concrete {} backend with disabled autodiff context, got {:?}",
+                        stringify!($backend),
+                        tensor.autodiff,
+                    ));
+                }
+                // The catch-all is unreachable in single-backend builds (the enum then has one
+                // variant), but required when several backend features are enabled.
+                #[allow(unreachable_patterns)]
+                match tensor.kind {
+                    DispatchTensorKind::$backend(t) => Ok(t),
+                    other => Err(format!(
+                        "Expected {} tensor, got variant: {}",
+                        stringify!($backend),
+                        other.name()
+                    )),
+                }
+            }
+
+            fn from_backend(tensor: BackendTensor<$backend>) -> DispatchTensor {
+                DispatchTensor {
+                    kind: DispatchTensorKind::$backend(tensor),
+                    autodiff: DispatchAutodiffContext::Disabled,
+                }
+            }
+        }
+
+        #[cfg(all($cfg, feature = "autodiff"))]
+        impl<C: CheckpointStrategy + IntoGradientCheckpointingStrategy>
+            DispatchKindConversion<Autodiff<$backend, C>> for DispatchTensor
+        {
+            fn try_into_backend(
+                tensor: DispatchTensor,
+            ) -> Result<BackendTensor<Autodiff<$backend, C>>, String> {
+                if tensor.autodiff != DispatchAutodiffContext::Enabled(C::STRATEGY) {
+                    return Err(format!(
+                        "Expected {:?} autodiff context, got {:?}",
+                        C::STRATEGY,
+                        tensor.autodiff
+                    ));
+                }
+                match tensor.kind {
+                    DispatchTensorKind::Autodiff(t) => match *t {
+                        DispatchTensorKind::$backend(t) => match t {
+                            // Encode as `BackendTensor::Float` for `Autodiff<B, C>`
+                            BackendTensor::Autodiff(t) => Ok(BackendTensor::Float(t)),
+                            other => Err(format!(
+                                "Expected Autodiff {} float tensor, got Autodiff variant: {}",
+                                stringify!($backend),
+                                other.name()
+                            )),
+                        },
+                        other => Err(format!(
+                            "Expected Autodiff {} tensor, got Autodiff variant: {}",
+                            stringify!($backend),
+                            other.name()
+                        )),
+                    },
+                    DispatchTensorKind::$backend(t) => match t {
+                        BackendTensor::Int(t) => Ok(BackendTensor::Int(t)),
+                        BackendTensor::Bool(t) => Ok(BackendTensor::Bool(t)),
+                        BackendTensor::Quantized(t) => Ok(BackendTensor::Quantized(t)),
+                        BackendTensor::Float(_) => Err(format!(
+                            "Expected Autodiff {} float tensor, got unwrapped float",
+                            stringify!($backend),
+                        )),
+                        BackendTensor::Autodiff(_) => Err(format!(
+                            "Expected Autodiff {} tensor, got invalid inner autodiff variant",
+                            stringify!($backend),
+                        )),
+                    },
+                    #[allow(unreachable_patterns)]
+                    other => Err(format!(
+                        "Expected Autodiff tensor, got backend: {}",
+                        other.name()
+                    )),
+                }
+            }
+
+            fn from_backend(tensor: BackendTensor<Autodiff<$backend, C>>) -> DispatchTensor {
+                // Unwrap the Autodiff backend representation back into the inner hardware representation
+                let kind = match tensor {
+                    // Inverse: Wrap the `Float` variant back into the backend's `Autodiff` primitive variant
+                    BackendTensor::Float(t) => {
+                        let ad_tensor = BackendTensor::Autodiff(t);
+                        // Wrap in the concrete backend's dispatch container
+                        let inner_dispatch = DispatchTensorKind::$backend(ad_tensor);
+                        // Re-apply the outer Autodiff dispatch wrapper
+                        DispatchTensorKind::Autodiff(Box::new(inner_dispatch))
+                    }
+
+                    // Pass-throughs for non-differentiable types
+                    BackendTensor::Int(t) => DispatchTensorKind::$backend(BackendTensor::Int(t)),
+                    BackendTensor::Bool(t) => DispatchTensorKind::$backend(BackendTensor::Bool(t)),
+                    BackendTensor::Quantized(t) => {
+                        DispatchTensorKind::$backend(BackendTensor::Quantized(t))
+                    }
+
+                    BackendTensor::Autodiff(_) => {
+                        panic!("Unexpected Autodiff variant provided to `from_backend`",)
+                    }
+                };
+
+                DispatchTensor {
+                    kind,
+                    autodiff: DispatchAutodiffContext::Enabled(C::STRATEGY),
+                }
+            }
+        }
+    };
+}
+
+// One invocation per dispatch variant. Every cubecl runtime is the same `Cube`
+// backend, so they share the one impl rather than getting seven identical ones.
+impl_dispatch_conversion!(Cube, cube_backend);
+impl_dispatch_conversion!(Flex, feature = "flex");
+impl_dispatch_conversion!(Remote, feature = "remote");
+impl_dispatch_conversion!(Capture, feature = "capture");
+impl_dispatch_conversion!(NdArray, feature = "ndarray");
+impl_dispatch_conversion!(LibTorch, feature = "tch");

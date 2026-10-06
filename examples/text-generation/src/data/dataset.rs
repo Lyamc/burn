@@ -1,4 +1,6 @@
-use burn::data::dataset::{Dataset, SqliteDataset, source::huggingface::HuggingfaceDatasetLoader};
+use burn::data::dataset::{
+    Dataset, DatasetError, SqliteDataset, source::huggingface::HuggingfaceDatasetLoader,
+};
 
 #[derive(new, Clone, Debug)]
 pub struct TextGenerationItem {
@@ -15,10 +17,11 @@ pub struct DbPediaDataset {
 }
 
 impl Dataset<TextGenerationItem> for DbPediaDataset {
-    fn get(&self, index: usize) -> Option<TextGenerationItem> {
+    fn get(&self, index: usize) -> Result<TextGenerationItem, DatasetError> {
         self.dataset
             .get(index)
             .map(|item| TextGenerationItem::new(item.content))
+            .map_err(DatasetError::new)
     }
 
     fn len(&self) -> usize {
@@ -35,9 +38,10 @@ impl DbPediaDataset {
         Self::new("test")
     }
     pub fn new(split: &str) -> Self {
-        let dataset: SqliteDataset<DbPediaItem> = HuggingfaceDatasetLoader::new("dbpedia_14")
-            .dataset(split)
-            .unwrap();
+        let dataset: SqliteDataset<DbPediaItem> =
+            HuggingfaceDatasetLoader::new("fancyzhx/dbpedia_14")
+                .dataset(split)
+                .unwrap();
         Self { dataset }
     }
 }

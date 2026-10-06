@@ -1,9 +1,28 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![recursion_limit = "256"]
 
-//! Burn optimizers.
+//! Optimizers and learning rate schedulers for Burn.
+//!
+//! Applications use these through `burn::optim`, `burn::lr_scheduler` and `burn::grad_clipping`.
+//! An optimizer is built from its config and applied to a module with gradients from a backward pass:
+//!
+//! ```rust,ignore
+//! let mut optimizer = AdamConfig::new().init();
+//! let grads = GradientsParams::from_grads(loss.backward(), &model);
+//! model = optimizer.step(learning_rate, model, grads);
+//! ```
+//!
+//! - Optimizers: SGD, Adam, AdamW, Adagrad, Adafactor, Adan, LAMB, L-BFGS, Lion, Muon and RMSprop,
+//!   with momentum, weight decay and gradient accumulation helpers.
+//! - [`lr_scheduler`]: constant, step, exponential, linear, cosine, Noam, and sequential or
+//!   composed schedules.
+//! - [`grad_clipping`]: clipping by value or by norm.
+//!
+//! # Feature flags
+//!
+//! - `std` (default): standard library support. Without it the crate is `no_std` with `alloc`.
+//! - `tracing`: instrument operations with the `tracing` crate.
 
 #[macro_use]
 extern crate derive_new;
@@ -26,38 +45,3 @@ pub mod lr_scheduler;
 /// LearningRate also implements [learning rate scheduler](crate::lr_scheduler::LrScheduler) so it
 /// can be used for constant learning rate.
 pub type LearningRate = f64; // We could potentially change the type.
-
-/// Backend for test cases
-#[cfg(all(
-    test,
-    not(feature = "test-tch"),
-    not(feature = "test-wgpu"),
-    not(feature = "test-cuda"),
-    not(feature = "test-rocm")
-))]
-pub type TestBackend = burn_flex::Flex;
-
-#[cfg(all(test, feature = "test-tch"))]
-/// Backend for test cases
-pub type TestBackend = burn_tch::LibTorch<f32>;
-
-#[cfg(all(test, feature = "test-wgpu"))]
-/// Backend for test cases
-pub type TestBackend = burn_wgpu::Wgpu;
-
-#[cfg(all(test, feature = "test-cuda"))]
-/// Backend for test cases
-pub type TestBackend = burn_cuda::Cuda;
-
-#[cfg(all(test, feature = "test-rocm"))]
-/// Backend for test cases
-pub type TestBackend = burn_rocm::Rocm;
-
-/// Backend for autodiff test cases
-#[cfg(test)]
-pub type TestAutodiffBackend = burn_autodiff::Autodiff<TestBackend>;
-
-#[cfg(all(test, feature = "test-memory-checks"))]
-mod tests {
-    burn_fusion::memory_checks!();
-}

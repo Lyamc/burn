@@ -10,13 +10,40 @@ use burn_backend::{
         },
         unfold::calculate_unfold_shape,
     },
-    quantization::QuantScheme,
+    quantization::{QuantScheme, QuantStore},
     tensor::IndexingUpdateOp,
 };
 
 use crate::{ScalarIr, TensorId, TensorIr};
 
 use super::operation::*;
+
+fn permute_quantized_dtype(dtype: DType, rank: usize, axes: &[usize]) -> DType {
+    let DType::QFloat(mut scheme) = dtype else {
+        return dtype;
+    };
+
+    scheme.permute_block_dims(rank, axes);
+
+    if let QuantStore::PackedU32(packed_dim) | QuantStore::PackedNative(packed_dim) =
+        &mut scheme.store
+    {
+        let packed_axis = rank - *packed_dim - 1;
+        let new_axis = axes
+            .iter()
+            .position(|axis| *axis == packed_axis)
+            .expect("Permute axes to contain the packed axis");
+        *packed_dim = rank - new_axis - 1;
+    }
+
+    DType::QFloat(scheme)
+}
+
+fn swap_dims_quantized_dtype(dtype: DType, rank: usize, dim1: usize, dim2: usize) -> DType {
+    let mut axes = (0..rank).collect::<Vec<_>>();
+    axes.swap(dim1, dim2);
+    permute_quantized_dtype(dtype, rank, &axes)
+}
 
 impl CreationOpIr {
     pub fn create(shape: Shape, dtype: DType, new_id: impl FnOnce() -> TensorId) -> Self {
@@ -75,13 +102,45 @@ impl ShapeOpIr {
     }
 
     pub fn reshape(input: TensorIr, shape: Shape, new_id: impl FnOnce() -> TensorId) -> Self {
-        let shape = input.shape.reshape(shape).unwrap();
+        // The shape is already resolved; zeros represent empty dimensions here.
+        assert_eq!(
+            input.shape.num_elements(),
+            shape.num_elements(),
+            "Reshape must preserve the number of elements"
+        );
         Self::create(input, shape, new_id)
     }
 
     fn create(input: TensorIr, shape: Shape, new_id: impl FnOnce() -> TensorId) -> Self {
         let out = TensorIr::uninit(new_id(), shape, input.dtype);
         ShapeOpIr { input, out }
+    }
+}
+
+impl PadOpIr {
+    pub fn create(
+        input: TensorIr,
+        padding: Vec<(usize, usize)>,
+        mode: PadModeIr,
+        new_id: impl FnOnce() -> TensorId,
+    ) -> Self {
+        burn_backend::ops::validate_padding(&input.shape, &padding, mode.into());
+        let shape = Shape::from(
+            input
+                .shape
+                .iter()
+                .zip(padding.iter())
+                .map(|(size, (before, after))| size + before + after)
+                .collect::<Vec<_>>(),
+        );
+        let out = TensorIr::uninit(new_id(), shape, input.dtype);
+
+        Self {
+            input,
+            out,
+            padding,
+            mode,
+        }
     }
 }
 
@@ -150,6 +209,7 @@ fn output_dtype_mixed<'a, I: IntoIterator<Item = &'a DType>>(inputs: I) -> Resul
 ///
 /// Supports shape and dtype validation.
 macro_rules! impl_ir_create {
+    // Leaf: the default `create`, inferring the output dtype from the inputs.
     (@create_fn $op:ident { $( $field:ident : $ty:ty ),* $(,)? } , $shape:expr, $dtype:expr) => {
         #[doc = "Create a new operation IR from the given inputs."]
         #[doc = "`new_id` should generate a unique `TensorId` for the uninitialized output tensor."]
@@ -162,36 +222,52 @@ macro_rules! impl_ir_create {
         }
     };
 
-    // Case: simple op, single `create`
-    (
-        $op:ident { $( $field:ident : $ty:ty ),* $(,)? },
-        shape = $shape:expr,
-        dtype = $dtype:expr
-    ) => {
-        impl $op {
-            impl_ir_create!(@create_fn $op { $( $field : $ty ),* }, $shape, $dtype);
+    // Leaf: a single additional constructor that takes an explicit output dtype.
+    (@extra_fn $op:ident { $( $field:ident : $ty:ty ),* $(,)? } , $shape:expr, $dtype:expr, $fn_name:ident ( $extra:ident : $extra_ty:ty )) => {
+        #[doc = "Create a new operation IR from the given inputs and the given output dtype."]
+        #[allow(clippy::too_many_arguments)]
+        pub fn $fn_name($( $field : $ty ),*, $extra: $extra_ty, new_id: impl FnOnce() -> crate::TensorId) -> $op {
+            let shape = $shape;
+            let _ = $dtype; // still validates dtype if needed
+            let out = TensorIr::uninit(new_id(), shape, $extra);
+            $op { $( $field ),*, out }
         }
     };
 
-    // Case: op with one additional constructor that accepts an explicit output dtype
+    // Recursively emit each additional constructor in its own `impl` block. The field list is
+    // forwarded as an opaque token tree (`$fields`) so it is not iterated alongside the
+    // constructor list (the two repeat independently).
+    (@extras $op:ident $fields:tt, $shape:expr, $dtype:expr, $fn_name:ident ( $extra:ident : $extra_ty:ty ) $(, $rest_fn:ident ( $rest_extra:ident : $rest_extra_ty:ty ) )* $(,)?) => {
+        impl $op {
+            impl_ir_create!(@extra_fn $op $fields, $shape, $dtype, $fn_name ( $extra : $extra_ty ));
+        }
+        impl_ir_create!(@extras $op $fields, $shape, $dtype, $( $rest_fn ( $rest_extra : $rest_extra_ty ) ),*);
+    };
+    (@extras $op:ident $fields:tt, $shape:expr, $dtype:expr, $(,)?) => {};
+
+    // Case: simple op, single `create`
     (
-        $op:ident { $( $field:ident : $ty:ty ),* $(,)? },
+        $op:ident $fields:tt,
+        shape = $shape:expr,
+        dtype = $dtype:expr $(,)?
+    ) => {
+        impl $op {
+            impl_ir_create!(@create_fn $op $fields, $shape, $dtype);
+        }
+    };
+
+    // Case: op with one or more additional constructors that accept an explicit output dtype
+    (
+        $op:ident $fields:tt,
         shape = $shape:expr,
         dtype = $dtype:expr,
         $fn_name:ident ( $extra:ident : $extra_ty:ty )
+        $(, $rest_fn:ident ( $rest_extra:ident : $rest_extra_ty:ty ) )* $(,)?
     ) => {
         impl $op {
-            impl_ir_create!(@create_fn $op { $( $field : $ty ),* }, $shape, $dtype);
-
-            #[doc = "Create a new operation IR from the given inputs and the given output dtype."]
-            #[allow(clippy::too_many_arguments)]
-            pub fn $fn_name($( $field : $ty ),*, $extra: $extra_ty, new_id: impl FnOnce() -> crate::TensorId) -> Self {
-                let shape = $shape;
-                let _ = $dtype; // still validates dtype if needed
-                let out = TensorIr::uninit(new_id(), shape, $extra);
-                $op { $( $field ),*, out }
-            }
+            impl_ir_create!(@create_fn $op $fields, $shape, $dtype);
         }
+        impl_ir_create!(@extras $op $fields, $shape, $dtype, $fn_name ( $extra : $extra_ty ) $(, $rest_fn ( $rest_extra : $rest_extra_ty ) )*);
     };
 }
 
@@ -243,13 +319,13 @@ impl_ir_create!(
         dim2: usize
     },
     shape = input.shape.clone().swapped(dim1, dim2).unwrap(),
-    dtype = input.dtype
+    dtype = swap_dims_quantized_dtype(input.dtype, input.shape.rank(), dim1, dim2)
 );
 
 impl_ir_create!(
     PermuteOpIr { input: TensorIr, axes: Vec<usize> },
     shape = input.shape.clone().permuted(&axes).unwrap(),
-    dtype = input.dtype
+    dtype = permute_quantized_dtype(input.dtype, input.shape.rank(), &axes)
 );
 
 impl_ir_create!(
@@ -274,9 +350,12 @@ impl_ir_create!(
     dtype = output_dtype(tensors.iter().map(|t| &t.dtype)).unwrap()
 );
 
-#[cfg(feature = "distributed")]
 impl_ir_create!(
-    AllReduceOpIr { tensor: TensorIr },
+    AllReduceOpIr {
+        tensor: TensorIr,
+        op: burn_backend::distributed::ReduceOperation,
+        device_ids: Vec<DeviceIdIr>
+    },
     shape = tensor.shape.clone(),
     dtype = tensor.dtype
 );
@@ -335,7 +414,9 @@ impl GatherNdOpIr {
 impl_ir_create!(
     ReduceOpIr { input: TensorIr },
     shape = [1].into(),
-    dtype = input.dtype
+    dtype = input.dtype,
+    // Additional constructor for reduce-all/reduce-any (bool output)
+    create_bool(bool_dtype: DType)
 );
 
 fn reduce_output_shape(mut output_shape: Shape, axis: usize, accumulator_len: usize) -> Shape {
@@ -353,7 +434,9 @@ impl_ir_create!(
     shape = reduce_output_shape(input.shape.clone(), axis, accumulator_len),
     dtype = input.dtype,
     // Additional constructor for argument reduction
-    create_arg(ind_dtype: DType)
+    create_arg(ind_dtype: DType),
+    // Additional constructor for reduce-all/reduce-any along a dim (bool output)
+    create_bool(bool_dtype: DType)
 );
 
 impl_ir_create!(
@@ -441,6 +524,187 @@ impl_ir_create!(
     },
     shape = tensor.shape.clone(),
     dtype = tensor.dtype
+);
+
+impl_ir_create!(
+    HardSigmoidOpIr {
+        tensor: TensorIr,
+        alpha: ScalarIr,
+        beta: ScalarIr
+    },
+    shape = tensor.shape.clone(),
+    dtype = tensor.dtype
+);
+
+impl_ir_create!(
+    SortOpIr {
+        input: TensorIr,
+        dim: usize,
+        descending: bool
+    },
+    shape = input.shape.clone(),
+    dtype = input.dtype,
+    // Additional constructor for argsort (output is the indices tensor)
+    create_arg(ind_dtype: DType)
+);
+
+impl SortWithIndicesOpIr {
+    /// Create a sort-with-indices IR.
+    pub fn create(
+        input: TensorIr,
+        dim: usize,
+        descending: bool,
+        indices_dtype: DType,
+        mut new_id: impl FnMut() -> TensorId,
+    ) -> Self {
+        let shape = input.shape.clone();
+        let dtype = input.dtype;
+        let out = TensorIr::uninit(new_id(), shape.clone(), dtype);
+        let out_indices = TensorIr::uninit(new_id(), shape, indices_dtype);
+        SortWithIndicesOpIr {
+            input,
+            dim,
+            descending,
+            out,
+            out_indices,
+        }
+    }
+}
+
+impl LayerNormOpIr {
+    /// Create a layer-norm IR.
+    pub fn create(
+        input: TensorIr,
+        gamma: TensorIr,
+        beta: Option<TensorIr>,
+        epsilon: f64,
+        new_id: impl FnOnce() -> TensorId,
+    ) -> Self {
+        let dtype = output_dtype(
+            [
+                Some(&input.dtype),
+                Some(&gamma.dtype),
+                beta.as_ref().map(|b| &b.dtype),
+            ]
+            .iter()
+            .filter_map(|&d| d),
+        )
+        .unwrap();
+        let out = TensorIr::uninit(new_id(), input.shape.clone(), dtype);
+        LayerNormOpIr {
+            input,
+            gamma,
+            beta,
+            epsilon: ScalarIr::Float(epsilon),
+            out,
+        }
+    }
+}
+
+impl Unfold4dOpIr {
+    /// Create an unfold4d IR.
+    pub fn create(
+        x: TensorIr,
+        kernel_size: [usize; 2],
+        options: Unfold4dOptionsIr,
+        new_id: impl FnOnce() -> TensorId,
+    ) -> Self {
+        // Output shape mirrors the implementation in `unfold4d_using_unfold`:
+        // [N, C * kH * kW, num_blocks_h * num_blocks_w]
+        let dilation = options.dilation;
+        let padding = options.padding;
+        let stride = options.stride;
+        let weight_shape = Shape::from([
+            x.shape[1] * kernel_size[0] * kernel_size[1],
+            x.shape[1],
+            kernel_size[0],
+            kernel_size[1],
+        ]);
+        let conv_options = burn_backend::ops::ConvOptions::new(stride, padding, dilation, 1);
+        let out_shape = burn_backend::ops::conv::calculate_conv_output_shape(
+            &x.shape,
+            &weight_shape,
+            &conv_options.stride,
+            &conv_options.padding,
+            &conv_options.dilation,
+        )
+        .unwrap();
+        let shape = Shape::from([
+            x.shape[0],
+            x.shape[1] * kernel_size[0] * kernel_size[1],
+            out_shape[2] * out_shape[3],
+        ]);
+        let out = TensorIr::uninit(new_id(), shape, x.dtype);
+        Unfold4dOpIr {
+            x,
+            kernel_size,
+            options,
+            out,
+        }
+    }
+}
+
+impl_ir_create!(
+    ConvTranspose1dWeightBackwardOpIr {
+        x: TensorIr,
+        weight: TensorIr,
+        output_grad: TensorIr,
+        options: ConvTranspose1dOptionsIr
+    },
+    shape = weight.shape.clone(),
+    dtype = output_grad.dtype
+);
+
+impl_ir_create!(
+    ConvTranspose1dBiasBackwardOpIr {
+        x: TensorIr,
+        bias: TensorIr,
+        output_grad: TensorIr,
+    },
+    shape = bias.shape.clone(),
+    dtype = output_grad.dtype
+);
+
+impl_ir_create!(
+    ConvTranspose2dWeightBackwardOpIr {
+        x: TensorIr,
+        weight: TensorIr,
+        output_grad: TensorIr,
+        options: ConvTranspose2dOptionsIr
+    },
+    shape = weight.shape.clone(),
+    dtype = output_grad.dtype
+);
+
+impl_ir_create!(
+    ConvTranspose2dBiasBackwardOpIr {
+        x: TensorIr,
+        bias: TensorIr,
+        output_grad: TensorIr,
+    },
+    shape = bias.shape.clone(),
+    dtype = output_grad.dtype
+);
+
+impl_ir_create!(
+    ConvTranspose3dWeightBackwardOpIr {
+        x: TensorIr,
+        weight: TensorIr,
+        output_grad: TensorIr,
+        options: ConvTranspose3dOptionsIr
+    },
+    shape = weight.shape.clone(),
+    dtype = output_grad.dtype
+);
+
+impl_ir_create!(
+    ConvTranspose3dBiasBackwardOpIr {
+        x: TensorIr,
+        bias: TensorIr,
+        output_grad: TensorIr,
+    },
+    shape = bias.shape.clone(),
+    dtype = output_grad.dtype
 );
 
 impl_ir_create!(
@@ -622,6 +886,30 @@ impl_ir_create!(
 );
 
 impl_ir_create!(
+    AdaptiveAvgPool3dOpIr {
+        x: TensorIr,
+        output_size: [usize; 3]
+    },
+    shape = Shape::new([
+        x.shape[0],
+        x.shape[1],
+        output_size[0],
+        output_size[1],
+        output_size[2]
+    ]),
+    dtype = x.dtype
+);
+
+impl_ir_create!(
+    AdaptiveAvgPool3dBackwardOpIr {
+        x: TensorIr,
+        grad: TensorIr,
+    },
+    shape = x.shape.clone(),
+    dtype = x.dtype
+);
+
+impl_ir_create!(
     InterpolateOpIr {
         x: TensorIr,
         output_size: [usize; 2],
@@ -658,6 +946,51 @@ impl_ir_create!(
         grid.shape[2]
     ]),
     dtype = tensor.dtype
+);
+
+impl_ir_create!(
+    EmbeddingOpIr {
+        weights: TensorIr,
+        indices: TensorIr,
+    },
+    shape = {
+        // weights: [n_embeddings, d_model]
+        // indices: [batch_size, seq_length]
+        // output:  [batch_size, seq_length, d_model]
+        let d_model = weights.shape[1];
+        Shape::from(alloc::vec![indices.shape[0], indices.shape[1], d_model])
+    },
+    dtype = weights.dtype
+);
+
+impl_ir_create!(
+    EmbeddingBackwardOpIr {
+        weights: TensorIr,
+        out_grad: TensorIr,
+        indices: TensorIr,
+    },
+    shape = weights.shape.clone(),
+    dtype = output_dtype([&weights.dtype, &out_grad.dtype]).unwrap()
+);
+
+impl_ir_create!(
+    BatchNormOpIr {
+        x: TensorIr,
+        gamma: TensorIr,
+        beta: TensorIr,
+        mean: TensorIr,
+        variance: TensorIr,
+        epsilon: ScalarIr,
+    },
+    shape = x.shape.clone(),
+    dtype = output_dtype([
+        &x.dtype,
+        &gamma.dtype,
+        &beta.dtype,
+        &mean.dtype,
+        &variance.dtype
+    ])
+    .unwrap()
 );
 
 impl_ir_create!(
@@ -857,7 +1190,7 @@ impl_ir_create!(
             &x.shape,
             &weight.shape,
             &options.stride,
-            &options.padding,
+            &options.padding.map(|padding| (padding, padding)),
             &options.dilation,
         )
         .unwrap(),
@@ -918,7 +1251,7 @@ impl_ir_create!(
             &x.shape,
             &weight.shape,
             &options.stride,
-            &options.padding,
+            &options.padding.map(|padding| (padding, padding)),
             &options.dilation,
         )
         .unwrap(),
@@ -1123,6 +1456,31 @@ impl ReduceDimWithIndicesOpIr {
     }
 }
 
+impl TopKWithIndicesOpIr {
+    pub fn create(
+        tensor: TensorIr,
+        dim: usize,
+        k: usize,
+        dtype_indices: DType,
+        mut new_id: impl FnMut() -> TensorId,
+    ) -> Self {
+        // Unlike a plain reduce-with-indices, the reduced axis keeps `k` entries
+        // rather than collapsing to 1.
+        let mut shape = tensor.shape.clone();
+        shape[dim] = k;
+        let out = TensorIr::uninit(new_id(), shape.clone(), tensor.dtype);
+        let out_indices = TensorIr::uninit(new_id(), shape.clone(), dtype_indices);
+
+        TopKWithIndicesOpIr {
+            tensor,
+            dim,
+            k,
+            out,
+            out_indices,
+        }
+    }
+}
+
 impl DeformConv2dBackwardOpIr {
     #[allow(clippy::too_many_arguments)]
     pub fn create(
@@ -1245,5 +1603,42 @@ impl MaxPool2dWithIndicesOpIr {
             out,
             out_indices,
         }
+    }
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    #[test]
+    fn reshape_preserves_concrete_shape() {
+        for (source, target) in [
+            (Shape::new([2, 3]), Shape::new([3, 1, 2])),
+            (Shape::new([2, 0]), Shape::new([2, 1, 0])),
+            (Shape::new([2, 0]), Shape::new([0, 2])),
+            (Shape::new([0, 3]), Shape::new([1, 0, 3])),
+        ] {
+            let input = TensorIr::uninit(TensorId::new(1), source, DType::F32);
+            let desc = ShapeOpIr::reshape(input.clone(), target.clone(), || TensorId::new(2));
+
+            assert_eq!(desc.input, input);
+            assert_eq!(desc.out.shape, target);
+            assert_eq!(desc.out.dtype, input.dtype);
+            assert_eq!(desc.out.id, TensorId::new(2));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Reshape must preserve the number of elements")]
+    fn reshape_rejects_different_element_counts() {
+        let input = TensorIr::uninit(TensorId::new(1), Shape::new([2, 3]), DType::F32);
+        ShapeOpIr::reshape(input, Shape::new([2, 2]), || TensorId::new(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "Reshape must preserve the number of elements")]
+    fn reshape_rejects_zero_as_copy_dimension() {
+        let input = TensorIr::uninit(TensorId::new(1), Shape::new([2, 3]), DType::F32);
+        ShapeOpIr::reshape(input, Shape::new([0, 3]), || TensorId::new(2));
     }
 }

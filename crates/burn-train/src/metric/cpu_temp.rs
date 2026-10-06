@@ -1,8 +1,10 @@
+//! CPU Temperature metric
+
 use std::sync::Arc;
 
-/// CPU Temperature metric
 use super::MetricMetadata;
 use crate::metric::{Metric, MetricAttributes, MetricName, Numeric, NumericEntry, SerializedEntry};
+use burn_core::tensor::TensorReadError;
 use systemstat::{Platform, System};
 
 /// CPU Temperature in celsius degrees
@@ -35,7 +37,15 @@ impl Default for CpuTemperature {
 impl Metric for CpuTemperature {
     type Input = ();
 
-    fn update(&mut self, _item: &Self::Input, _metadata: &MetricMetadata) -> SerializedEntry {
+    fn update(
+        &mut self,
+        _item: &Self::Input,
+        _metadata: &MetricMetadata,
+    ) -> Result<SerializedEntry, TensorReadError> {
+        self.compute()
+    }
+
+    fn compute(&mut self) -> Result<SerializedEntry, TensorReadError> {
         match self.sys.cpu_temp() {
             Ok(temp) => self.temp_celsius = temp,
             Err(_) => self.temp_celsius = f32::NAN,
@@ -47,7 +57,7 @@ impl Metric for CpuTemperature {
         };
         let raw = format!("{:.2}", self.temp_celsius);
 
-        SerializedEntry::new(formatted, raw)
+        Ok(SerializedEntry::new(formatted, raw))
     }
 
     fn clear(&mut self) {}
@@ -66,11 +76,15 @@ impl Metric for CpuTemperature {
 }
 
 impl Numeric for CpuTemperature {
-    fn value(&self) -> NumericEntry {
-        NumericEntry::Value(self.temp_celsius as f64)
+    fn value(&self) -> Option<NumericEntry> {
+        Some(NumericEntry::Value(self.temp_celsius as f64))
     }
 
-    fn running_value(&self) -> NumericEntry {
+    fn running_value(&self) -> Option<NumericEntry> {
+        Some(NumericEntry::Value(self.temp_celsius as f64))
+    }
+
+    fn final_value(&self) -> NumericEntry {
         NumericEntry::Value(self.temp_celsius as f64)
     }
 }

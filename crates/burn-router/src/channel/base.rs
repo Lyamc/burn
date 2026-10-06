@@ -1,31 +1,30 @@
 use alloc::string::String;
-use burn_backend::{DType, Element, Shape, backend::DeviceOps};
+use burn_backend::{DType, Shape, backend::DeviceOps};
 use burn_ir::TensorIr;
 
-use crate::{MultiBackendBridge, RouterTensor, RunnerClient, get_client};
+use crate::{MultiBackendBridge, RouterClient, RouterTensor, get_client};
 
 /// Type alias for `<Br as MultiBackendBridge>::TensorHandle`.
 pub type TensorHandle<Br> = <Br as MultiBackendBridge>::TensorHandle;
 
-/// Defines the connection channel and operations for a setup with multiple backend runner clients.
-pub trait RunnerChannel: Clone + Send + Sync + 'static + Sized {
+/// Defines the connection channel and operations for a setup with multiple backend router clients.
+pub trait RouterChannel: Clone + Send + Sync + 'static + Sized {
     /// Device type.
     type Device: DeviceOps;
     /// A bridge that can transfer tensors between multiple backends.
     type Bridge: MultiBackendBridge<Device = Self::Device>;
     /// Client type.
-    type Client: RunnerClient<Device = Self::Device>;
-    /// Float element type.
-    type FloatElem: Element;
-    /// Int element type.
-    type IntElem: Element;
-    /// Bool element type.
-    type BoolElem: Element;
+    type Client: RouterClient<Device = Self::Device>;
 
     /// Name of the channel.
     fn name(device: &Self::Device) -> String;
 
-    /// Initialize a new client for the given device.
+    /// Initialize a new unscoped client for the given device.
+    ///
+    /// [`get_client`] calls this on a cache miss and retains the result in the global client
+    /// locator. Channels whose client lifetime is externally scoped can instead construct their
+    /// client directly and install it with [`crate::register_scoped_client`]; that path deliberately
+    /// bypasses this method.
     fn init_client(device: &Self::Device) -> Self::Client;
 
     /// Get the tensor handle corresponding to the [tensor representation](TensorIr).

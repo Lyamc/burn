@@ -1,7 +1,14 @@
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-//! A library for training reinforcement learning agents.
+//! Reinforcement learning building blocks for Burn.
+//!
+//! - [`Environment`]: a simulation an agent acts in, returning a [`StepResult`] per action.
+//! - [`Policy`]: maps observations to actions; [`PolicyLearner`] updates a policy from experience.
+//! - [`TransitionBuffer`]: a replay buffer of [`Transition`]s sampled in batches.
+//!
+//! Applications enable the `rl` feature of `burn` and use this crate as `burn::rl`. The training
+//! loop for agents lives in `burn-train` under its `rl` feature.
 
 /// Module for implementing an environment.
 pub mod environment;
@@ -15,14 +22,10 @@ pub use policy::*;
 pub use transition_buffer::*;
 
 #[cfg(test)]
-pub(crate) type TestBackend = burn_flex::Flex;
-
-#[cfg(test)]
 pub(crate) mod tests {
-    use crate::{Batchable, Policy, PolicyState, TestBackend};
+    use crate::{Batchable, Policy, PolicyState};
 
-    use burn_core::record::Record;
-    use burn_core::{self as burn};
+    use burn_core::tensor::Device;
 
     /// Mock policy for testing
     ///
@@ -40,7 +43,7 @@ pub(crate) mod tests {
         }
     }
 
-    impl Policy<TestBackend> for MockPolicy {
+    impl Policy for MockPolicy {
         type Observation = MockObservation;
         type ActionDistribution = MockActionDistribution;
         type Action = MockAction;
@@ -82,10 +85,11 @@ pub(crate) mod tests {
             MockPolicyState
         }
 
-        fn load_record(
-            self,
-            _record: <Self::PolicyState as PolicyState<TestBackend>>::Record,
-        ) -> Self {
+        fn load_record(self, _record: <Self::PolicyState as PolicyState>::Record) -> Self {
+            self
+        }
+
+        fn to_device(self, _device: &Device) -> Self {
             self
         }
     }
@@ -109,16 +113,16 @@ pub(crate) mod tests {
     #[derive(Clone)]
     pub(crate) struct MockPolicyState;
 
-    #[derive(Clone, Record)]
+    #[derive(Clone)]
     pub(crate) struct MockRecord {
-        item: usize,
+        _item: usize,
     }
 
-    impl PolicyState<TestBackend> for MockPolicyState {
+    impl PolicyState for MockPolicyState {
         type Record = MockRecord;
 
         fn into_record(self) -> Self::Record {
-            MockRecord { item: 0 }
+            MockRecord { _item: 0 }
         }
 
         fn load_record(&self, _record: Self::Record) -> Self {

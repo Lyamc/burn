@@ -2,34 +2,31 @@ use burn_core as burn;
 
 use crate::{ModuleSnapshot, SafetensorsStore};
 use burn_core::module::{Module, Param};
+use burn_core::tensor::{Device, Tensor, shape};
 use burn_nn::{Linear, LinearConfig};
-use burn_tensor::backend::Backend;
-use burn_tensor::{Tensor, shape};
-
-type TestBackend = burn_flex::Flex;
 
 #[derive(Module, Debug)]
-pub(super) struct ComplexModule<B: Backend> {
-    pub encoder: EncoderModule<B>,
-    pub decoder: DecoderModule<B>,
-    pub layers: Vec<Linear<B>>,
+pub(super) struct ComplexModule {
+    pub encoder: EncoderModule,
+    pub decoder: DecoderModule,
+    pub layers: Vec<Linear>,
 }
 
 #[derive(Module, Debug)]
-pub(super) struct EncoderModule<B: Backend> {
-    pub weight: Param<Tensor<B, 3>>,
-    pub bias: Param<Tensor<B, 1>>,
-    pub norm: Param<Tensor<B, 1>>,
+pub(super) struct EncoderModule {
+    pub weight: Param<Tensor<3>>,
+    pub bias: Param<Tensor<1>>,
+    pub norm: Param<Tensor<1>>,
 }
 
 #[derive(Module, Debug)]
-pub(super) struct DecoderModule<B: Backend> {
-    pub projection: Linear<B>,
-    pub scale: Param<Tensor<B, 2>>,
+pub(super) struct DecoderModule {
+    pub projection: Linear,
+    pub scale: Param<Tensor<2>>,
 }
 
-impl<B: Backend> ComplexModule<B> {
-    pub fn new(device: &B::Device) -> Self {
+impl ComplexModule {
+    pub fn new(device: &Device) -> Self {
         Self {
             encoder: EncoderModule {
                 weight: Param::from_data(
@@ -50,7 +47,7 @@ impl<B: Backend> ComplexModule<B> {
         }
     }
 
-    pub fn new_zeros(device: &B::Device) -> Self {
+    pub fn new_zeros(device: &Device) -> Self {
         Self {
             encoder: EncoderModule {
                 weight: Param::from_tensor(Tensor::zeros([2, 2, 2], device)),
@@ -72,8 +69,8 @@ impl<B: Backend> ComplexModule<B> {
 #[test]
 fn complex_module_round_trip() {
     let device = Default::default();
-    let module1 = ComplexModule::<TestBackend>::new(&device);
-    let mut module2 = ComplexModule::<TestBackend>::new_zeros(&device);
+    let module1 = ComplexModule::new(&device);
+    let mut module2 = ComplexModule::new_zeros(&device);
 
     // Save module1 using new store API
     let mut save_store = SafetensorsStore::from_bytes(None);
@@ -98,9 +95,42 @@ fn complex_module_round_trip() {
     let module2_views = module2.collect(None, None, false);
     let encoder_weight = module2_views
         .iter()
-        .find(|v| v.full_path() == "encoder.weight")
-        .unwrap()
-        .to_data()
+        .find(|v| v.name == "encoder.weight")
+        .map(|v| crate::bridge::to_data(v).unwrap())
         .unwrap();
-    assert_eq!(encoder_weight.shape, shape![2, 2, 2]);
+    assert_eq!(*encoder_weight.shape(), shape![2, 2, 2]);
+}
+
+/// Safetensors stores no parameter identity, so importing from it must leave the target module's
+/// ParamIds untouched. Randomizing them here would orphan optimizer state keyed by ParamId.
+#[test]
+fn round_trip_keeps_target_param_ids() {
+    let device = Default::default();
+    let module1 = ComplexModule::new(&device);
+    let mut module2 = ComplexModule::new_zeros(&device);
+
+    let expected_bias_id = module2.encoder.bias.id;
+    let expected_norm_id = module2.encoder.norm.id;
+
+    let mut save_store = SafetensorsStore::from_bytes(None);
+    module1.save_into(&mut save_store).unwrap();
+
+    let mut load_store = SafetensorsStore::from_bytes(None);
+    if let SafetensorsStore::Memory(ref mut p) = load_store
+        && let SafetensorsStore::Memory(ref p_save) = save_store
+    {
+        let data_arc = p_save.data().unwrap();
+        p.set_data(data_arc.as_ref().clone());
+    }
+    let result = module2.load_from(&mut load_store).unwrap();
+    assert!(result.is_success());
+
+    assert_eq!(
+        module2.encoder.bias.id, expected_bias_id,
+        "encoder.bias should keep its ParamId across a safetensors import"
+    );
+    assert_eq!(
+        module2.encoder.norm.id, expected_norm_id,
+        "encoder.norm should keep its ParamId across a safetensors import"
+    );
 }

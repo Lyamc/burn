@@ -1,12 +1,13 @@
-use alloc::{sync::Arc, vec::Vec};
+use alloc::vec::Vec;
 
-#[cfg(feature = "distributed")]
 use burn_backend::distributed::DistributedParams;
 
 #[cfg(target_has_atomic = "64")]
 use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(target_has_atomic = "64"))]
 use portable_atomic::{AtomicU64, Ordering};
+
+use burn_std::sync::Arc;
 
 use crate::checkpoint::retro_forward::RetroForward;
 use crate::runtime::AutodiffClientImpl;
@@ -40,7 +41,6 @@ pub struct Node {
     pub requirement: Requirement,
     pub properties: ComputingProperty,
     pub client: AutodiffClientImpl,
-    #[cfg(feature = "distributed")]
     pub distributed_params: Option<DistributedParams>,
 }
 pub type NodeRef = Arc<Node>;
@@ -48,6 +48,8 @@ pub type NodeRef = Arc<Node>;
 #[derive(new, Debug, Clone, PartialEq, Eq)]
 pub struct Parent {
     pub id: NodeId,
+    /// Leaves remain valid gradient endpoints after their no-op root step is consumed.
+    pub is_leaf: bool,
 }
 
 impl Node {
@@ -61,7 +63,7 @@ impl Node {
 }
 
 /// Unique identifier generated for each node.
-#[derive(Clone, Hash, PartialEq, Eq, Debug, Copy)]
+#[derive(Clone, Hash, PartialEq, Eq, Debug, Copy, Ord, PartialOrd)]
 pub struct NodeId {
     /// The integer representation of the id
     pub value: u64,

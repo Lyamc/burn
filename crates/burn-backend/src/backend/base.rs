@@ -1,43 +1,67 @@
 use burn_std::DType;
-pub use burn_std::backtrace::BackTrace;
+pub use burn_std::{ExecutionError, backtrace::BackTrace};
 
-use alloc::string::String;
-use enumset::{EnumSet, EnumSetType};
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
-
-use crate::element::Element;
+use crate::distributed::DistributedOps;
+pub use crate::element::Element;
 use crate::ops::*;
 use crate::tensor::{BoolTensor, FloatTensor, IntTensor, QuantizedTensor};
-use crate::{QTensorPrimitive, TensorData, TensorMetadata};
+use crate::{TensorData, TensorMetadata};
+use alloc::string::String;
+use alloc::vec::Vec;
+use enumset::{EnumSet, EnumSetType};
 
-#[cfg(feature = "distributed")]
 use crate::distributed::{DistributedParamId, DistributedParams};
 
 use super::DeviceOps;
+use super::profile::profile_unsupported;
+use super::{MemoryPoolUsage, SlicedPoolReport};
+use super::{ProfileDuration, ProfileOptions, ProfileToken, profile_system_time};
 
-/// The mapping of types used by Backend and traits like Numeric, BasicOps
-pub trait BackendTypes {
+/// The mapping of types used by Backend and traits.
+pub trait BackendTypes: Clone + Send + Sync + core::fmt::Debug + 'static {
     /// Device type.
     type Device: DeviceOps;
 
     /// Tensor primitive to be used for all float operations.
-    type FloatTensorPrimitive: TensorMetadata + 'static;
-    /// Default float element type.
-    type FloatElem: Element;
+    type FloatTensorPrimitive: TensorMetadata<Device = Self::Device> + 'static;
 
     /// Tensor primitive to be used for all int operations.
-    type IntTensorPrimitive: TensorMetadata + 'static;
-    /// Int element type.
-    type IntElem: Element;
+    type IntTensorPrimitive: TensorMetadata<Device = Self::Device> + 'static;
 
     /// Tensor primitive to be used for all bool operations.
-    type BoolTensorPrimitive: TensorMetadata + 'static;
-    /// Tensor primitive to be used for all bool operations.
-    type BoolElem: Element;
+    type BoolTensorPrimitive: TensorMetadata<Device = Self::Device> + 'static;
 
     /// Tensor primitive to be used for all quantized operations.
-    type QuantizedTensorPrimitive: TensorMetadata + QTensorPrimitive + 'static;
+    type QuantizedTensorPrimitive: TensorMetadata<Device = Self::Device> + 'static;
+
+    /// Captured graph primitive returned by [`Backend::graph_stop_capture`] and
+    /// consumed by [`Backend::graph_replay`]: a backend-owned recording of a
+    /// launch sequence that replays as a single dispatch.
+    ///
+    /// Backends without graph-capture support use [`GraphUnsupported`], an
+    /// uninhabited type — their capture methods only ever error, so no value of
+    /// it can exist.
+    type GraphPrimitive: Clone + Send + Sync + core::fmt::Debug + 'static;
+}
+
+/// Captured graph primitive type used by the backend (see
+/// [`BackendTypes::GraphPrimitive`]).
+pub type BackendGraph<B> = <B as BackendTypes>::GraphPrimitive;
+
+/// Placeholder [graph primitive](BackendTypes::GraphPrimitive) for backends
+/// without graph-capture support.
+///
+/// Uninhabited: `graph_stop_capture` on such backends always errors, so a value
+/// of this type can never be constructed (and `graph_replay` can never be called).
+#[derive(Debug, Clone, Copy)]
+pub enum GraphUnsupported {}
+
+/// The error returned by the default (unsupported) graph-capture methods.
+fn graph_unsupported() -> ExecutionError {
+    ExecutionError::Generic {
+        reason: alloc::string::String::from("graph capture is not supported by this backend"),
+        backtrace: BackTrace::capture(),
+    }
 }
 
 /// This trait defines all types and functions needed for a backend to be used with burn.
@@ -98,6 +122,7 @@ pub trait Backend:
     + ActivationOps<Self>
     + QTensorOps<Self>
     + TransactionOps<Self>
+    + DistributedOps<Self>
     + Clone
     + Default
     + Sized
@@ -129,6 +154,25 @@ pub trait Backend:
     #[allow(unused_variables)]
     fn memory_cleanup(device: &Self::Device) {}
 
+    /// The dynamic pools' measured state, in the order allocations are routed
+    /// through them. `None` on a backend that does not report one, or whose
+    /// stream has failed.
+    ///
+    /// One entry per pool that carves pages, the pools a growth left behind
+    /// last. Pools of other kinds — an allocation's own page, the metadata
+    /// churn — are left out.
+    #[allow(unused_variables)]
+    fn memory_pool_report(device: &Self::Device) -> Option<Vec<SlicedPoolReport>> {
+        None
+    }
+
+    /// The device allocator's current state. `None` on a backend that does not
+    /// report one, or whose stream has failed.
+    #[allow(unused_variables)]
+    fn memory_pool_usage(device: &Self::Device) -> Option<MemoryPoolUsage> {
+        None
+    }
+
     /// Name of the backend.
     fn name(device: &Self::Device) -> String;
 
@@ -144,6 +188,152 @@ pub trait Backend:
     fn sync(_device: &Self::Device) -> Result<(), ExecutionError> {
         Ok(())
     }
+
+    /// Measure how long the device spends on the work `func` puts on the
+    /// calling stream, in device time.
+    ///
+    /// The window opens where the stream is when the call is made and closes
+    /// where the stream is when `func` returns: work the stream still owed
+    /// from before falls in, and work a backend queues past the end (a
+    /// batching backend's last operations, unless `options` flush) falls out.
+    /// Nothing is waited on — the [`ProfileDuration`] resolves later, when
+    /// the device has stamped both ends — so windows nest without the inner
+    /// ones being charged to the outer. Work on other streams is not kept
+    /// out, and not counted. A window that nothing ran in reads as no time.
+    ///
+    /// The default is [`profile_system_time`]: wall-clock time between two
+    /// syncs, for a backend with no device clock to read. That one does wait,
+    /// and an inner window's syncs are charged to the outer.
+    ///
+    /// # Errors
+    ///
+    /// The device refused to open or close the window, or work inside it
+    /// failed and took the measurement with it. `func` has run by then — a
+    /// window that could not be opened does not cancel the work it was asked
+    /// to measure — and its output is lost with the error, as it would be on
+    /// the read that the failure surfaces on without a window.
+    ///
+    /// **A failure that the device only reports later is not here.** The
+    /// measurement is resolved after this returns, so anything the device
+    /// learns in between — and everything a *remote* server reports, which
+    /// travels back with the measurement rather than ahead of it — arrives as
+    /// a window that resolves to no measurement, with the reason in the log.
+    /// A caller that must distinguish "nothing ran" from "the server failed"
+    /// cannot do it from the `Result` alone.
+    fn profile<O: Send + 'static>(
+        device: &Self::Device,
+        options: ProfileOptions,
+        func: impl FnOnce() -> O + Send,
+    ) -> Result<(O, ProfileDuration), ExecutionError> {
+        let _ = options;
+        profile_system_time::<Self, O>(device, func)
+    }
+
+    /// Open a [profiling window](Self::profile) at the calling stream's
+    /// current position, to be closed with
+    /// [`profile_end`](Self::profile_end) from the same stream.
+    ///
+    /// For a caller that cannot bracket the work in a closure: a backend that
+    /// forwards operations to be executed on another thread opens and closes
+    /// the window from that thread, in order with the operations.
+    ///
+    /// `None` from a backend that opens no windows and measures only with
+    /// [`profile`](Self::profile) — the default — so the caller can bracket
+    /// with [`profile_system_time`] instead.
+    fn profile_start(_device: &Self::Device) -> Result<Option<ProfileToken>, ExecutionError> {
+        Ok(None)
+    }
+
+    /// Close the window `token` at the calling stream's current position.
+    ///
+    /// When `options` flush, the work the backend still holds queued for the
+    /// stream executes first, so it falls inside the window. A backend that
+    /// forwards the close passes `options` along, so a queue further down
+    /// the chain — a remote server's fusion, say — is flushed too.
+    ///
+    /// Errors on a backend whose [`profile_start`](Self::profile_start) hands
+    /// out no token.
+    fn profile_end(
+        _device: &Self::Device,
+        _token: ProfileToken,
+        _options: ProfileOptions,
+    ) -> Result<ProfileDuration, ExecutionError> {
+        Err(profile_unsupported())
+    }
+
+    /// Drop the window `token` opened without measuring it, for a caller that
+    /// will never reach [`profile_end`](Self::profile_end).
+    ///
+    /// **An open window is not free**, and the cost is not paid once: a
+    /// backend holds a start event, keeps timestamp writes on, or retains
+    /// command buffers for as long as one is open, and on wgpu every later
+    /// pass keeps rewriting the live window's end slot. So a window whose
+    /// caller unwound between the two calls is abandoned rather than left,
+    /// which is what [`profile_with_tokens`](crate::profile_with_tokens) does
+    /// on the panic path.
+    ///
+    /// Cannot fail and answers nothing: it is called while a panic is already
+    /// unwinding, where there is nobody left to tell. The default closes the
+    /// window and discards the measurement, which every backend can already
+    /// do; one that can drop a window without recording an end does that
+    /// instead.
+    fn profile_abandon(device: &Self::Device, token: ProfileToken) {
+        let _ = Self::profile_end(device, token, ProfileOptions::default());
+    }
+
+    /// Prepare `device` for an upcoming graph capture: route allocations into a
+    /// stable pool so every buffer allocated before graph_stop_capture can
+    /// be pinned. Call before the warmup run. No-op by default.
+    ///
+    /// See [`burn_graph`](crate) — the closure-based `capture` helper drives
+    /// this whole sequence.
+    fn graph_prepare(_device: &Self::Device) -> Result<(), ExecutionError> {
+        Ok(())
+    }
+
+    /// Begin recording launches on `device` into a graph (see
+    /// [`graph_stop_capture`](Backend::graph_stop_capture)). Errors on backends
+    /// without hardware graph support, so callers fall back to re-running.
+    fn graph_start_capture(_device: &Self::Device) -> Result<(), ExecutionError> {
+        Err(graph_unsupported())
+    }
+
+    /// Stop recording and return the captured [graph](BackendTypes::GraphPrimitive),
+    /// ready to [`graph_replay`](Backend::graph_replay).
+    fn graph_stop_capture(_device: &Self::Device) -> Result<BackendGraph<Self>, ExecutionError> {
+        Err(graph_unsupported())
+    }
+
+    /// Replay a captured [graph](BackendTypes::GraphPrimitive) — one dispatch
+    /// re-running the recorded launches against their original buffers.
+    ///
+    /// # Safety
+    ///
+    /// The replay dispatches raw device work against the exact buffers recorded
+    /// at capture time, with nothing tracking whether those buffers are still
+    /// valid. The caller must guarantee, for every tensor the captured closure
+    /// read or wrote:
+    ///
+    /// - its buffer is still alive — no tensor referenced by the graph has been
+    ///   freed (and its memory possibly reallocated) since capture;
+    /// - it is not concurrently read or written by work on another stream or
+    ///   thread while the replay executes;
+    /// - input refreshes and output reads are issued on the stream the graph
+    ///   was captured on, so they order correctly against the replay.
+    unsafe fn graph_replay(
+        _device: &Self::Device,
+        _graph: &BackendGraph<Self>,
+    ) -> Result<(), ExecutionError> {
+        Err(graph_unsupported())
+    }
+
+    /// Flush any pending operation of the backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ExecutionError`] when the pending operations cannot be dispatched, e.g. on
+    /// a device that is poisoned.
+    fn flush(_device: &Self::Device) -> Result<(), ExecutionError>;
 
     /// Marks the given data as being used as a staging buffer for transfer between CPU and
     /// accelerators like GPUs.
@@ -179,40 +369,10 @@ pub trait Backend:
     fn device_count(type_id: u16) -> usize;
 }
 
-/// An error that can happen when syncing a device.
-#[derive(Error, Serialize, Deserialize)]
-pub enum ExecutionError {
-    /// A generic error happened during execution.
-    ///
-    /// The backtrace and context information should be included in the reason string.
-    #[error("An error happened during execution\nCaused by:\n  {reason}")]
-    WithContext {
-        /// The reason of the error.
-        reason: String,
-    },
-    /// A generic error happened during execution thrown in the Burn project.
-    ///
-    /// The full context isn't captured by the string alone.
-    #[error("An error happened during execution\nCaused by:\n  {reason}")]
-    Generic {
-        /// The reason of the error.
-        reason: String,
-        /// The backtrace.
-        #[serde(skip)]
-        backtrace: BackTrace,
-    },
-}
-
-impl core::fmt::Debug for ExecutionError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_fmt(format_args!("{self}"))
-    }
-}
-
 /// Trait that allows a backend to support autodiff.
 pub trait AutodiffBackend: Backend {
     /// The inner backend type.
-    type InnerBackend: Backend<Device = Self::Device, FloatElem = Self::FloatElem, IntElem = Self::IntElem>;
+    type InnerBackend: Backend<Device = Self::Device>;
 
     /// Gradients type.
     type Gradients: Send;
@@ -364,7 +524,6 @@ pub trait AutodiffBackend: Backend {
     /// The autodiff backend tensor.
     fn q_from_inner(tensor: QuantizedTensor<Self::InnerBackend>) -> QuantizedTensor<Self>;
 
-    #[cfg(feature = "distributed")]
     /// Mark the tensor as distributed across multiple devices.
     /// The gradients will be aggregated during the backward pass.
     ///
@@ -376,13 +535,11 @@ pub trait AutodiffBackend: Backend {
         tensor
     }
 
-    #[cfg(feature = "distributed")]
     /// Returns the distributed parameters if the tensor was marked as distributed.
     fn distributed_params(_tensor: &FloatTensor<Self>) -> Option<DistributedParams> {
         None
     }
 
-    #[cfg(feature = "distributed")]
     /// Returns true if the tensor was marked as distributed.
     fn is_distributed(_tensor: &FloatTensor<Self>) -> bool {
         false

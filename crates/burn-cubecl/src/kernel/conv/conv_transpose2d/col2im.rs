@@ -1,5 +1,4 @@
 use crate::{
-    CubeRuntime,
     kernel::{
         conv::batches_per_run,
         into_contiguous_aligned,
@@ -10,6 +9,7 @@ use crate::{
     ops::{numeric::empty_device_dtype, reshape, swap_dims},
     tensor::CubeTensor,
 };
+use burn_backend::cubecl::dtype_to_storage_type;
 use burn_backend::{
     Shape,
     ops::{ConvTransposeOptions, conv::calculate_conv_transpose_output_size},
@@ -17,7 +17,7 @@ use burn_backend::{
 use cubecl::{
     calculate_cube_count_elemwise,
     prelude::*,
-    std::{FastDivmod, tensor::layout::linear::LinearView},
+    std::{FastDivmod, tensor::layout::linear::LinearViewMut},
 };
 use cubek::convolution::components::ConvSetupError;
 
@@ -27,12 +27,12 @@ use cubek::convolution::components::ConvSetupError;
 /// * `weight` - The weights (filter) applied to each kernel
 /// * `bias` - The bias added to each channel
 /// * `options` - The options to use for the convolution
-pub fn conv_transpose2d_col2im<R: CubeRuntime>(
-    input: CubeTensor<R>,
-    weight: CubeTensor<R>,
-    bias: Option<CubeTensor<R>>,
+pub fn conv_transpose2d_col2im(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
     options: ConvTransposeOptions<2>,
-) -> Result<CubeTensor<R>, ConvSetupError> {
+) -> Result<CubeTensor, ConvSetupError> {
     let [input_channels, im_ch_per_group, kernel_h, kernel_w] = weight.meta.shape().dims();
     let [batch_size, _, input_h, input_w] = input.meta.shape().dims();
     let groups = options.groups;
@@ -132,7 +132,7 @@ pub fn conv_transpose2d_col2im<R: CubeRuntime>(
     }
 }
 
-pub(crate) fn index<R: CubeRuntime>(tensor: CubeTensor<R>, i: usize) -> CubeTensor<R> {
+pub(crate) fn index(tensor: CubeTensor, i: usize) -> CubeTensor {
     #[allow(clippy::single_range_in_vec_init)]
     let mut indices = vec![i..i + 1];
     for dim in tensor.meta.shape()[1..].iter() {
@@ -144,11 +144,11 @@ pub(crate) fn index<R: CubeRuntime>(tensor: CubeTensor<R>, i: usize) -> CubeTens
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute<R: CubeRuntime>(
-    input: CubeTensor<R>,
-    weight: CubeTensor<R>,
-    bias: Option<CubeTensor<R>>,
-    image: CubeTensor<R>,
+fn execute(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: Option<CubeTensor>,
+    image: CubeTensor,
     options: ConvTransposeOptions<2>,
     kernel_h: usize,
     kernel_w: usize,
@@ -174,10 +174,10 @@ fn execute<R: CubeRuntime>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn col2im<R: CubeRuntime>(
-    columns: CubeTensor<R>,
-    bias: Option<CubeTensor<R>>,
-    out: CubeTensor<R>,
+fn col2im(
+    columns: CubeTensor,
+    bias: Option<CubeTensor>,
+    out: CubeTensor,
     kernel_h: usize,
     kernel_w: usize,
     out_h: usize,
@@ -202,7 +202,7 @@ fn col2im<R: CubeRuntime>(
             cube_dim,
             address_type!(columns, bias, out),
             columns.into_tensor_arg(),
-            bias.map(|bias| bias.into_tensor_arg()).into(),
+            bias.map(|bias| bias.into_buffer_arg()).into(),
             out.into_linear_view(),
             shape,
             Col2ImArgsLaunch::new(
@@ -217,7 +217,7 @@ fn col2im<R: CubeRuntime>(
                 options.stride[0],
                 options.stride[1],
             ),
-            dtype.into(),
+            dtype_to_storage_type(dtype),
         )
     };
 
@@ -243,11 +243,11 @@ struct Col2ImArgs {
 #[cube(launch_unchecked, address_type = "dynamic")]
 fn col2im_kernel<E: Numeric>(
     columns: &Tensor<E>,
-    bias: &ComptimeOption<Tensor<E>>,
-    image: &mut LinearView<E, ReadWrite>,
+    bias: ComptimeOption<&[E]>,
+    mut image: LinearViewMut<'_, E>,
     image_shape: Sequence<FastDivmod<usize>>,
     args: &Col2ImArgs,
-    #[define(E)] _dtype: StorageType,
+    #[define(E)] _dtype: ElemType,
 ) {
     if ABSOLUTE_POS >= image.shape() {
         terminate!();
@@ -300,7 +300,7 @@ fn col2im_kernel<E: Numeric>(
 
     #[comptime]
     match bias {
-        ComptimeOption::Some(bias) => image[ABSOLUTE_POS] = val + bias[ch_im],
-        ComptimeOption::None => image[ABSOLUTE_POS] = val,
+        ComptimeOption::Some(bias) => image.write(ABSOLUTE_POS, val + bias[ch_im]),
+        ComptimeOption::None => image.write(ABSOLUTE_POS, val),
     }
 }

@@ -1,27 +1,32 @@
 use crate::{
-    CubeRuntime,
     kernel::utils::address_type,
     ops::{max_vector_size, numeric::empty_device_dtype},
     tensor::CubeTensor,
 };
 use burn_backend::TensorMetadata;
+use burn_backend::cubecl::dtype_to_storage_type;
 use burn_std::DType;
 use cubecl::{
-    CubeDim, calculate_cube_count_elemwise, num_traits::One, prelude::*,
-    std::tensor::layout::linear::LinearView,
+    CubeDim, calculate_cube_count_elemwise,
+    num_traits::One,
+    prelude::*,
+    std::tensor::layout::linear::{LinearView, LinearViewMut},
 };
 
 #[cube(launch_unchecked, address_type = "dynamic")]
 fn bool_cast_kernel<B: Int, T: Numeric, N: Size>(
-    input: &LinearView<Vector<B, N>>,
-    output: &mut LinearView<Vector<T, N>, ReadWrite>,
-    #[define(B, T)] _dtypes: [StorageType; 2],
+    input: LinearView<'_, Vector<B, N>>,
+    mut output: LinearViewMut<'_, Vector<T, N>>,
+    #[define(B, T)] _dtypes: [ElemType; 2],
 ) {
     if !output.is_in_bounds(ABSOLUTE_POS) {
         terminate!();
     }
 
-    output[ABSOLUTE_POS] = Vector::cast_from(input[ABSOLUTE_POS] & Vector::one());
+    output.write(
+        ABSOLUTE_POS,
+        Vector::cast_from(input.read(ABSOLUTE_POS) & Vector::one()),
+    );
 }
 
 /// Cast a bool tensor to the given element type.
@@ -30,7 +35,7 @@ fn bool_cast_kernel<B: Int, T: Numeric, N: Size>(
 /// where any non-zero value means true. Depending how it was created
 /// it may hold an uncanny bit combination. Naively casting it would not
 /// necessarily yield 0 or 1.
-pub fn bool_cast<R: CubeRuntime>(tensor: CubeTensor<R>, out_dtype: DType) -> CubeTensor<R> {
+pub fn bool_cast(tensor: CubeTensor, out_dtype: DType) -> CubeTensor {
     let output = empty_device_dtype(
         tensor.client.clone(),
         tensor.device.clone(),
@@ -55,7 +60,10 @@ pub fn bool_cast<R: CubeRuntime>(tensor: CubeTensor<R>, out_dtype: DType) -> Cub
             vector_size,
             tensor.into_linear_view(),
             output.clone().into_linear_view(),
-            [dtype.into(), out_dtype.into()],
+            [
+                dtype_to_storage_type(dtype),
+                dtype_to_storage_type(out_dtype),
+            ],
         )
     };
 

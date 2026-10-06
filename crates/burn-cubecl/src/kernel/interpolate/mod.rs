@@ -1,8 +1,7 @@
 mod base;
-mod bicubic;
-mod bilinear;
-mod lanczos3;
-mod nearest;
-mod nearest_backward;
+#[cfg(feature = "autotune")]
+mod tune;
 
 pub use base::*;
+#[cfg(feature = "autotune")]
+pub use tune::*;

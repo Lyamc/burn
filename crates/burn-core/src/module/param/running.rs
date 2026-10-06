@@ -1,24 +1,13 @@
 use super::ParamId;
 use crate::module::{
-    AutodiffModule, Content, Module, ModuleDisplay, ModuleDisplayDefault, ModuleMapper,
-    ModuleVisitor, Param,
+    Content, Module, ModuleDisplay, ModuleDisplayDefault, ModuleMapper, ModuleVisitor, Param,
 };
 
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
-#[cfg(target_has_atomic = "ptr")]
-use alloc::sync::Arc;
-
-#[cfg(not(target_has_atomic = "ptr"))]
-use portable_atomic_util::Arc;
-
-use burn_std::stub::Mutex;
-use burn_tensor::{
-    Tensor,
-    backend::{AutodiffBackend, Backend},
-    ops::Device,
-};
+use burn_std::sync::{Arc, Mutex};
+use burn_tensor::{Device, Tensor};
 
 #[cfg(feature = "std")]
 mod threading {
@@ -33,7 +22,7 @@ mod threading {
 
 #[cfg(not(feature = "std"))]
 mod threading {
-    pub(super) use burn_std::stub::ThreadId;
+    pub(super) use burn_std::sync::ThreadId;
     pub(super) use hashbrown::HashMap;
 
     #[inline(always)]
@@ -75,46 +64,29 @@ impl<V> ModuleDisplayDefault for RunningState<V> {
 
 impl<V> ModuleDisplay for RunningState<V> {}
 
-impl<const D: usize, B: Backend> Module<B> for RunningState<Tensor<B, D>> {
-    type Record = Param<Tensor<B, D>>;
-
-    fn visit<V: ModuleVisitor<B>>(&self, visitor: &mut V) {
-        let tensor = self.value.lock().unwrap();
+impl<const D: usize> Module for RunningState<Tensor<D>> {
+    fn visit<V: ModuleVisitor>(&self, visitor: &mut V) {
+        let tensor = self.value.lock();
         let param = Param::initialized(self.id, tensor.clone());
         visitor.visit_float(&param)
     }
 
-    fn map<M: ModuleMapper<B>>(self, mapper: &mut M) -> Self {
-        let mut tensor = self.value.lock().unwrap();
+    fn map<M: ModuleMapper>(self, mapper: &mut M) -> Self {
+        let mut tensor = self.value.lock();
         let param = Param::initialized(self.id, tensor.clone());
         let param_out = mapper.map_float(param);
         let (_, tensor_out, _) = param_out.consume();
 
-        *tensor = tensor_out;
+        // Running state is a buffer, not an optimizer target. Mappers may transform its value,
+        // but must not make it require gradients.
+        *tensor = tensor_out.set_require_grad(false);
         core::mem::drop(tensor);
 
         self
     }
 
-    fn into_record(self) -> Self::Record {
-        self.sync();
-        let tensor = self.value.lock().unwrap();
-
-        Param::initialized(self.id, tensor.clone())
-    }
-
-    fn load_record(mut self, record: Self::Record) -> Self {
-        let mut tensor = self.value.lock().unwrap();
-        *tensor = record.val().to_device(&tensor.device());
-        self.id = record.id;
-
-        core::mem::drop(tensor);
-
-        self
-    }
-
-    fn to_device(self, device: &Device<B>) -> Self {
-        let mut tensor = self.value.lock().unwrap();
+    fn to_device(self, device: &Device) -> Self {
+        let mut tensor = self.value.lock();
         let tensor_out = tensor.clone().to_device(device);
 
         *tensor = tensor_out;
@@ -123,12 +95,12 @@ impl<const D: usize, B: Backend> Module<B> for RunningState<Tensor<B, D>> {
         self
     }
 
-    fn fork(self, device: &Device<B>) -> Self {
+    fn fork(self, device: &Device) -> Self {
         self.to_device(device) // Same thing here since no grad.
     }
 
-    fn collect_devices(&self, mut devices: Vec<Device<B>>) -> Vec<Device<B>> {
-        let device = self.value.lock().unwrap().device();
+    fn collect_devices(&self, mut devices: Vec<Device>) -> Vec<Device> {
+        let device = self.value.lock().device();
 
         if !devices.contains(&device) {
             devices.push(device)
@@ -136,11 +108,29 @@ impl<const D: usize, B: Backend> Module<B> for RunningState<Tensor<B, D>> {
 
         devices
     }
+
+    fn materialize(self) -> Self {
+        self
+    }
+
+    fn valid(&self) -> Self {
+        self.sync();
+        let value = self.value();
+
+        RunningState::with_id(self.id, value.without_autodiff())
+    }
+
+    fn train(self) -> Self {
+        self.sync();
+        let value = self.value();
+
+        RunningState::with_id(self.id, Tensor::from_inner(value))
+    }
 }
 
-impl<const D: usize, B: Backend> RunningState<Tensor<B, D>> {
+impl<const D: usize> RunningState<Tensor<D>> {
     /// Create a new running state.
-    pub fn new(value: Tensor<B, D>) -> Self {
+    pub fn new(value: Tensor<D>) -> Self {
         Self {
             id: ParamId::new(),
             values: Arc::new(Mutex::new(HashMap::new())),
@@ -149,7 +139,7 @@ impl<const D: usize, B: Backend> RunningState<Tensor<B, D>> {
     }
 
     /// Create a new running state.
-    pub fn with_id(id: ParamId, value: Tensor<B, D>) -> Self {
+    pub fn with_id(id: ParamId, value: Tensor<D>) -> Self {
         Self {
             id,
             values: Arc::new(Mutex::new(HashMap::new())),
@@ -158,7 +148,7 @@ impl<const D: usize, B: Backend> RunningState<Tensor<B, D>> {
     }
 
     /// Create a new running state from a record.
-    pub fn from_record(record: Param<Tensor<B, D>>) -> Self {
+    pub fn from_record(record: Param<Tensor<D>>) -> Self {
         let tensor = record.val();
         Self {
             id: record.id,
@@ -168,9 +158,9 @@ impl<const D: usize, B: Backend> RunningState<Tensor<B, D>> {
     }
 
     /// Update the value on the current thread.
-    pub fn update(&self, value: Tensor<B, D>) {
+    pub fn update(&self, value: Tensor<D>) {
         let thread_id = get_thread_current_id();
-        let mut map = self.values.lock().unwrap();
+        let mut map = self.values.lock();
 
         if map.contains_key(&thread_id) {
             self.update_value(&mut map);
@@ -184,8 +174,8 @@ impl<const D: usize, B: Backend> RunningState<Tensor<B, D>> {
     /// # Note
     ///
     /// The current value might be outdated by one update.
-    pub fn value(&self) -> Tensor<B, D> {
-        let value = self.value.lock().unwrap();
+    pub fn value(&self) -> Tensor<D> {
+        let value = self.value.lock();
         value.clone()
     }
 
@@ -195,28 +185,28 @@ impl<const D: usize, B: Backend> RunningState<Tensor<B, D>> {
     ///
     /// Don't use this function after an update on the same thread where other threads might have to
     /// register their update before the actual synchronization needs to happen.
-    pub fn value_sync(&self) -> Tensor<B, D> {
+    pub fn value_sync(&self) -> Tensor<D> {
         let thread_id = get_thread_current_id();
-        let mut map = self.values.lock().unwrap();
+        let mut map = self.values.lock();
 
         if map.contains_key(&thread_id) {
             self.update_value(&mut map);
         }
 
-        let value = self.value.lock().unwrap();
+        let value = self.value.lock();
         value.clone()
     }
 
     fn sync(&self) {
-        let mut map = self.values.lock().unwrap();
+        let mut map = self.values.lock();
 
         if !map.is_empty() {
             self.update_value(&mut map);
         }
     }
 
-    fn update_value(&self, map: &mut HashMap<ThreadId, Tensor<B, D>>) {
-        let mut value_updated: Option<Tensor<B, D>> = None;
+    fn update_value(&self, map: &mut HashMap<ThreadId, Tensor<D>>) {
+        let mut value_updated: Option<Tensor<D>> = None;
         let mut counter = 0;
 
         for (_key, tensor) in map.drain() {
@@ -233,26 +223,8 @@ impl<const D: usize, B: Backend> RunningState<Tensor<B, D>> {
 
         if let Some(value) = value_updated {
             let value = value.div_scalar(counter);
-            let mut value_old = self.value.lock().unwrap();
+            let mut value_old = self.value.lock();
             *value_old = value;
         }
-    }
-}
-
-impl<const D: usize, B: AutodiffBackend> AutodiffModule<B> for RunningState<Tensor<B, D>> {
-    type InnerModule = RunningState<Tensor<B::InnerBackend, D>>;
-
-    fn valid(&self) -> Self::InnerModule {
-        self.sync();
-        let value = self.value();
-
-        RunningState::with_id(self.id, value.inner())
-    }
-
-    fn from_inner(module: Self::InnerModule) -> Self {
-        module.sync();
-        let value = module.value();
-
-        RunningState::with_id(module.id, Tensor::from_inner(value))
     }
 }

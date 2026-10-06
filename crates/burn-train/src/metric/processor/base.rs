@@ -1,5 +1,8 @@
 use burn_core::data::dataloader::Progress;
-use burn_optim::LearningRate;
+use burn_optim::lr_scheduler::module_lr_scheduler::ModuleLearningRate;
+use burn_std::ExecutionError;
+
+use super::EventProcessorError;
 
 use crate::{
     LearnerSummary,
@@ -8,11 +11,27 @@ use crate::{
 
 /// Event happening during the training/validation process.
 pub enum LearnerEvent<T> {
-    /// Signal the start of the process (e.g., training start)
-    Start,
+    /// Signal the start of the process (e.g., training start).
+    Start {
+        /// The total number of training epochs.
+        total_epochs: usize,
+        /// The starting epoch.
+        starting_epoch: usize,
+        /// An optional label for this training.
+        label: Option<String>,
+    },
     /// Signal that an item have been processed.
     ProcessedItem(TrainingItem<T>),
-    /// Signal the end of an epoch.
+    /// Signal the start of a split.
+    StartSplit {
+        /// The epoch number.
+        epoch_number: usize,
+        /// The total number of items to be processed during this split.
+        total_items: usize,
+    },
+    /// Signal the end of a split, carrying the current epoch number.
+    EndSplit(usize),
+    /// Signal the end of a full epoch.
     EndEpoch(usize),
     /// Signal the end of the process (e.g., training end).
     End(Option<LearnerSummary>),
@@ -21,9 +40,16 @@ pub enum LearnerEvent<T> {
 /// Event happening during the evaluation process.
 pub enum EvaluatorEvent<T> {
     /// Signal the start of the process (e.g., evaluation start)
-    Start,
+    Start {
+        /// The total number of items to evaluate.
+        total_tests: usize,
+    },
+    /// Signal the start of a test split, carrying the split name and total number of items.
+    StartTest(EvaluationName, usize),
     /// Signal that an item have been processed.
     ProcessedItem(EvaluationName, EvaluationItem<T>),
+    /// Signal the end of a single test split.
+    EndTest,
     /// Signal the end of the process (e.g., evaluation end).
     End(Option<LearnerSummary>),
 }
@@ -31,20 +57,41 @@ pub enum EvaluatorEvent<T> {
 /// Items that are lazy are not ready to be processed by metrics.
 ///
 /// We want to sync them on a different thread to avoid blocking training.
-pub trait ItemLazy: Send {
-    /// Item that is properly synced and ready to be processed by metrics.
-    type ItemSync: Send;
-
+pub trait ItemLazy: Send + Sized {
     /// Sync the item.
-    fn sync(self) -> Self::ItemSync;
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ExecutionError`] when the item's pending work cannot be dispatched, e.g. on a
+    /// device that is poisoned.
+    fn sync(self) -> Result<Self, ExecutionError>;
 }
 
 /// Process events happening during training and validation.
 pub trait EventProcessorTraining<TrainEvent, ValidEvent>: Send {
     /// Collect a training event.
-    fn process_train(&mut self, event: TrainEvent);
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`EventProcessorError`] listing every metric that could not process the event.
+    /// The other metrics still processed it. Note that an asynchronous processor reports
+    /// it on a later call instead (see [`AsyncProcessorTraining`](super::AsyncProcessorTraining)).
+    fn process_train(&mut self, event: TrainEvent) -> Result<(), EventProcessorError>;
     /// Collect a validation event.
-    fn process_valid(&mut self, event: ValidEvent);
+    ///
+    /// # Errors
+    ///
+    /// Same as [`process_train`](Self::process_train).
+    fn process_valid(&mut self, event: ValidEvent) -> Result<(), EventProcessorError>;
+    /// Wait until previously submitted events are processed (no-op for sync processors).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`EventProcessorError`] listing every metric failure among the events processed
+    /// since the last error was reported.
+    fn flush(&mut self) -> Result<(), EventProcessorError> {
+        Ok(())
+    }
     /// Returns the renderer used for training.
     fn renderer(self) -> Box<dyn MetricsRenderer>;
 }
@@ -55,7 +102,26 @@ pub trait EventProcessorEvaluation: Send {
     type ItemTest: ItemLazy;
 
     /// Collect a test event.
-    fn process_test(&mut self, event: EvaluatorEvent<Self::ItemTest>);
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`EventProcessorError`] listing every metric that could not process the event.
+    /// The other metrics still processed it. Note that an asynchronous processor reports
+    /// it on a later call instead (see [`AsyncProcessorEvaluation`](super::AsyncProcessorEvaluation)).
+    fn process_test(
+        &mut self,
+        event: EvaluatorEvent<Self::ItemTest>,
+    ) -> Result<(), EventProcessorError>;
+
+    /// Wait until previously submitted events are processed (no-op for sync processors).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`EventProcessorError`] listing every metric failure among the events processed
+    /// since the last error was reported.
+    fn flush(&mut self) -> Result<(), EventProcessorError> {
+        Ok(())
+    }
 
     /// Returns the renderer used for evaluation.
     fn renderer(self) -> Box<dyn MetricsRenderer>;
@@ -70,27 +136,21 @@ pub struct TrainingItem<T> {
     /// The progress.
     pub progress: Progress,
 
-    /// The global progress of the training (e.g. epochs).
-    pub global_progress: Progress,
-
     /// The iteration, if it it different from the items processed.
     pub iteration: Option<usize>,
 
-    /// The learning rate.
-    pub lr: Option<LearningRate>,
+    /// The learning rate for a module's parameters.
+    pub lr: Option<ModuleLearningRate>,
 }
 
 impl<T: ItemLazy> ItemLazy for TrainingItem<T> {
-    type ItemSync = TrainingItem<T::ItemSync>;
-
-    fn sync(self) -> Self::ItemSync {
-        TrainingItem {
-            item: self.item.sync(),
+    fn sync(self) -> Result<Self, ExecutionError> {
+        Ok(TrainingItem {
+            item: self.item.sync()?,
             progress: self.progress,
-            global_progress: self.global_progress,
             iteration: self.iteration,
             lr: self.lr,
-        }
+        })
     }
 }
 
@@ -108,19 +168,17 @@ pub struct EvaluationItem<T> {
 }
 
 impl<T: ItemLazy> ItemLazy for EvaluationItem<T> {
-    type ItemSync = EvaluationItem<T::ItemSync>;
-
-    fn sync(self) -> Self::ItemSync {
-        EvaluationItem {
-            item: self.item.sync(),
+    fn sync(self) -> Result<Self, ExecutionError> {
+        Ok(EvaluationItem {
+            item: self.item.sync()?,
             progress: self.progress,
             iteration: self.iteration,
-        }
+        })
     }
 }
 
 impl ItemLazy for () {
-    type ItemSync = ();
-
-    fn sync(self) -> Self::ItemSync {}
+    fn sync(self) -> Result<Self, ExecutionError> {
+        Ok(())
+    }
 }

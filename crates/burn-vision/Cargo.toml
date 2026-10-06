@@ -10,7 +10,7 @@ edition.workspace = true
 keywords = ["deep-learning", "machine-learning", "gpu"]
 license.workspace = true
 name = "burn-vision"
-readme.workspace = true
+readme = "README.md"
 repository = "https://github.com/tracel-ai/burn/tree/main/crates/burn-vision"
 version.workspace = true
 
@@ -19,61 +19,76 @@ workspace = true
 
 
 [features]
-default = ["flex", "cubecl-backend", "fusion", "std"]
-std = ["aligned-vec/std", "burn-store?/std", "burn-std?/std"]
+default = [
+    "burn-core/default",
+    "burn-cubecl?/default",
+    "burn-fusion?/default",
+    "fusion",
+    "std",
+]
+std = [
+    "aligned-vec/std",
+    "burn-core/std",
+    "burn-cubecl?/std",
+    "burn-fusion?/std",
+    "burn-nn?/std",
+    "burn-store?/std",
+]
 tracing = [
     "burn-cubecl?/tracing",
     "burn-fusion?/tracing",
-    "burn-ir/tracing",
-    "burn-tch?/tracing",
-    "burn-tensor/tracing",
-    "cubecl/tracing",
+    "burn-core/tracing",
+    "cubecl?/tracing",
 ]
 
+# The cubecl vision ops. Implied by every runtime feature below and not selectable on its own:
+# the backend no longer carries its runtime in its type, so `CubeBackend` — and the ops
+# implemented on it — exist only once a runtime is compiled in.
 cubecl-backend = ["cubecl", "burn-cubecl"]
-fusion = ["burn-fusion", "burn-cuda/fusion", "burn-wgpu/fusion"]
-flex = ["burn-flex"]
-tch = ["burn-tch"]
+fusion = ["burn-fusion", "burn-core/fusion"]
+
+cuda = ["cubecl-backend", "burn-core/cuda", "burn-cubecl/cuda"]
+rocm = ["cubecl-backend", "burn-core/rocm", "burn-cubecl/hip"]
+wgpu = ["cubecl-backend", "burn-core/wgpu", "burn-cubecl/wgpu"]
+vulkan = ["cubecl-backend", "burn-core/vulkan", "burn-cubecl/vulkan"]
+webgpu = ["cubecl-backend", "burn-core/webgpu", "burn-cubecl/webgpu"]
+metal = ["cubecl-backend", "burn-core/metal", "burn-cubecl/metal"]
+cpu = ["cubecl-backend", "burn-core/cpu", "burn-cubecl/cpu"]
+flex = ["burn-core/flex"]
+tch = ["burn-core/tch"]
 
 # TODO: move somewhere else
-loss = ["std", "burn-store/pytorch", "burn-std/network", "dirs"]
-
-# Test features
-test-cpu = []
-test-cuda = ["cubecl-backend", ]
-test-wgpu = ["cubecl-backend", ]
-test-vulkan = ["burn-wgpu/vulkan", "test-wgpu"]
-test-metal = ["burn-wgpu/metal", "test-wgpu"]
+loss = ["std", "dep:burn-nn", "burn-store/pytorch", "burn-std/network", "dirs"]
 
 [dependencies]
-aligned-vec = { workspace = true }
+burn-cubecl = { workspace = true, optional = true }
+burn-fusion = { workspace = true, optional = true }
+burn-core = { workspace = true, features = [
+    "extension",
+] }
+burn-std = { workspace = true }
+
+# TODO: requires burn-backend. The `extension` feature should expose this from `burn-core`.
+
+aligned-vec = { version = "0.6", default-features = false }
 bon = { workspace = true }
-burn-cubecl = { workspace = true, optional = true, features = ["default"] }
-burn-fusion = { workspace = true, optional = true, features = ["default"] }
-burn-flex = { workspace = true, optional = true, features = ["default"] }
-burn-ir = { workspace = true, features = ["default"] }
-burn-tch = { workspace = true, optional = true, features = ["default"] }
-burn-tensor = { workspace = true, features = ["default"] }
-burn-tensor-testgen = { workspace = true, optional = true }
 
 # For loss functions requiring pretrained models (e.g., Gram Matrix Loss)
+burn-nn = { workspace = true, optional = true }
 burn-store = { workspace = true, optional = true }
-burn-std = { workspace = true, optional = true }
 dirs = { workspace = true, optional = true }
 
 bytemuck = { workspace = true }
 cubecl = { workspace = true, optional = true }
 derive-new = { workspace = true }
-half = { workspace = true }
 image = { version = "0.25" }
 macerator = { workspace = true }
 ndarray = { workspace = true }
 num-traits = { workspace = true }
-paste = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
-burn-cuda = { workspace = true }
-burn-flex = { workspace = true, features = ["default"] }
-burn-wgpu = { workspace = true }
-cubecl = { workspace = true }
+burn-core = { workspace = true, features = ["autodiff"] }
+
+[package.metadata.docs.rs]
+features = ["flex"]

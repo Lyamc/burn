@@ -7,19 +7,19 @@ use burn_backend::{
     tensor::IntTensor,
 };
 
-use crate::{IntoKind, LibTorch, LibTorchDevice, TchShape, TchTensor, element::TchElement};
+use crate::{IntoKind, LibTorch, LibTorchDevice, TchShape, TchTensor};
 
 use super::TchOps;
 
-impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
+impl IntTensorOps<Self> for LibTorch {
     fn int_from_data(data: TensorData, device: &LibTorchDevice) -> TchTensor {
-        match data.dtype {
+        match data.dtype() {
             burn_backend::DType::I64 => TchTensor::from_data::<i64>(data, (*device).into()),
             burn_backend::DType::I32 => TchTensor::from_data::<i32>(data, (*device).into()),
             burn_backend::DType::I16 => TchTensor::from_data::<i16>(data, (*device).into()),
             burn_backend::DType::I8 => TchTensor::from_data::<i8>(data, (*device).into()),
             burn_backend::DType::U8 => TchTensor::from_data::<u8>(data, (*device).into()),
-            _ => unimplemented!("Unsupported dtype for `int_from_data`: {:?}", data.dtype),
+            _ => unimplemented!("Unsupported dtype for `int_from_data`: {:?}", data.dtype()),
         }
     }
 
@@ -40,10 +40,6 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
 
     fn int_reshape(tensor: TchTensor, shape: Shape) -> TchTensor {
         TchOps::reshape(tensor, shape)
-    }
-
-    fn int_device(tensor: &TchTensor) -> LibTorchDevice {
-        tensor.tensor.device().into()
     }
 
     fn int_empty(shape: Shape, device: &LibTorchDevice, dtype: IntDType) -> TchTensor {
@@ -287,13 +283,30 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         TchOps::gather(dim, tensor, indices)
     }
 
-    fn int_scatter_add(
+    fn int_scatter(
         dim: usize,
         tensor: TchTensor,
         indices: TchTensor,
         value: TchTensor,
+        update: burn_backend::tensor::IndexingUpdateOp,
     ) -> TchTensor {
-        TchOps::scatter(dim, tensor, indices, value)
+        match update {
+            burn_backend::tensor::IndexingUpdateOp::Assign => {
+                TchOps::scatter_assign(dim, tensor, indices, value)
+            }
+            burn_backend::tensor::IndexingUpdateOp::Add => {
+                TchOps::scatter(dim, tensor, indices, value)
+            }
+            burn_backend::tensor::IndexingUpdateOp::Mul => {
+                TchOps::scatter_mul(dim, tensor, indices, value)
+            }
+            burn_backend::tensor::IndexingUpdateOp::Min => {
+                TchOps::scatter_min(dim, tensor, indices, value)
+            }
+            burn_backend::tensor::IndexingUpdateOp::Max => {
+                TchOps::scatter_max(dim, tensor, indices, value)
+            }
+        }
     }
 
     fn int_scatter_nd(
@@ -313,13 +326,30 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         TchOps::index_select_dim(tensor, dim, indices)
     }
 
-    fn int_select_add(
+    fn int_select_assign(
         tensor: TchTensor,
         dim: usize,
         indices: TchTensor,
         value: TchTensor,
+        update: burn_backend::tensor::IndexingUpdateOp,
     ) -> TchTensor {
-        TchOps::select_assign(tensor, dim, indices, value)
+        match update {
+            burn_backend::tensor::IndexingUpdateOp::Assign => {
+                TchOps::select_assign_replace(tensor, dim, indices, value)
+            }
+            burn_backend::tensor::IndexingUpdateOp::Add => {
+                TchOps::select_assign(tensor, dim, indices, value)
+            }
+            burn_backend::tensor::IndexingUpdateOp::Mul => {
+                TchOps::select_assign_mul(tensor, dim, indices, value)
+            }
+            burn_backend::tensor::IndexingUpdateOp::Min => {
+                TchOps::select_assign_min(tensor, dim, indices, value)
+            }
+            burn_backend::tensor::IndexingUpdateOp::Max => {
+                TchOps::select_assign_max(tensor, dim, indices, value)
+            }
+        }
     }
 
     fn int_mask_where(tensor: TchTensor, mask: TchTensor, source: TchTensor) -> TchTensor {
@@ -340,12 +370,16 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         )
     }
 
+    async fn int_mask_select(tensor: TchTensor, mask: TchTensor) -> TchTensor {
+        TchTensor::new(tensor.tensor.masked_select(&mask.tensor))
+    }
+
     fn int_argmax(tensor: TchTensor, dim: usize) -> TchTensor {
         TchOps::argmax(tensor, dim)
     }
 
-    fn int_argtopk(_tensor: TchTensor, _dim: usize, _k: usize) -> TchTensor {
-        panic!("argtopk not implemented for torch")
+    fn int_argtopk(tensor: TchTensor, dim: usize, k: usize) -> TchTensor {
+        TchOps::argtopk(tensor, dim, k)
     }
 
     fn int_topk(tensor: TchTensor, dim: usize, k: usize) -> TchTensor {

@@ -3,13 +3,13 @@ use crate::engine::codegen::{DynElem, DynSize};
 
 use super::{ir::*, tensor::GlobalTensor};
 use burn_std::quantization::QuantScheme;
-use cubecl::quant::scheme::QuantLevel;
+use cubecl::quant::scheme::QuantStore;
 use cubecl::{
     intrinsic,
-    ir::{ManagedVariable, Variable},
     prelude::*,
     std::{FastDivmod, tensor::View},
 };
+use cubecl::{ir::ExpandValue, prelude::polyfills::set_polyfill};
 use cubek::quantization::layout::{BlockScaledLayout, PerTensorLayout, ScalesLayout};
 use serde::{Deserialize, Serialize};
 
@@ -163,29 +163,50 @@ pub fn read<C: Scalar, N: Size>(
 fn index_offset_with_quant_layout(
     tensor: &GlobalTensor,
     locals: &LocalArgs,
-    index: usize,
+    offset_ref: usize,
     #[comptime] rank: usize,
     #[comptime] scheme: QuantScheme,
 ) -> usize {
-    let (start, end) = (0, rank - 1);
     let num_quants = scheme.num_quants();
+    let packed_axis = comptime![match scheme.store {
+        QuantStore::Native => rank - 1,
+        QuantStore::PackedU32(dim) | QuantStore::PackedNative(dim) => rank - dim - 1,
+    }];
 
-    let offset_ref = index * locals.ref_vector_size;
     let mut offset = 0;
 
     #[unroll]
-    for i in start..end {
-        let ogwl = offset_ref / locals.ref_strides[i];
-        offset += ogwl % tensor.tensor.shape(i) * tensor.tensor.stride(i);
+    for i in 0..rank {
+        let coord = offset_ref / locals.ref_strides[i] % tensor.tensor.shape(i);
+        if comptime![i == packed_axis] {
+            offset += coord / num_quants * tensor.tensor.stride(i);
+        } else {
+            offset += coord * tensor.tensor.stride(i);
+        }
     }
 
-    // Handle packed representation in last dim
-    let ogwl = offset_ref / locals.ref_strides[end];
-    let shape_last = tensor.tensor.shape(end).div_ceil(num_quants);
-    let stride_last = tensor.tensor.stride(end);
-    offset += (ogwl.div_ceil(num_quants)) % shape_last * stride_last;
-
     offset / tensor.tensor.vector_size()
+}
+
+#[cube]
+fn read_quantized_at<C: Scalar, N: Size>(
+    inputs: &GlobalArgs,
+    locals: &LocalArgs,
+    offset_ref: usize,
+    #[comptime] arg: FuseArg,
+    #[comptime] config: &FuseBlockConfig,
+    #[comptime] scheme: QuantScheme,
+) -> Vector<C, N> {
+    match arg {
+        FuseArg::Input(pos, _precision, _layout) => {
+            let global = inputs.tensors.index(pos);
+            let offset =
+                index_offset_with_quant_layout(global, locals, offset_ref, config.rank, scheme);
+            let val = global.tensor[offset];
+            Vector::cast_from(val)
+        }
+        _ => panic!("Not supported"),
+    }
 }
 
 /// Reads a global quantized tensor at the given position.
@@ -202,17 +223,28 @@ pub fn read_quantized<C: Scalar, N: Size>(
     #[comptime] config: &FuseBlockConfig,
     #[comptime] scheme: QuantScheme,
 ) -> Vector<C, N> {
-    match arg {
-        FuseArg::Input(pos, _precision, _layout) => {
-            let global = inputs.tensors.index(pos);
+    read_quantized_at::<C, N>(
+        inputs,
+        locals,
+        ref_pos * locals.ref_vector_size,
+        arg,
+        config,
+        scheme,
+    )
+}
 
-            let offset =
-                index_offset_with_quant_layout(global, locals, ref_pos, config.rank, scheme);
-            let val = global.tensor[offset];
-            Vector::cast_from(val)
-        }
-        _ => panic!("Not supported"),
-    }
+/// Reads a single packed quantized value for the logical tensor position.
+#[cube]
+pub fn read_quantized_scalar<C: Scalar>(
+    inputs: &GlobalArgs,
+    locals: &LocalArgs,
+    position: usize,
+    #[comptime] arg: FuseArg,
+    #[comptime] config: &FuseBlockConfig,
+    #[comptime] scheme: QuantScheme,
+) -> C {
+    let value = read_quantized_at::<C, Const<1>>(inputs, locals, position, arg, config, scheme);
+    value.extract(0usize)
 }
 
 /// Reads a global scalar.
@@ -264,19 +296,19 @@ pub fn read_input_window<C: CubePrimitive>(
     #[comptime] pos: usize,
     start: usize,
     end: usize,
-) -> Slice<C> {
+) -> &[C] {
     set_polyfill_typed::<C, DynElem, DynSize>();
     let tensor = inputs.tensors.index(pos);
-    let slice = tensor.tensor.slice(start, end);
+    let slice = &tensor.tensor[start..end];
     slice.downcast()
 }
 
 /// Returns the input as a slice.
 #[cube]
-pub fn input_as_slice<C: CubePrimitive>(inputs: &GlobalArgs, #[comptime] pos: usize) -> Slice<C> {
+pub fn input_as_slice<C: CubePrimitive>(inputs: &GlobalArgs, #[comptime] pos: usize) -> &[C] {
     set_polyfill_typed::<C, DynElem, DynSize>();
     let tensor = inputs.tensors.index(pos);
-    let slice = tensor.tensor.to_slice();
+    let slice = tensor.tensor.as_slice();
     slice.downcast()
 }
 
@@ -286,17 +318,21 @@ pub fn input_as_scales_view<C: Scalar, N: Size>(
     inputs: &GlobalArgs,
     #[comptime] pos: usize,
     #[comptime] tensor_pos: usize,
-    #[comptime] level: QuantLevel,
+    #[comptime] scheme: QuantScheme,
     #[comptime] config: &FuseBlockConfig,
-) -> View<C, usize> {
+) -> View<'static, C, usize> {
+    comptime!(assert!(
+        burn_std::quantization::global_scale_dtype(&scheme).is_none(),
+        "two-level quantization is not supported in fused kernels yet"
+    ));
     set_polyfill_typed::<Vector<C, N>, DynElem, DynSize>();
     let tensor = inputs.tensors.index(tensor_pos);
     let scales = inputs.tensors.index(pos);
     let tensor_len = tensor.tensor.len();
     let rank = config.rank;
-    let layout = match level {
-        QuantLevel::Tensor => ScalesLayout::new_PerTensor(PerTensorLayout::new(tensor_len)),
-        QuantLevel::Block(block_size) => {
+    let layout = match comptime![scheme.block_size()] {
+        None => ScalesLayout::new_PerTensor(PerTensorLayout::new(tensor_len)),
+        Some(block_size) => {
             let block_size = comptime![block_size.to_dim_vec(rank)];
             let mut tensor_shape = Sequence::new();
             let mut scales_strides = Sequence::new();
@@ -316,7 +352,8 @@ pub fn input_as_scales_view<C: Scalar, N: Size>(
             ScalesLayout::new_BlockScaled(layout)
         }
     };
-    View::new::<Slice<C>, usize>(&scales.tensor.to_slice().downcast(), layout)
+    let slice = scales.tensor.as_slice().downcast();
+    View::new::<Box<[C]>, usize>(unsafe { slice.as_boxed_unchecked() }, layout)
 }
 
 /// Reads the input tensor aligned.
@@ -348,29 +385,33 @@ pub fn read_input_aligned<C: Scalar, N: Size>(
                     comptime![shape.clone()],
                 );
                 let index = reshaped_index_to_original_index(&tensor.tensor, index, config.rank);
-                result[i] = C::cast_from(tensor.tensor[index][0])
+                result.insert(i, C::cast_from(tensor.tensor[index].extract(0usize)))
             }
         }
         Some(Transform::SwapDims(dim1, dim2)) => {
             let offset =
                 get_offset_aligned(inputs, locals, tensor, ref_pos, layout, config, transform);
-            let i = comptime![swap_dims_transform(config.rank - 1, (dim1, dim2))];
+            // `tensor` is the original; the block sees the swapped view. A line
+            // advances along `vector_axis` in the view's numbering, which is this
+            // dimension in the original's — the same mapping
+            // [index_offset_with_layout] applies to every dimension it walks.
+            let i = comptime![swap_dims_transform(config.vector_axis, (dim1, dim2))];
             let stride = tensor.tensor.stride(i);
 
             #[unroll]
             for i in 0..config.width {
                 let index = offset + i * stride;
-                result[i] = C::cast_from(tensor.tensor[index][0])
+                result.insert(i, C::cast_from(tensor.tensor[index].extract(0usize)))
             }
         }
         None => {
             let offset =
                 get_offset_aligned(inputs, locals, tensor, ref_pos, layout, config, transform);
-            let stride = tensor.tensor.stride(config.rank - 1);
+            let stride = tensor.tensor.stride(config.vector_axis);
             #[unroll]
             for i in 0..config.width {
                 let index = offset + i * stride;
-                result[i] = C::cast_from(tensor.tensor[index][0])
+                result.insert(i, C::cast_from(tensor.tensor[index].extract(0usize)))
             }
         }
     }
@@ -427,7 +468,7 @@ pub fn read_output<C: Scalar, N: Size>(
 }
 
 #[cube]
-/// Write the given value at the [arg](Arg) position.
+/// Write the given value at the [arg](FuseArg) position.
 pub fn write<C: Scalar, N: Size>(
     inputs: &GlobalArgs,
     outputs: &mut GlobalArgs,
@@ -446,7 +487,9 @@ pub fn write<C: Scalar, N: Size>(
             if comptime![output_vs != config.width] {
                 // Output tensor has a different vector_size than the computation width.
                 // Write element-by-element to avoid SPIR-V type mismatch.
-                write_output_aligned(inputs, outputs, locals, pos, ref_pos, value, layout, config);
+                write_output_aligned(
+                    inputs, outputs, &*locals, pos, ref_pos, value, layout, config,
+                );
             } else {
                 // Vector sizes match - set polyfill to output type and write directly.
                 set_polyfill::<DynElem, DynSize>(comptime![tensor.ty]);
@@ -454,7 +497,7 @@ pub fn write<C: Scalar, N: Size>(
                     LayoutInfo::SameAsRef => ref_pos,
                     LayoutInfo::IsRef => ref_pos,
                     LayoutInfo::Unknown => {
-                        get_offset(inputs, locals, tensor, ref_pos, None, config, None)
+                        get_offset(inputs, &*locals, tensor, ref_pos, None, config, None)
                     }
                 };
                 let tensor = outputs.tensors.index_mut(pos);
@@ -492,15 +535,16 @@ fn write_output_aligned<C: Scalar, N: Size>(
         LayoutInfo::SameAsRef | LayoutInfo::IsRef => {
             let offset = (ref_pos * config.width) / tensor.tensor.vector_size();
             let output = outputs.tensors.index_mut(pos);
-            let stride = output.tensor.stride(config.rank - 1);
+            let stride = output.tensor.stride(config.vector_axis);
 
             #[unroll]
             for i in 0..config.width {
                 let idx = offset + i * stride;
-                let val = if comptime![value.vector_size() == config.width] {
-                    Vector::cast_from(value[i])
+                let vec = value.vector_size();
+                let val = if comptime![vec == config.width] {
+                    Vector::cast_from(value.extract(i))
                 } else {
-                    Vector::cast_from(value[i % value.vector_size()])
+                    Vector::cast_from(value.extract(i % value.vector_size().comptime()))
                 };
                 output.tensor[idx] = val;
             }
@@ -526,10 +570,11 @@ fn write_output_aligned<C: Scalar, N: Size>(
                 );
                 let output = outputs.tensors.index_mut(pos);
 
-                let val = if comptime![value.vector_size() == config.width] {
-                    Vector::cast_from(value[i])
+                let vec = value.vector_size();
+                let val = if comptime![vec == config.width] {
+                    Vector::cast_from(value.extract(i))
                 } else {
-                    Vector::cast_from(value[i % value.vector_size()])
+                    Vector::cast_from(value.extract(i % value.vector_size().comptime()))
                 };
                 output.tensor[offset] = val;
             }
@@ -538,7 +583,7 @@ fn write_output_aligned<C: Scalar, N: Size>(
 }
 
 #[cube]
-/// Write the given value at the [arg](Arg) position.
+/// Write the given value at the [arg](FuseArg) position.
 pub fn write_scalar<C: Scalar, N: Size>(
     locals: &mut LocalArgs,
     value: Vector<C, N>,
@@ -860,7 +905,9 @@ pub(crate) fn reverse_index(
 #[cube]
 fn from_const_int<C: CubePrimitive>(#[comptime] value: usize) -> C {
     intrinsic!(|scope| {
-        ManagedVariable::Plain(Variable::constant(value.into(), C::as_type(scope))).into()
+        let val: NativeExpand<C::Scalar> =
+            ExpandValue::constant(value.into(), C::Scalar::elem_type(scope)).into();
+        C::__expand_cast_from(scope, val)
     })
 }
 
@@ -868,7 +915,7 @@ fn from_const_int<C: CubePrimitive>(#[comptime] value: usize) -> C {
 #[allow(clippy::extra_unused_type_parameters)]
 pub(crate) fn set_polyfill_typed<C: CubePrimitive, Dyn: Scalar, DynSize: Size>() {
     intrinsic!(|scope| {
-        let elem_type = C::as_type(scope);
-        set_polyfill::expand::<Dyn, DynSize>(scope, elem_type);
+        let elem_type = C::__expand_as_type(scope);
+        scope.register_value_type::<Dyn, DynSize>(elem_type);
     })
 }

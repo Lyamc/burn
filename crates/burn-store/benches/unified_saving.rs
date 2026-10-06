@@ -1,9 +1,10 @@
-#![recursion_limit = "256"]
+// The LibTorch bench group exists to compare against the deprecated backend.
+#![cfg_attr(feature = "tch", allow(deprecated))]
 
 //! Unified benchmark comparing all saving methods:
-//! - BurnpackStore (new native format)
-//! - NamedMpkFileRecorder (old native format)
-//! - SafetensorsStore (new)
+//! - BurnpackStore (streaming burnpack writer)
+//! - ModuleRecord (the record API, writing the same burnpack format)
+//! - SafetensorsStore
 //!
 //! Before running this benchmark, ensure the directory exists:
 //! ```bash
@@ -18,7 +19,6 @@ use burn_core as burn;
 
 use burn_core::module::Module;
 use burn_core::prelude::*;
-use burn_core::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use burn_nn as nn;
 use burn_store::{BurnpackStore, ModuleSnapshot, SafetensorsStore};
 use divan::{AllocProfiler, Bencher};
@@ -28,29 +28,14 @@ use std::path::PathBuf;
 #[global_allocator]
 static ALLOC: AllocProfiler = AllocProfiler::system();
 
-// Backend type aliases
-type FlexBackend = burn_flex::Flex;
-
-#[cfg(feature = "wgpu")]
-type WgpuBackend = burn_wgpu::Wgpu;
-
-#[cfg(feature = "cuda")]
-type CudaBackend = burn_cuda::Cuda<f32, i32>;
-
-#[cfg(feature = "tch")]
-type TchBackend = burn_tch::LibTorch<f32>;
-
-#[cfg(feature = "metal")]
-type MetalBackend = burn_wgpu::Metal;
-
 // Use the same LargeModel as other benchmarks for fair comparison
 #[derive(Module, Debug)]
-struct LargeModel<B: Backend> {
-    layers: Vec<nn::Linear<B>>,
+struct LargeModel {
+    layers: Vec<nn::Linear>,
 }
 
-impl<B: Backend> LargeModel<B> {
-    fn new(device: &B::Device) -> Self {
+impl LargeModel {
+    fn new(device: &Device) -> Self {
         let mut layers = Vec::new();
         // Create a model with 20 layers - same as loading benchmarks
         for i in 0..20 {
@@ -84,9 +69,9 @@ fn main() {
             println!("🚀 Running unified saving benchmarks...");
             println!();
             println!("Comparing 3 saving methods:");
-            println!("  1. BurnpackStore (new native format)");
-            println!("  2. NamedMpkFileRecorder (old native format)");
-            println!("  3. SafetensorsStore (new)");
+            println!("  1. BurnpackStore (streaming burnpack writer)");
+            println!("  2. ModuleRecord (record API, same burnpack format)");
+            println!("  3. SafetensorsStore");
             println!();
             println!("Available backends:");
             println!("  - Flex (CPU)");
@@ -111,19 +96,16 @@ fn main() {
 
 // Macro to generate benchmarks for each backend
 macro_rules! bench_backend {
-    ($backend:ty, $mod_name:ident, $backend_name:literal) => {
+    ($device:expr, $mod_name:ident, $backend_name:literal) => {
         #[divan::bench_group(name = $backend_name, sample_count = 10)]
         mod $mod_name {
             use super::*;
 
-            type TestBackend = $backend;
-            type TestDevice = Device<TestBackend>;
-
             #[divan::bench]
             fn burnpack_store(bencher: Bencher) {
                 bencher.bench(|| {
-                    let device: TestDevice = Default::default();
-                    let model = LargeModel::<TestBackend>::new(&device);
+                    let device = $device;
+                    let model = LargeModel::new(&device);
                     let output_path = get_output_dir().join("test_burnpack.bpk");
                     let mut store = BurnpackStore::from_file(output_path.clone()).overwrite(true);
                     model
@@ -135,15 +117,14 @@ macro_rules! bench_backend {
             }
 
             #[divan::bench]
-            fn namedmpk_recorder(bencher: Bencher) {
+            fn module_record(bencher: Bencher) {
                 bencher.bench(|| {
-                    let device: TestDevice = Default::default();
-                    let model = LargeModel::<TestBackend>::new(&device);
-                    let output_path = get_output_dir().join("test_namedmpk.mpk");
-                    let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::default();
+                    let device = $device;
+                    let model = LargeModel::new(&device);
+                    let output_path = get_output_dir().join("test_module_record.bpk");
                     model
-                        .save_file(output_path.clone(), &recorder)
-                        .expect("Failed to save with NamedMpkFileRecorder");
+                        .save_file(output_path.clone())
+                        .expect("Failed to save with ModuleRecord");
                     // Clean up
                     let _ = fs::remove_file(output_path);
                 });
@@ -152,8 +133,8 @@ macro_rules! bench_backend {
             #[divan::bench]
             fn safetensors_store(bencher: Bencher) {
                 bencher.bench(|| {
-                    let device: TestDevice = Default::default();
-                    let model = LargeModel::<TestBackend>::new(&device);
+                    let device = $device;
+                    let model = LargeModel::new(&device);
                     let output_path = get_output_dir().join("test_safetensors_store.safetensors");
                     let mut store = SafetensorsStore::from_file(output_path.clone());
                     model
@@ -168,16 +149,28 @@ macro_rules! bench_backend {
 }
 
 // Generate benchmarks for each backend
-bench_backend!(FlexBackend, flex_backend, "Flex Backend (CPU)");
+bench_backend!(Device::flex(), flex_backend, "Flex Backend (CPU)");
 
 #[cfg(feature = "wgpu")]
-bench_backend!(WgpuBackend, wgpu_backend, "WGPU Backend (GPU)");
+bench_backend!(
+    Device::wgpu(Default::default()),
+    wgpu_backend,
+    "WGPU Backend (GPU)"
+);
 
 #[cfg(feature = "cuda")]
-bench_backend!(CudaBackend, cuda_backend, "CUDA Backend (NVIDIA GPU)");
+bench_backend!(
+    CudaDevice::default(),
+    cuda_backend,
+    "CUDA Backend (NVIDIA GPU)"
+);
 
 #[cfg(feature = "tch")]
-bench_backend!(TchBackend, tch_backend, "LibTorch Backend");
+bench_backend!(Device::libtorch(), tch_backend, "LibTorch Backend");
 
 #[cfg(feature = "metal")]
-bench_backend!(MetalBackend, metal_backend, "Metal Backend (Apple GPU)");
+bench_backend!(
+    Device::wgpu(Default::default()),
+    metal_backend,
+    "Metal Backend (Apple GPU)"
+);

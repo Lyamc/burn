@@ -1,8 +1,10 @@
 mod base;
+mod error;
 mod in_memory;
 mod iterator;
 
 pub use base::*;
+pub use error::*;
 pub use in_memory::*;
 pub use iterator::*;
 
@@ -18,8 +20,8 @@ mod dataframe;
 #[cfg(feature = "dataframe")]
 pub use dataframe::*;
 
-#[cfg(any(feature = "sqlite", feature = "sqlite-bundled"))]
+#[cfg(feature = "sqlite")]
 pub use sqlite::*;
 
-#[cfg(any(feature = "sqlite", feature = "sqlite-bundled"))]
+#[cfg(feature = "sqlite")]
 mod sqlite;

@@ -3,8 +3,10 @@ use crate::{
     graph::{ComputingProperty, NodeId},
     tensor::AutodiffTensor,
 };
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, vec::Vec};
+
 use burn_backend::Backend;
+use burn_std::sync::Arc;
 use core::any::Any;
 
 use super::{
@@ -220,7 +222,7 @@ impl CheckpointerBuilder {
                         .iter()
                         .position(|action| action.id() == node_id);
                     self.backup_actions.remove(pos.unwrap_or_else(|| {
-                        panic!("Node {:?} is needed but never checkpointed", &node_id)
+                        panic!("Node {:?} is needed but never checkpointed", node_id)
                     }))
                 }
             };

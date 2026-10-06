@@ -1,11 +1,15 @@
 use crate::{
-    CubeRuntime,
     kernel::utils::address_type,
     ops::{max_vector_size, numeric::empty_device_dtype},
     tensor::CubeTensor,
 };
 use burn_backend::TensorMetadata;
-use cubecl::{calculate_cube_count_elemwise, prelude::*, std::tensor::layout::linear::LinearView};
+use burn_backend::cubecl::dtype_to_storage_type;
+use cubecl::{
+    calculate_cube_count_elemwise,
+    prelude::*,
+    std::tensor::layout::linear::{LinearView, LinearViewMut},
+};
 
 pub(crate) trait IntUnaryOpFamily: 'static + Send + Sync {
     type Options: LaunchArg;
@@ -21,22 +25,24 @@ pub(crate) trait IntUnaryOp<I: Scalar, N: Size>: 'static + Send + Sync {
 
 #[cube(launch_unchecked, address_type = "dynamic")]
 pub(crate) fn unary_int<I: Int, N: Size, O: IntUnaryOpFamily>(
-    input: &LinearView<Vector<I, N>>,
-    output: &mut LinearView<Vector<I, N>, ReadWrite>,
+    input: LinearView<'_, Vector<I, N>>,
+    mut output: LinearViewMut<'_, Vector<I, N>>,
     options: &O::Options,
-    #[define(I)] _dtype: StorageType,
+    #[define(I)] _dtype: ElemType,
 ) {
     if !output.is_in_bounds(ABSOLUTE_POS) {
         terminate!();
     }
 
-    output[ABSOLUTE_POS] = O::Unary::<I, N>::execute(input[ABSOLUTE_POS], options);
+    output.write(
+        ABSOLUTE_POS,
+        O::Unary::<I, N>::execute(input.read(ABSOLUTE_POS), options),
+    );
 }
 
-pub(crate) fn launch_unary_int<R, O, Args>(tensor: CubeTensor<R>, args: Args) -> CubeTensor<R>
+pub(crate) fn launch_unary_int<O, Args>(tensor: CubeTensor, args: Args) -> CubeTensor
 where
-    for<'a> Args: FnOnce(&'a ()) -> RuntimeArg<O::Options, R>,
-    R: CubeRuntime,
+    for<'a> Args: FnOnce(&'a ()) -> RuntimeArg<O::Options>,
     O: IntUnaryOpFamily,
 {
     let vector_size = max_vector_size(&tensor);
@@ -50,7 +56,7 @@ where
 
     unsafe {
         if tensor.can_mut() && tensor.is_nonoverlapping() {
-            unary_int::launch_unchecked::<O, R>(
+            unary_int::launch_unchecked::<O>(
                 &client,
                 cube_count,
                 cube_dim,
@@ -59,7 +65,7 @@ where
                 tensor.clone().into_linear_view(),
                 tensor.as_linear_view_alias(0),
                 args(&()),
-                dtype.into(),
+                dtype_to_storage_type(dtype),
             );
 
             tensor
@@ -71,7 +77,7 @@ where
                 tensor.dtype,
             );
 
-            unary_int::launch_unchecked::<O, R>(
+            unary_int::launch_unchecked::<O>(
                 &client,
                 cube_count,
                 cube_dim,
@@ -80,7 +86,7 @@ where
                 tensor.into_linear_view(),
                 output.clone().into_linear_view(),
                 args(&()),
-                dtype.into(),
+                dtype_to_storage_type(dtype),
             );
 
             output
@@ -94,12 +100,11 @@ pub(crate) mod unary_basic_int {
 
     use super::*;
 
-    pub(crate) fn launch<R, Args>(tensor: CubeTensor<R>, args: Args) -> CubeTensor<R>
+    pub(crate) fn launch<Args>(tensor: CubeTensor, args: Args) -> CubeTensor
     where
-        R: CubeRuntime,
         for<'a> Args: FnOnce(&'a ()) -> BasicIntUnaryKind,
     {
-        launch_unary_int::<R, BasicIntUnary, _>(tensor, |input| {
+        launch_unary_int::<BasicIntUnary, _>(tensor, |input| {
             BasicIntUnaryOptionsLaunch::new(args(input))
         })
     }
@@ -129,8 +134,8 @@ pub(crate) mod unary_basic_int {
                     let one = Vector::one();
                     let minus_one = Vector::new(I::new(-1));
 
-                    let is_positive = input.greater_than(zero);
-                    let is_negative = input.less_than(zero);
+                    let is_positive = input.greater_than(&zero);
+                    let is_negative = input.less_than(&zero);
                     let sign = select_many(is_negative, minus_one, zero);
 
                     select_many(is_positive, one, sign)

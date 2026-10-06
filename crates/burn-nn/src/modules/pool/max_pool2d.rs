@@ -5,8 +5,7 @@ use burn::config::Config;
 use burn::module::Module;
 use burn::module::{Content, DisplaySettings, ModuleDisplay};
 use burn::tensor::Tensor;
-use burn::tensor::backend::Backend;
-use burn::tensor::ops::PadMode;
+use burn::tensor::ops::MaxPoolOptions;
 
 use burn::tensor::module::max_pool2d;
 
@@ -35,7 +34,7 @@ pub struct MaxPool2dConfig {
 /// Applies a 2D max pooling over input tensors.
 ///
 /// Should be created with [MaxPool2dConfig](MaxPool2dConfig).
-#[derive(Module, Clone, Debug)]
+#[derive(Module, Debug)]
 #[module(custom_display)]
 pub struct MaxPool2d {
     /// The strides.
@@ -43,6 +42,7 @@ pub struct MaxPool2d {
     /// The size of the kernel.
     pub kernel_size: [usize; 2],
     /// The padding configuration.
+    #[module(skip)]
     pub padding: PaddingConfig2d,
     /// The dilation.
     pub dilation: [usize; 2],
@@ -59,10 +59,10 @@ impl ModuleDisplay for MaxPool2d {
 
     fn custom_content(&self, content: Content) -> Option<Content> {
         content
-            .add("kernel_size", &alloc::format!("{:?}", &self.kernel_size))
-            .add("stride", &alloc::format!("{:?}", &self.stride))
+            .add("kernel_size", &alloc::format!("{:?}", self.kernel_size))
+            .add("stride", &alloc::format!("{:?}", self.stride))
             .add_debug_attribute("padding", &self.padding)
-            .add("dilation", &alloc::format!("{:?}", &self.dilation))
+            .add("dilation", &alloc::format!("{:?}", self.dilation))
             .add("ceil_mode", &self.ceil_mode)
             .optional()
     }
@@ -90,54 +90,29 @@ impl MaxPool2d {
     ///
     /// - input: `[batch_size, channels, height_in, width_in]`
     /// - output: `[batch_size, channels, height_out, width_out]`
-    pub fn forward<B: Backend>(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
+    pub fn forward(&self, input: Tensor<4>) -> Tensor<4> {
         let [_batch_size, _channels_in, height_in, width_in] = input.dims();
-
-        // Calculate padding as pairs - handles Same, Valid, and Explicit uniformly
-        let ((top, bottom), (left, right)) = self.padding.calculate_padding_2d_pairs(
+        let (padding_height, padding_width) = self.padding.calculate_padding_2d_pairs(
             height_in,
             width_in,
             &self.kernel_size,
             &self.stride,
         );
 
-        // TODO: Move asymmetric padding to functional level via PoolOptions
-        // See: https://github.com/tracel-ai/burn/issues/4362
-        // Handle asymmetric padding by applying explicit pad operation first
-        if top != bottom || left != right {
-            // Burn's pad takes (left, right, top, bottom) for the last two dimensions
-            // Use -inf for max pooling so padded values don't affect the max
-            let padded = input.pad(
-                (left, right, top, bottom),
-                PadMode::Constant(f32::NEG_INFINITY),
-            );
-            // Use zero padding for the pool operation since we already padded
-            max_pool2d(
-                padded,
-                self.kernel_size,
-                self.stride,
-                [0, 0],
-                self.dilation,
-                self.ceil_mode,
-            )
-        } else {
-            // Symmetric padding
-            max_pool2d(
-                input,
-                self.kernel_size,
-                self.stride,
-                [top, left],
-                self.dilation,
-                self.ceil_mode,
-            )
-        }
+        max_pool2d(
+            input,
+            MaxPoolOptions::new(self.kernel_size)
+                .with_stride(self.stride)
+                .with_padding_pairs([padding_height, padding_width])
+                .with_dilation(self.dilation)
+                .with_ceil_mode(self.ceil_mode),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestBackend;
     use rstest::rstest;
 
     #[test]
@@ -149,7 +124,7 @@ mod tests {
         let pool = config.init();
 
         // Input: [batch=1, channels=2, height=5, width=5]
-        let input = Tensor::<TestBackend, 4>::ones([1, 2, 5, 5], &device);
+        let input = Tensor::<4>::ones([1, 2, 5, 5], &device);
         let output = pool.forward(input);
 
         // Same padding should preserve spatial dimensions
@@ -191,7 +166,7 @@ mod tests {
         let pool = config.init();
 
         // Input: [batch=1, channels=2, height=4, width=5]
-        let input = Tensor::<TestBackend, 4>::ones([1, 2, 4, 5], &device);
+        let input = Tensor::<4>::ones([1, 2, 4, 5], &device);
         let output = pool.forward(input);
 
         // Height: 4 + 1 + 3 = 8, output = (8 - 3) / 1 + 1 = 6
@@ -209,7 +184,7 @@ mod tests {
         let pool = config.init();
 
         // Input: [batch=1, channels=2, height=4, width=5]
-        let input = Tensor::<TestBackend, 4>::ones([1, 2, 4, 5], &device);
+        let input = Tensor::<4>::ones([1, 2, 4, 5], &device);
         let output = pool.forward(input);
 
         // Height: 4 + 2 + 2 = 8, output = (8 - 3) / 1 + 1 = 6

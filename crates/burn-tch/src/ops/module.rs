@@ -1,15 +1,16 @@
-use crate::{LibTorch, TchTensor, element::TchElement};
+use crate::{IntoKind, LibTorch, TchTensor};
 use burn_backend::{
-    TensorMetadata,
+    IntDType, TensorMetadata,
     ops::{
         AttentionModuleOptions, ConvOptions, ConvTransposeOptions, DeformConv2dBackward,
         DeformConvOptions, InterpolateMode, InterpolateOptions, MaxPool1dWithIndices,
         MaxPool2dBackward, MaxPool2dWithIndices, ModuleOps, attention::attention_fallback,
+        conv::pad_asymmetric_conv_input,
     },
     tensor::{FloatTensor, IntTensor},
 };
 
-impl<E: TchElement> ModuleOps<Self> for LibTorch<E> {
+impl ModuleOps<Self> for LibTorch {
     fn embedding(weights: TchTensor, indices: TchTensor) -> TchTensor {
         // Workaround for MPS "Placeholder storage has not been allocated" error.
         // See: https://github.com/pytorch/pytorch/issues/123995
@@ -66,12 +67,13 @@ impl<E: TchElement> ModuleOps<Self> for LibTorch<E> {
         bias: Option<TchTensor>,
         options: ConvOptions<1>,
     ) -> TchTensor {
+        let (x, options) = pad_asymmetric_conv_input::<LibTorch, 1>(x, options);
         let tensor = tch::Tensor::conv1d(
             &x.tensor,
             &weight.tensor,
             bias.map(|t| t.tensor),
             options.stride.map(|i| i as i64),
-            options.padding.map(|i| i as i64),
+            options.padding_begin().map(|i| i as i64),
             options.dilation.map(|i| i as i64),
             options.groups as i64,
         );
@@ -85,12 +87,13 @@ impl<E: TchElement> ModuleOps<Self> for LibTorch<E> {
         bias: Option<TchTensor>,
         options: ConvOptions<2>,
     ) -> TchTensor {
+        let (x, options) = pad_asymmetric_conv_input::<LibTorch, 2>(x, options);
         let tensor = tch::Tensor::conv2d(
             &x.tensor,
             &weight.tensor,
             bias.map(|t| t.tensor),
             options.stride.map(|i| i as i64),
-            options.padding.map(|i| i as i64),
+            options.padding_begin().map(|i| i as i64),
             options.dilation.map(|i| i as i64),
             options.groups as i64,
         );
@@ -109,7 +112,7 @@ impl<E: TchElement> ModuleOps<Self> for LibTorch<E> {
             &weight.tensor,
             bias.map(|t| t.tensor),
             options.stride.map(|i| i as i64),
-            options.padding.map(|i| i as i64),
+            options.padding_begin().map(|i| i as i64),
             options.dilation.map(|i| i as i64),
             options.groups as i64,
         );
@@ -290,6 +293,7 @@ impl<E: TchElement> ModuleOps<Self> for LibTorch<E> {
         padding: usize,
         dilation: usize,
         ceil_mode: bool,
+        indices_dtype: IntDType,
     ) -> MaxPool1dWithIndices<Self> {
         let (tensor, indices) = tch::Tensor::max_pool1d_with_indices(
             &x.tensor,
@@ -300,7 +304,10 @@ impl<E: TchElement> ModuleOps<Self> for LibTorch<E> {
             ceil_mode,
         );
 
-        MaxPool1dWithIndices::new(TchTensor::new(tensor), TchTensor::new(indices))
+        MaxPool1dWithIndices::new(
+            TchTensor::new(tensor),
+            TchTensor::new(indices.to_kind(indices_dtype.into_kind())),
+        )
     }
 
     fn max_pool2d(
@@ -330,6 +337,7 @@ impl<E: TchElement> ModuleOps<Self> for LibTorch<E> {
         padding: [usize; 2],
         dilation: [usize; 2],
         ceil_mode: bool,
+        indices_dtype: IntDType,
     ) -> MaxPool2dWithIndices<Self> {
         let (tensor, indices) = tch::Tensor::max_pool2d_with_indices(
             &x.tensor,
@@ -340,7 +348,10 @@ impl<E: TchElement> ModuleOps<Self> for LibTorch<E> {
             ceil_mode,
         );
 
-        MaxPool2dWithIndices::new(TchTensor::new(tensor), TchTensor::new(indices))
+        MaxPool2dWithIndices::new(
+            TchTensor::new(tensor),
+            TchTensor::new(indices.to_kind(indices_dtype.into_kind())),
+        )
     }
 
     fn max_pool2d_with_indices_backward(
@@ -379,6 +390,18 @@ impl<E: TchElement> ModuleOps<Self> for LibTorch<E> {
         TchTensor::new(tensor)
     }
 
+    fn adaptive_avg_pool3d(x: TchTensor, output_size: [usize; 3]) -> TchTensor {
+        let tensor = tch::Tensor::adaptive_avg_pool3d(&x.tensor, output_size.map(|e| e as i64));
+
+        TchTensor::new(tensor)
+    }
+
+    fn adaptive_avg_pool3d_backward(x: TchTensor, grad: TchTensor) -> TchTensor {
+        let tensor = tch::Tensor::internal_adaptive_avg_pool3d_backward(&x.tensor, &grad.tensor);
+
+        TchTensor::new(tensor)
+    }
+
     fn adaptive_avg_pool1d(x: TchTensor, output_size: usize) -> TchTensor {
         let tensor = tch::Tensor::adaptive_avg_pool1d(&x.tensor, output_size as i64);
 
@@ -396,6 +419,9 @@ impl<E: TchElement> ModuleOps<Self> for LibTorch<E> {
         let tensor = match options.mode {
             InterpolateMode::Nearest => {
                 tch::Tensor::upsample_nearest2d(&x.tensor, output_size, None, None)
+            }
+            InterpolateMode::NearestExact => {
+                panic!("nearest exact interpolation is not supported by PyTorch/tch backend")
             }
             InterpolateMode::Bilinear => {
                 tch::Tensor::upsample_bilinear2d(&x.tensor, output_size, align_corners, None, None)
@@ -430,6 +456,11 @@ impl<E: TchElement> ModuleOps<Self> for LibTorch<E> {
                 None,
                 None,
             ),
+            InterpolateMode::NearestExact => {
+                panic!(
+                    "nearest exact interpolation backward is not supported by PyTorch/tch backend"
+                )
+            }
             InterpolateMode::Bilinear => tch::Tensor::upsample_bilinear2d_backward(
                 &grad.tensor,
                 output_size,
@@ -568,29 +599,6 @@ impl<E: TchElement> ModuleOps<Self> for LibTorch<E> {
 
         TchTensor::new(grad)
     }
-
-    fn rfft(
-        signal: FloatTensor<Self>,
-        dim: usize,
-        n: Option<usize>,
-    ) -> (FloatTensor<Self>, FloatTensor<Self>) {
-        let complex = signal
-            .tensor
-            .fft_rfft(n.map(|v| v as i64), dim as i64, "backward");
-        let re = TchTensor::new(complex.real().contiguous());
-        let im = TchTensor::new(complex.imag().contiguous());
-        (re, im)
-    }
-
-    fn irfft(
-        spectrum_re: FloatTensor<Self>,
-        spectrum_im: FloatTensor<Self>,
-        dim: usize,
-        n: Option<usize>,
-    ) -> FloatTensor<Self> {
-        let complex = tch::Tensor::complex(&spectrum_re.tensor, &spectrum_im.tensor);
-        TchTensor::new(complex.fft_irfft(n.map(|v| v as i64), dim as i64, "backward"))
-    }
 }
 
 #[cfg(test)]
@@ -602,7 +610,7 @@ mod tests {
         read_sync,
     };
 
-    type B = crate::LibTorch<f32>;
+    type B = crate::LibTorch;
 
     #[test]
     fn ctc_loss_uniform() {

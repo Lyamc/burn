@@ -25,10 +25,6 @@ impl<B: Backend, C: CheckpointStrategy> BoolTensorOps<Self> for Autodiff<B, C> {
         B::bool_to_device(tensor, device)
     }
 
-    fn bool_device(tensor: &BoolTensor<B>) -> Device<B> {
-        B::bool_device(tensor)
-    }
-
     fn bool_reshape(tensor: BoolTensor<B>, shape: Shape) -> BoolTensor<B> {
         B::bool_reshape(tensor, shape)
     }
@@ -132,6 +128,13 @@ impl<B: Backend, C: CheckpointStrategy> BoolTensorOps<Self> for Autodiff<B, C> {
         value: Scalar,
     ) -> BoolTensor<Self> {
         B::bool_mask_fill(tensor, mask, value)
+    }
+
+    async fn bool_mask_select(
+        tensor: BoolTensor<Self>,
+        mask: BoolTensor<Self>,
+    ) -> BoolTensor<Self> {
+        B::bool_mask_select(tensor, mask).await
     }
 
     fn bool_gather(

@@ -2,20 +2,18 @@ use super::{AutodiffClient, server::AutodiffServer};
 use crate::{
     NodeId,
     checkpoint::builder::CheckpointerBuilder,
-    grads::Gradients,
+    grads::{BackwardMode, Gradients},
     graph::{Parent, StepBoxed},
     runtime::server::NodeCleaner,
     tensor::{AutodiffTensor, NodeRefCount},
 };
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-#[cfg(not(feature = "distributed"))]
 use burn_backend::Backend;
+use burn_std::sync::Arc;
 
-#[cfg(feature = "distributed")]
-use burn_backend::distributed::DistributedBackend;
-use hashbrown::{HashMap, HashSet};
+use alloc::collections::BTreeMap;
+use hashbrown::HashSet;
 
 #[cfg(feature = "std")]
 use parking_lot::{Mutex, MutexGuard};
@@ -46,11 +44,11 @@ pub struct GraphMutexClient;
 /// Multiple node ids can point to the same graph, where the autodiff graph is stored.
 #[derive(Default)]
 pub struct GraphLocator {
-    graphs: HashMap<NodeId, Arc<Graph>>,
+    graphs: BTreeMap<NodeId, Arc<Graph>>,
     /// We keep a mapping of each original node id (graph id) => all nodes that point to that graph.
     /// This is to ensure that when merging graphs, we correctly move all previous graphs to
     /// the new merged one.
-    keys: HashMap<NodeId, HashSet<NodeId>>,
+    keys: BTreeMap<NodeId, HashSet<NodeId>>,
 }
 
 /// Represents a single computation graph with a mutex-protected server.
@@ -110,8 +108,7 @@ impl AutodiffClient for GraphMutexClient {
         state.server.register(node_id_ref, step, actions);
     }
 
-    #[cfg(not(feature = "distributed"))]
-    fn backward<B: Backend>(&self, root: AutodiffTensor<B>) -> Gradients {
+    fn backward<B: Backend>(&self, root: AutodiffTensor<B>, mode: BackwardMode) -> Gradients {
         let node_id = root.node.id;
         let graph = GraphMutexClient::graph(root.node.id, &[]);
 
@@ -119,24 +116,7 @@ impl AutodiffClient for GraphMutexClient {
             let mut state = graph.state.lock();
             state
                 .server
-                .backward::<GraphCleaner, B>(root.node, root.primitive, node_id)
-        }; // lock released
-
-        GraphCleaner::cleanup_orphaned_entries();
-
-        grads
-    }
-
-    #[cfg(feature = "distributed")]
-    fn backward<B: DistributedBackend>(&self, root: AutodiffTensor<B>) -> Gradients {
-        let node_id = root.node.id;
-        let graph = GraphMutexClient::graph(root.node.id, &[]);
-
-        let grads = {
-            let mut state = graph.state.lock();
-            state
-                .server
-                .backward::<GraphCleaner, B>(root.node, root.primitive, node_id)
+                .backward::<GraphCleaner, B>(root.node, root.primitive, node_id, mode)
         }; // lock released
 
         GraphCleaner::cleanup_orphaned_entries();
@@ -162,7 +142,15 @@ impl<'a> GraphCleaner<'a> {
         let mut should_remove = Vec::new();
         for graph in graphs.values() {
             {
-                let mut guard = graph.state.lock();
+                // Best-effort sweep: a graph whose mutex is contended is in
+                // use — possibly by this very thread, when a `Backward` step
+                // itself runs an inner `backward()` (the outer backward holds
+                // its graph's lock across step execution, and this mutex is
+                // not reentrant). Skip it; a later backward's sweep will
+                // collect its orphans.
+                let Some(mut guard) = graph.state.try_lock() else {
+                    continue;
+                };
                 // Double safety: in case it was marked as no longer useful, but other
                 // nodes are still relevant, we only check which nodes can safely be removed.
                 if !guard.server.maybe_useful() {
@@ -235,7 +223,7 @@ impl GraphLocator {
         };
 
         // We collect all graphs of parents and of the current node based on their origin node id.
-        let mut graphs = HashMap::<NodeId, Arc<Graph>>::new();
+        let mut graphs = BTreeMap::<NodeId, Arc<Graph>>::new();
 
         if let Some(val) = self.graphs.get(&node) {
             graphs.insert(val.origin, val.clone());
@@ -256,15 +244,18 @@ impl GraphLocator {
         }
 
         if graphs.len() == 1 {
-            return GraphAnalysis::NoCollision(graphs.drain().next().unwrap().1);
+            return GraphAnalysis::NoCollision(graphs.into_values().next().unwrap());
         }
 
         GraphAnalysis::Collisions(graphs)
     }
 
     /// Merges multiple graphs associated with a node into a single graph.
-    fn merge(&mut self, node: NodeId, mut graphs: HashMap<NodeId, Arc<Graph>>) -> Arc<Graph> {
-        let mut graphs = graphs.drain().map(|g| g.1);
+    fn merge(&mut self, node: NodeId, graphs: BTreeMap<NodeId, Arc<Graph>>) -> Arc<Graph> {
+        // `into_values()` on the `BTreeMap` yields graphs in ascending `NodeId` order, so the "main"
+        // graph and the merge order are deterministic (a `HashMap` here picked an arbitrary,
+        // run-to-run-varying main, which permuted the merged steps and the backward op stream).
+        let mut graphs = graphs.into_values();
 
         let main = graphs.next().expect("At least one graph");
         self.register_key(main.origin, node);
@@ -285,10 +276,7 @@ impl GraphLocator {
 
     /// Registers a key for a given origin node.
     fn register_key(&mut self, origin: NodeId, key: NodeId) {
-        if !self.keys.contains_key(&origin) {
-            // Ensure an entry exists for this origin
-            self.keys.insert(origin, HashSet::new());
-        }
+        self.keys.entry(origin).or_default();
 
         if origin != key {
             // Register this node to point to the origin graph
@@ -355,5 +343,5 @@ enum GraphAnalysis {
     /// No collision detected, contains the graph associated with the node.
     NoCollision(Arc<Graph>),
     /// Collision detected, contains a map of node IDs to their associated graphs.
-    Collisions(HashMap<NodeId, Arc<Graph>>),
+    Collisions(BTreeMap<NodeId, Arc<Graph>>),
 }

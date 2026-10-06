@@ -1,7 +1,8 @@
 use crate::collections::HashMap;
 use crate::graph::NodeId;
 
-use alloc::sync::Arc;
+use burn_std::sync::Arc;
+
 use core::fmt::Debug;
 
 use super::state::{BackwardStates, State};

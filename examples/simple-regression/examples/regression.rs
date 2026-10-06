@@ -1,66 +1,66 @@
-use burn::{backend::Autodiff, tensor::backend::Backend};
+use burn::tensor::Device;
 use simple_regression::{inference, training};
 
 static ARTIFACT_DIR: &str = "/tmp/burn-example-regression";
 
 #[cfg(feature = "flex")]
 mod flex {
-    use burn::backend::flex::{Flex, FlexDevice};
+    use burn::tensor::Device;
 
     pub fn run() {
-        let device = FlexDevice;
-        super::run::<Flex>(device);
+        super::run(Device::flex());
     }
 }
 
 #[cfg(feature = "tch-gpu")]
 mod tch_gpu {
-    use burn::backend::libtorch::{LibTorch, LibTorchDevice};
+    use burn::tensor::{Device, DeviceIndex};
 
     pub fn run() {
         #[cfg(not(target_os = "macos"))]
-        let device = LibTorchDevice::Cuda(0);
+        let device = Device::libtorch_cuda(DeviceIndex::Default);
         #[cfg(target_os = "macos")]
-        let device = LibTorchDevice::Mps;
+        let device = Device::libtorch_mps();
 
-        super::run::<LibTorch>(device);
+        super::run(device);
     }
 }
 
 #[cfg(feature = "wgpu")]
 mod wgpu {
-    use burn::backend::wgpu::{Wgpu, WgpuDevice};
+    use burn::tensor::{Device, DeviceKind};
 
     pub fn run() {
-        let device = WgpuDevice::default();
-        super::run::<Wgpu>(device);
+        super::run(Device::wgpu(DeviceKind::DefaultDevice));
     }
 }
 
 #[cfg(feature = "tch-cpu")]
 mod tch_cpu {
-    use burn::backend::libtorch::{LibTorch, LibTorchDevice};
-    use simple_regression::training;
+    use burn::tensor::Device;
     pub fn run() {
-        let device = LibTorchDevice::Cpu;
-        super::run::<LibTorch>(device);
+        super::run(Device::libtorch());
     }
 }
 
 #[cfg(feature = "remote")]
 mod remote {
-    use burn::backend::{RemoteBackend, remote::RemoteDevice};
+    use burn::{remote::RemoteHost, tensor::Device};
 
+    /// Train on the `server` example's device, at its default address.
     pub fn run() {
-        let device = RemoteDevice::default();
-        super::run::<RemoteBackend>(device);
+        let host = RemoteHost::websocket("ws://localhost:3000");
+        let device = Device::remote_options(&host)
+            .init()
+            .expect("The server can be dialed");
+        super::run(device);
     }
 }
 
 /// Train a regression model and predict results on a number of samples.
-pub fn run<B: Backend>(device: B::Device) {
-    training::run::<Autodiff<B>>(ARTIFACT_DIR, device.clone());
-    inference::infer::<B>(ARTIFACT_DIR, device)
+pub fn run(device: Device) {
+    training::run(ARTIFACT_DIR, device.clone());
+    inference::infer(ARTIFACT_DIR, device)
 }
 
 fn main() {

@@ -1,11 +1,11 @@
 use burn_backend::{
-    AllocationProperty, DType, Element, QTensorPrimitive, Shape, TensorData, TensorMetadata,
-    quantization::{QParams, QuantLevel, QuantMode, QuantScheme, QuantValue},
+    AllocationProperty, DType, Element, Shape, TensorData, TensorMetadata,
+    quantization::{QuantMode, QuantScheme},
 };
 use burn_std::BoolStore;
 
-use crate::NdArrayStorage;
 use crate::ops::quantization::{QuantizationStrategy, SymmetricQuantization};
+use crate::{NdArrayDevice, NdArrayStorage};
 use alloc::vec::Vec;
 use ndarray::{ArcArray, ArrayD, IxDyn};
 
@@ -377,6 +377,7 @@ macro_rules! execute_with_int_out_dtype {
 }
 
 impl TensorMetadata for NdArrayTensor {
+    type Device = NdArrayDevice;
     fn dtype(&self) -> DType {
         match self {
             NdArrayTensor::F64(_) => DType::F64,
@@ -407,6 +408,17 @@ impl TensorMetadata for NdArrayTensor {
 
     fn rank(&self) -> usize {
         self.shape().num_dims()
+    }
+
+    fn device(&self) -> NdArrayDevice {
+        NdArrayDevice::Cpu
+    }
+
+    fn can_mut(&self) -> bool {
+        // NdArray storage is copy-on-write (`ArcArray`) without a public
+        // uniqueness check at this level; in-place ops resolve sharing
+        // themselves, so conservatively report the buffer as shared.
+        false
     }
 }
 
@@ -537,9 +549,14 @@ macro_rules! reshape {
     ) => {{
         let dim = $crate::to_typed_dims!($n, $shape, justdim);
         let array = match $array.is_standard_layout() {
+            // Move the array into the new shape rather than going through
+            // `to_shape`: the latter returns a borrowed view here, which
+            // `into_shared` then clones, copying the buffer on every reshape.
+            // Moving rewrites the dimensions in place, and the buffer stays
+            // shared for copy-on-write like in any other operation.
             true => {
-                match $array.to_shape(dim) {
-                    Ok(val) => val.into_shared(),
+                match $array.into_shape_with_order(dim) {
+                    Ok(val) => val,
                     Err(err) => {
                         core::panic!("Shape should be compatible shape={dim:?}: {err:?}");
                     }
@@ -595,7 +612,7 @@ impl NdArrayTensor {
         // For native Rust heap allocations (the common case), go directly to owned storage:
         // `from_data_owned` reclaims the Vec zero-copy via `into_vec`, while
         // Borrowed storage would trigger a full memcopy on every single operation.
-        if data.bytes.property() != AllocationProperty::Native {
+        if data.bytes().property() != AllocationProperty::Native {
             match Self::try_from_data_borrowed(data) {
                 Ok(tensor) => return tensor,
                 Err(data) => return Self::from_data_owned(data),
@@ -611,11 +628,7 @@ impl NdArrayTensor {
     ///
     /// Returns `Err(data)` if borrowing is not possible (e.g., misaligned data).
     fn try_from_data_borrowed(data: TensorData) -> Result<NdArrayTensor, TensorData> {
-        let TensorData {
-            bytes,
-            shape,
-            dtype,
-        } = data;
+        let (bytes, shape, dtype) = data.into_parts();
 
         macro_rules! try_borrow {
             ($ty:ty, $variant:ident, $bytes:expr, $shape:expr) => {
@@ -642,11 +655,7 @@ impl NdArrayTensor {
             _ => (bytes, shape), // QFloat not supported for zero-copy
         };
 
-        Err(TensorData {
-            bytes,
-            shape,
-            dtype,
-        })
+        Err(TensorData::from_bytes(bytes, shape, dtype))
     }
 
     /// Create a tensor with owned storage.
@@ -655,14 +664,16 @@ impl NdArrayTensor {
     /// can be reclaimed (via `try_into_vec`). If bytes are uniquely owned,
     /// no copy occurs; otherwise data is copied to a new allocation.
     fn from_data_owned(data: TensorData) -> NdArrayTensor {
-        let shape = data.shape.to_vec(); // TODO: into_vec
+        let shape = data.shape().to_vec(); // TODO: into_vec
 
         macro_rules! execute {
             ($data: expr, [$($dtype: pat => $ty: ty),*]) => {
-                match $data.dtype {
+                match $data.dtype() {
                     $( $dtype => {
-                        match data.into_vec::<$ty>() {
-                            Ok(vec) => unsafe { ArrayD::from_shape_vec_unchecked(shape, vec) }.into_shared(),
+                        match data.try_into_vec::<$ty>() {
+                            Ok(vec) => ArrayD::from_shape_vec(shape, vec)
+                                .expect("Data should have as many elements as the shape")
+                                .into_shared(),
                             Err(err) => panic!("Data should have the same element type as the tensor {err:?}"),
                         }.into()
                     }, )*
@@ -687,68 +698,41 @@ pub struct NdArrayQTensor {
     pub qtensor: NdArrayTensor,
     /// The quantization scheme.
     pub scheme: QuantScheme,
-    /// The quantization parameters.
-    pub qparams: Vec<QParams<f32>>,
+    /// The block scales.
+    pub qparams: Vec<f32>,
+    /// The per-tensor scale that [`qparams`](Self::qparams) are expressed relative to, for a
+    /// two-level scheme.
+    pub global: Option<f32>,
 }
 
 impl NdArrayQTensor {
     /// Returns the quantization strategy, including quantization parameters, for the given tensor.
     pub fn strategy(&self) -> QuantizationStrategy {
-        match self.scheme {
-            QuantScheme {
-                level: QuantLevel::Tensor,
-                mode: QuantMode::Symmetric,
-                value:
-                    QuantValue::Q8F
-                    | QuantValue::Q8S
-                    | QuantValue::E4M3
-                    | QuantValue::E5M2
-                    | QuantValue::Q4F
-                    | QuantValue::Q4S
-                    | QuantValue::E2M1
-                    | QuantValue::Q2F
-                    | QuantValue::Q2S,
-                ..
-            } => QuantizationStrategy::PerTensorSymmetric(SymmetricQuantization::init(
-                self.qparams[0].scales,
-                self.scheme.value,
-            )),
-            QuantScheme {
-                level: QuantLevel::Block(block_size),
-                mode: QuantMode::Symmetric,
-                value:
-                    QuantValue::Q8F
-                    | QuantValue::Q8S
-                    | QuantValue::E4M3
-                    | QuantValue::E5M2
-                    | QuantValue::Q4F
-                    | QuantValue::Q4S
-                    | QuantValue::E2M1
-                    | QuantValue::Q2F
-                    | QuantValue::Q2S,
-                ..
-            } => QuantizationStrategy::PerBlockSymmetric(
+        match (self.scheme.mode, self.scheme.block_size()) {
+            (QuantMode::Symmetric, None) => QuantizationStrategy::PerTensorSymmetric(
+                SymmetricQuantization::init(self.qparams[0], self.scheme.value),
+            ),
+            (QuantMode::Symmetric, Some(block_size)) => QuantizationStrategy::PerBlockSymmetric(
                 self.qparams
                     .iter()
-                    .map(|q| SymmetricQuantization::init(q.scales, self.scheme.value))
+                    .map(|&s| {
+                        SymmetricQuantization::init(
+                            self.global.unwrap_or(1.0) * s,
+                            self.scheme.value,
+                        )
+                    })
                     .collect(),
                 block_size,
             ),
+            (QuantMode::Lookup, _) => {
+                unimplemented!("lookup quantization is not supported by the ndarray backend")
+            }
         }
     }
 }
 
-impl QTensorPrimitive for NdArrayQTensor {
-    fn scheme(&self) -> &QuantScheme {
-        &self.scheme
-    }
-
-    fn default_scheme() -> QuantScheme {
-        QuantScheme::default().with_store(burn_backend::quantization::QuantStore::Native)
-    }
-}
-
 impl TensorMetadata for NdArrayQTensor {
+    type Device = NdArrayDevice;
     fn dtype(&self) -> DType {
         DType::QFloat(self.scheme)
     }
@@ -759,6 +743,14 @@ impl TensorMetadata for NdArrayQTensor {
 
     fn rank(&self) -> usize {
         self.shape().num_dims()
+    }
+
+    fn device(&self) -> Self::Device {
+        NdArrayDevice::Cpu
+    }
+
+    fn can_mut(&self) -> bool {
+        self.qtensor.can_mut()
     }
 }
 
@@ -771,7 +763,7 @@ mod tests {
     use burn_backend::{
         Distribution,
         ops::{FloatTensorOps, QTensorOps},
-        quantization::{QuantStore, QuantizationParametersPrimitive},
+        quantization::{QuantStore, QuantValue, QuantizationParametersPrimitive},
     };
     use burn_std::rand::get_seeded_rng;
 
@@ -833,7 +825,7 @@ mod tests {
 
     #[test]
     fn should_support_qtensor_strategy() {
-        type B = NdArray<f32, i64, i8>;
+        type B = NdArray;
         let scale: f32 = 0.009_019_608;
         let device = Default::default();
 
@@ -843,10 +835,11 @@ mod tests {
             .with_store(QuantStore::Native);
         let qparams = QuantizationParametersPrimitive {
             scales: B::float_from_data(TensorData::from([scale]), &device),
+            global: None,
         };
         let qtensor: NdArrayQTensor = B::quantize(tensor, &scheme, qparams);
 
-        assert_eq!(qtensor.scheme(), &scheme);
+        assert_eq!(qtensor.scheme(), scheme);
         assert_eq!(
             qtensor.strategy(),
             QuantizationStrategy::PerTensorSymmetric(SymmetricQuantization::init(

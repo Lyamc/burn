@@ -1,76 +1,39 @@
-use crate::BoolElement;
-use crate::{CubeBackend, CubeRuntime, FloatElement, IntElement, kernel, tensor::CubeTensor};
+use crate::{CubeBackend, CubeDevice, kernel, tensor::CubeTensor};
 use burn_backend::tensor::{BoolTensor, FloatTensor, IntTensor, QuantizedTensor};
 use burn_backend::{DType, Shape};
-use burn_cubecl_fusion::optim::reduce::ReduceSettings;
-use burn_cubecl_fusion::optim::reduce_broadcasted::ReduceBroadcastedFuser;
-use burn_cubecl_fusion::{
-    CubeFusionHandle, FallbackOperation,
-    optim::{
-        CubeOptimization, CubeOptimizationState,
-        elemwise::{ElementWiseFuser, ElemwiseOptimization},
-        matmul::{MatmulFuser, MatmulOptimization},
-        reduce::{ReduceFuser, ReduceOptimization},
-        reduce_broadcasted::ReduceBroadcastedOptimization,
-    },
-};
-use burn_fusion::UnfusedOp;
+pub use burn_cubecl_fusion::{CubeFusionHandle, FallbackOperation, Tiles};
 use burn_fusion::{
     FusionBackend, FusionRuntime,
-    stream::{Operation, OrderedExecution},
+    stream::{FallbackOp, OrderedExecution},
 };
 use burn_ir::{BackendIr, TensorHandle};
-use burn_std::Metadata;
-use core::marker::PhantomData;
-use std::sync::Arc;
 
-impl<R> burn_fusion::Optimization<FusionCubeRuntime<R>> for CubeOptimization<R>
-where
-    R: CubeRuntime,
-{
+mod registry;
+pub use burn_cubecl_fusion::optim::{CubeOptimization, CubeOptimizationState, FusedOperation};
+pub use registry::{
+    BUILTIN_NAMES, CubeFuser, OptimizationProvider, RegistryError, register, remove,
+};
+
+impl burn_fusion::Optimization<FusionCubeRuntime> for CubeOptimization {
     fn execute(
         &mut self,
         context: &mut burn_fusion::stream::Context<
-            <FusionCubeRuntime<R> as FusionRuntime>::FusionHandle,
+            <FusionCubeRuntime as FusionRuntime>::FusionHandle,
         >,
-        execution: &OrderedExecution<FusionCubeRuntime<R>>,
+        execution: &OrderedExecution<FusionCubeRuntime>,
     ) {
-        match self {
-            Self::ElementWise(op) => op.execute(context),
-            Self::Matmul(op) => op.execute(context, |index| {
-                let operation = execution.operation_within_optimization(index);
-                Box::new(FallbackOperationWrapper::new(operation))
-            }),
-            Self::Reduce(op) => op.execute(context, |index| {
-                let operation = execution.operation_within_optimization(index);
-                Box::new(FallbackOperationWrapper::new(operation))
-            }),
-            Self::ReduceBroadcasted(op) => op.execute(context, |index| {
-                let operation = execution.operation_within_optimization(index);
-                Box::new(FallbackOperationWrapper::new(operation))
-            }),
-        }
+        self.run(context, &|index| {
+            let operation = execution.operation_within_optimization(index);
+            Box::new(FallbackOperationWrapper::new(operation))
+        })
     }
 
     fn to_state(&self) -> CubeOptimizationState {
-        self.to_opt_state()
+        Self::to_state(self)
     }
 
-    fn from_state(device: &R::Device, state: CubeOptimizationState) -> Self {
-        match state {
-            CubeOptimizationState::ElementWise(state) => {
-                Self::ElementWise(ElemwiseOptimization::from_state(device, state))
-            }
-            CubeOptimizationState::Matmul(state) => {
-                Self::Matmul(MatmulOptimization::from_state(device, state))
-            }
-            CubeOptimizationState::Reduce(state) => {
-                Self::Reduce(ReduceOptimization::from_state(device, state))
-            }
-            CubeOptimizationState::ReduceBroadcasted(state) => {
-                Self::ReduceBroadcasted(ReduceBroadcastedOptimization::from_state(device, state))
-            }
-        }
+    fn from_state(device: &CubeDevice, state: CubeOptimizationState) -> Self {
+        registry::restore(device, state)
     }
 }
 
@@ -84,26 +47,17 @@ impl<O: Clone> FallbackOperationWrapper<O> {
     }
 }
 
-impl<R: CubeRuntime> FallbackOperation<R>
-    for FallbackOperationWrapper<Arc<dyn Operation<FusionCubeRuntime<R>>>>
-{
-    fn run(&self, context: &mut burn_fusion::stream::Context<CubeFusionHandle<R>>) {
-        self.operation.as_ref().execute(&mut context.handles);
-    }
-}
-
-impl<R: CubeRuntime> FallbackOperation<R>
-    for FallbackOperationWrapper<UnfusedOp<FusionCubeRuntime<R>>>
-{
-    fn run(&self, context: &mut burn_fusion::stream::Context<CubeFusionHandle<R>>) {
+impl FallbackOperation for FallbackOperationWrapper<FallbackOp<FusionCubeRuntime>> {
+    fn run(&self, context: &mut burn_fusion::stream::Context<CubeFusionHandle>) {
+        // Through `FallbackOp`, so unfused work inside a fused block obeys the
+        // same rule as unfused work outside one: an operation whose input a
+        // failure claims does not run, and its outputs take that failure.
         self.operation.execute(&mut context.handles);
     }
 }
 
-impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> BackendIr
-    for CubeBackend<R, F, I, BT>
-{
-    type Handle = CubeFusionHandle<R>;
+impl BackendIr for CubeBackend {
+    type Handle = CubeFusionHandle;
 
     fn float_tensor(handle: TensorHandle<Self::Handle>) -> FloatTensor<Self> {
         into_tensor(handle.handle, handle.shape)
@@ -138,58 +92,66 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> BackendIr
     }
 }
 
-impl<R: CubeRuntime> FusionRuntime for FusionCubeRuntime<R> {
+impl FusionRuntime for FusionCubeRuntime {
     type OptimizationState = CubeOptimizationState;
-    type Optimization = CubeOptimization<R>;
-    type FusionHandle = CubeFusionHandle<R>;
-    type FusionDevice = R::CubeDevice;
+    type Optimization = CubeOptimization;
+    type FusionHandle = CubeFusionHandle;
+    type FusionDevice = CubeDevice;
 
-    fn fusers(device: R::Device) -> Vec<Box<dyn burn_fusion::OperationFuser<Self::Optimization>>> {
-        vec![
-            Box::new(ElementWiseFuser::new(device.clone())),
-            Box::new(MatmulFuser::new(device.clone())),
-            Box::new(ReduceFuser::new(device.clone(), ReduceSettings::Always)),
-            Box::new(ReduceBroadcastedFuser::new(device.clone())),
-        ]
+    fn fusers(device: CubeDevice) -> Vec<Box<dyn burn_fusion::OperationFuser<Self::Optimization>>> {
+        registry::fusers(&device)
     }
 }
 
 /// Fusion runtime for JIT runtimes.
 #[derive(Debug)]
-pub struct FusionCubeRuntime<R: CubeRuntime> {
-    _b: PhantomData<R>,
-}
+pub struct FusionCubeRuntime;
 
-impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> FusionBackend
-    for CubeBackend<R, F, I, BT>
-{
-    type FusionRuntime = FusionCubeRuntime<R>;
+impl FusionBackend for CubeBackend {
+    type FusionRuntime = FusionCubeRuntime;
 
-    type FullPrecisionBackend = CubeBackend<R, f32, i32, BT>;
+    type FullPrecisionBackend = CubeBackend;
 
     fn cast_float(tensor: FloatTensor<Self>, dtype: DType) -> Self::Handle {
         kernel::cast(tensor, dtype).into()
     }
+
+    fn memory_persistent(device: &Self::Device, enabled: bool) {
+        use cubecl::MemoryAllocationMode;
+
+        let client = device.client();
+        let mode = match enabled {
+            true => MemoryAllocationMode::Persistent,
+            false => MemoryAllocationMode::Auto,
+        };
+        // Safety: called from the fusion execution thread, whose stream is the
+        // one every fused operation allocates on.
+        unsafe { client.allocation_mode(mode) };
+    }
 }
 
-fn into_tensor<R: CubeRuntime>(handle: CubeFusionHandle<R>, shape: Shape) -> CubeTensor<R> {
+fn into_tensor(handle: CubeFusionHandle, shape: Shape) -> CubeTensor {
     CubeTensor {
         client: handle.client.clone(),
         handle: handle.handle.clone(),
         device: handle.device.clone(),
-        meta: Box::new(Metadata::new(shape, handle.strides.clone())),
+        meta: Box::new(handle.metadata(shape)),
         dtype: handle.dtype,
         qparams: handle.qparams.clone(),
     }
 }
 
-impl<R: CubeRuntime> From<CubeTensor<R>> for CubeFusionHandle<R> {
-    fn from(value: CubeTensor<R>) -> Self {
+impl From<CubeTensor> for CubeFusionHandle {
+    fn from(value: CubeTensor) -> Self {
         Self {
             client: value.client.clone(),
             handle: value.handle.clone(),
             device: value.device.clone(),
             strides: value.meta.strides.clone(),
+            tiles: value.meta.is_tiled().then(|| Tiles {
+                shape: value.meta.shape.clone(),
+                tiling: value.meta.tiling,
+            }),
             dtype: value.dtype,
             qparams: value.qparams.clone(),
         }

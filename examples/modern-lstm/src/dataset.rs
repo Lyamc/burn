@@ -1,7 +1,7 @@
 use burn::{
     data::{
         dataloader::batcher::Batcher,
-        dataset::{Dataset, InMemDataset},
+        dataset::{Dataset, DatasetError, InMemDataset},
     },
     prelude::*,
 };
@@ -62,7 +62,7 @@ impl SequenceDataset {
 }
 
 impl Dataset<SequenceDatasetItem> for SequenceDataset {
-    fn get(&self, index: usize) -> Option<SequenceDatasetItem> {
+    fn get(&self, index: usize) -> Result<SequenceDatasetItem, DatasetError> {
         self.dataset.get(index)
     }
 
@@ -75,17 +75,17 @@ impl Dataset<SequenceDatasetItem> for SequenceDataset {
 pub struct SequenceBatcher {}
 
 #[derive(Clone, Debug)]
-pub struct SequenceBatch<B: Backend> {
-    pub sequences: Tensor<B, 3>, // [batch_size, seq_length, input_size]
-    pub targets: Tensor<B, 2>,   // [batch_size, 1]
+pub struct SequenceBatch {
+    pub sequences: Tensor<3>, // [batch_size, seq_length, input_size]
+    pub targets: Tensor<2>,   // [batch_size, 1]
 }
 
-impl<B: Backend> Batcher<B, SequenceDatasetItem, SequenceBatch<B>> for SequenceBatcher {
-    fn batch(&self, items: Vec<SequenceDatasetItem>, device: &B::Device) -> SequenceBatch<B> {
-        let mut sequences: Vec<Tensor<B, 2>> = Vec::new();
+impl Batcher<SequenceDatasetItem, SequenceBatch> for SequenceBatcher {
+    fn batch(&self, items: Vec<SequenceDatasetItem>, device: &Device) -> SequenceBatch {
+        let mut sequences: Vec<Tensor<2>> = Vec::new();
 
         for item in items.iter() {
-            let seq_tensor = Tensor::<B, 1>::from_floats(item.sequence.as_slice(), device);
+            let seq_tensor = Tensor::<1>::from_floats(item.sequence.as_slice(), device);
             // Add feature dimension, the input_size is 1 implicitly. We can change the input_size here with some operations
             sequences.push(seq_tensor.unsqueeze_dims(&[-1]));
         }
@@ -93,7 +93,7 @@ impl<B: Backend> Batcher<B, SequenceDatasetItem, SequenceBatch<B>> for SequenceB
 
         let targets = items
             .iter()
-            .map(|item| Tensor::<B, 1>::from_floats([item.target], device))
+            .map(|item| Tensor::<1>::from_floats([item.target], device))
             .collect();
         let targets = Tensor::stack(targets, 0);
 

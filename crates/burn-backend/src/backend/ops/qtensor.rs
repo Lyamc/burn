@@ -5,17 +5,13 @@ use burn_std::{
 };
 
 use crate::{
-    Backend, ExecutionError, QTensorPrimitive, TensorData, TensorMetadata, TensorPrimitive,
-    get_device_settings,
+    Backend, ExecutionError, TensorData, TensorMetadata, TensorPrimitive,
+    get_or_init_device_settings,
 };
 use crate::{
     Scalar,
-    tensor::{
-        BoolTensor, Device, FloatTensor, IntTensor, QuantizedTensor,
-        quantization::{
-            Calibration, QuantizationParametersPrimitive, compute_q_params, compute_range,
-        },
-    },
+    quantization::{Calibration, QuantizationParametersPrimitive, compute_q_params, compute_range},
+    tensor::{BoolTensor, Device, FloatTensor, IntTensor, QuantizedTensor},
 };
 
 /// Automatically applies `dequantization -> float operation -> quantization`.
@@ -42,7 +38,7 @@ macro_rules! dequant_op_quant {
         float_op $float_op:expr, $tensor:expr
     ) => {{
         let scheme = $tensor.scheme().clone();
-        let dtype = get_device_settings::<B>(&Self::q_device(&$tensor)).float_dtype;
+        let dtype = get_or_init_device_settings::<B>(&$tensor.device()).float_dtype;
 
         let tensor_f = Self::dequantize($tensor, dtype);
         #[allow(clippy::redundant_closure_call)]
@@ -64,8 +60,9 @@ macro_rules! dequant_op_flow {
     ) => {{
         // Heuristic: prioritize lhs scheme
         let scheme = $t1.scheme().clone();
-        let propagation = $t1.propagation();
-        let dtype = get_device_settings::<B>(&Self::q_device(&$t1)).float_dtype;
+        let settings = get_or_init_device_settings::<B>(&$t1.device());
+        let dtype = settings.float_dtype;
+        let propagation = settings.quantization.propagation;
 
         let t1_f = Self::dequantize($t1, dtype);
         let t2_f = Self::dequantize($t2, dtype);
@@ -84,8 +81,9 @@ macro_rules! dequant_op_flow {
         float_op $float_op:expr, $tensor:expr
     ) => {{
         let scheme = $tensor.scheme().clone();
-        let propagation = $tensor.propagation();
-        let dtype = get_device_settings::<B>(&Self::q_device(&$tensor)).float_dtype;
+        let settings = get_or_init_device_settings::<B>(&$tensor.device());
+        let dtype = settings.float_dtype;
+        let propagation = settings.quantization.propagation;
 
         let tensor_f = Self::dequantize($tensor, dtype);
         #[allow(clippy::redundant_closure_call)]
@@ -154,17 +152,6 @@ pub trait QTensorOps<B: Backend> {
     /// Convert the tensor back to a higher precision data type.
     fn dequantize(tensor: QuantizedTensor<B>, dtype: FloatDType) -> FloatTensor<B>;
 
-    /// Gets the device of the tensor.
-    ///
-    /// # Arguments
-    ///
-    /// * `tensor` - The tensor.
-    ///
-    /// # Returns
-    ///
-    /// The device of the tensor.
-    fn q_device(tensor: &QuantizedTensor<B>) -> Device<B>;
-
     /// Moves the tensor to the given device.
     ///
     /// # Arguments
@@ -221,7 +208,10 @@ pub trait QTensorOps<B: Backend> {
     }
 
     /// Broadcasts the `tensor` to the given `shape`.
-    fn q_expand(tensor: QuantizedTensor<B>, shape: Shape) -> QuantizedTensor<B>;
+    fn q_expand(tensor: QuantizedTensor<B>, shape: Shape) -> QuantizedTensor<B> {
+        // Default implementation. Backends can expand on the quantized values when supported.
+        dequant_op_quant!(float_op | tensor | B::float_expand(tensor, shape), tensor)
+    }
 
     /// Transposes a tensor.
     ///
@@ -286,7 +276,13 @@ pub trait QTensorOps<B: Backend> {
         tensor: QuantizedTensor<B>,
         dim: usize,
         indices: IntTensor<B>,
-    ) -> QuantizedTensor<B>;
+    ) -> QuantizedTensor<B> {
+        // Default implementation. Backends can select on the quantized values when supported.
+        dequant_op_quant!(
+            float_op | tensor | B::float_select(tensor, dim, indices),
+            tensor
+        )
+    }
 
     /// Select tensor elements corresponding to the given slices.
     ///
@@ -298,7 +294,10 @@ pub trait QTensorOps<B: Backend> {
     /// # Returns
     ///
     /// The selected elements in a new tensor.
-    fn q_slice(tensor: QuantizedTensor<B>, slices: &[Slice]) -> QuantizedTensor<B>;
+    fn q_slice(tensor: QuantizedTensor<B>, slices: &[Slice]) -> QuantizedTensor<B> {
+        // Default implementation. Backends can slice on the quantized values when supported.
+        dequant_op_quant!(float_op | tensor | B::float_slice(tensor, slices), tensor)
+    }
 
     /// Gather elements from a tensor.
     ///
@@ -516,10 +515,10 @@ pub trait QTensorOps<B: Backend> {
         let lhs = match lhs {
             TensorPrimitive::Float(lhs) => lhs,
             TensorPrimitive::QFloat(lhs) => {
-                propagation = lhs.propagation();
-                scheme = *lhs.scheme();
-                let float_dtype = target_dtype
-                    .unwrap_or_else(|| get_device_settings::<B>(&Self::q_device(&lhs)).float_dtype);
+                let settings = get_or_init_device_settings::<B>(&lhs.device());
+                propagation = settings.quantization.propagation;
+                scheme = lhs.scheme();
+                let float_dtype = target_dtype.unwrap_or(settings.float_dtype);
 
                 Self::dequantize(lhs, float_dtype)
             }
@@ -527,10 +526,10 @@ pub trait QTensorOps<B: Backend> {
         let rhs = match rhs {
             TensorPrimitive::Float(rhs) => rhs,
             TensorPrimitive::QFloat(rhs) => {
-                propagation = rhs.propagation();
-                scheme = *rhs.scheme();
-                let float_dtype = target_dtype
-                    .unwrap_or_else(|| get_device_settings::<B>(&Self::q_device(&rhs)).float_dtype);
+                let settings = get_or_init_device_settings::<B>(&rhs.device());
+                propagation = settings.quantization.propagation;
+                scheme = rhs.scheme();
+                let float_dtype = target_dtype.unwrap_or(settings.float_dtype);
 
                 Self::dequantize(rhs, float_dtype)
             }
@@ -923,8 +922,8 @@ pub trait QTensorOps<B: Backend> {
     fn q_cat(tensors: Vec<QuantizedTensor<B>>, dim: usize) -> QuantizedTensor<B> {
         // Heuristic: prioritize first tensor scheme
         let first = tensors.first().unwrap();
-        let scheme = *first.scheme();
-        let dtype = get_device_settings::<B>(&Self::q_device(first)).float_dtype;
+        let scheme = first.scheme();
+        let dtype = get_or_init_device_settings::<B>(&first.device()).float_dtype;
 
         let tensor_f = tensors
             .into_iter()
@@ -948,7 +947,7 @@ pub trait QTensorOps<B: Backend> {
     ///
     /// A tensor with the indices of the maximum elements of `tensor` along `dim`.
     fn q_argmax(tensor: QuantizedTensor<B>, dim: usize, out_dtype: IntDType) -> IntTensor<B> {
-        let dtype = get_device_settings::<B>(&Self::q_device(&tensor)).float_dtype;
+        let dtype = get_or_init_device_settings::<B>(&tensor.device()).float_dtype;
         let tensor_f = Self::dequantize(tensor, dtype);
         B::float_argmax(tensor_f, dim, out_dtype)
     }
@@ -972,7 +971,7 @@ pub trait QTensorOps<B: Backend> {
         k: usize,
         out_dtype: IntDType,
     ) -> IntTensor<B> {
-        let dtype = get_device_settings::<B>(&Self::q_device(&tensor)).float_dtype;
+        let dtype = get_or_init_device_settings::<B>(&tensor.device()).float_dtype;
         let tensor_f = Self::dequantize(tensor, dtype);
         B::float_argtopk(tensor_f, dim, k, out_dtype)
     }
@@ -993,6 +992,38 @@ pub trait QTensorOps<B: Backend> {
         dequant_op_quant!(float_op | tensor | B::float_topk(tensor, dim, k), tensor)
     }
 
+    /// Gets the values of the k maximum elements of a tensor along an axis, and their indices.
+    ///
+    /// # Arguments
+    ///
+    /// * `tensor` - The tensor to get the k maximum elements of.
+    /// * `dim` - The dimension along which to get the maximum elements.
+    /// * `k` - number of k maximums to keep
+    /// * `out_dtype` - The indices tensor dtype.
+    ///
+    /// # Returns
+    ///
+    /// A tuple with the values of the `k` maximum elements of `tensor` along `dim`, and their
+    /// indices.
+    /// The default sorts once and keeps the first `k` of each half, mirroring
+    /// [`crate::ops::FloatTensorOps::float_topk_with_indices`].
+    fn q_topk_with_indices(
+        tensor: QuantizedTensor<B>,
+        dim: usize,
+        k: usize,
+        out_dtype: IntDType,
+    ) -> (QuantizedTensor<B>, IntTensor<B>) {
+        let device = tensor.device();
+        let dtype = get_or_init_device_settings::<B>(&device).int_dtype;
+        let k_indices = B::int_arange(0..k as i64, &device, dtype);
+        let (values, indices) = Self::q_sort_with_indices(tensor, dim, true, out_dtype);
+
+        (
+            Self::q_select(values, dim, k_indices.clone()),
+            B::int_select(indices, dim, k_indices),
+        )
+    }
+
     /// Gets the indices of the minimum elements of a tensor along an axis.
     ///
     /// # Arguments
@@ -1005,7 +1036,7 @@ pub trait QTensorOps<B: Backend> {
     ///
     /// A tensor with the indices of the minimum elements of `tensor` along `dim`.
     fn q_argmin(tensor: QuantizedTensor<B>, dim: usize, out_dtype: IntDType) -> IntTensor<B> {
-        let dtype = get_device_settings::<B>(&Self::q_device(&tensor)).float_dtype;
+        let dtype = get_or_init_device_settings::<B>(&tensor.device()).float_dtype;
         let tensor_f = Self::dequantize(tensor, dtype);
         B::float_argmin(tensor_f, dim, out_dtype)
     }
@@ -1037,7 +1068,7 @@ pub trait QTensorOps<B: Backend> {
     ///
     /// A tensor with the maximum elements of `tensor` along `dim`.
     fn q_max_dim(tensor: QuantizedTensor<B>, dim: usize) -> QuantizedTensor<B> {
-        let int_dtype = get_device_settings::<B>(&B::q_device(&tensor)).int_dtype;
+        let int_dtype = get_or_init_device_settings::<B>(&tensor.device()).int_dtype;
         let index = B::q_argmax(tensor.clone(), dim, int_dtype);
 
         B::q_gather(dim, tensor, index)
@@ -1091,7 +1122,7 @@ pub trait QTensorOps<B: Backend> {
     ///
     /// A tensor with the minimum elements of `tensor` along `dim`.
     fn q_min_dim(tensor: QuantizedTensor<B>, dim: usize) -> QuantizedTensor<B> {
-        let int_dtype = get_device_settings::<B>(&B::q_device(&tensor)).int_dtype;
+        let int_dtype = get_or_init_device_settings::<B>(&tensor.device()).int_dtype;
         let index = B::q_argmin(tensor.clone(), dim, int_dtype);
 
         B::q_gather(dim, tensor, index)
@@ -1145,7 +1176,7 @@ pub trait QTensorOps<B: Backend> {
     ///
     /// A tensor with the maximum elements of `tensor` along `dim`.
     fn q_max_abs_dim(tensor: QuantizedTensor<B>, dim: usize) -> QuantizedTensor<B> {
-        let int_dtype = get_device_settings::<B>(&B::q_device(&tensor)).int_dtype;
+        let int_dtype = get_or_init_device_settings::<B>(&tensor.device()).int_dtype;
         let index = B::q_argmax(B::q_abs(tensor.clone()), dim, int_dtype);
 
         B::q_gather(dim, tensor, index)
@@ -1161,7 +1192,7 @@ pub trait QTensorOps<B: Backend> {
     ///
     /// A boolean tensor with a single element, True if any element in the tensor is True, False otherwise.
     fn q_any(tensor: QuantizedTensor<B>, out_dtype: BoolDType) -> BoolTensor<B> {
-        let dtype = get_device_settings::<B>(&Self::q_device(&tensor)).float_dtype;
+        let dtype = get_or_init_device_settings::<B>(&tensor.device()).float_dtype;
         let tensor_f = Self::dequantize(tensor, dtype);
         B::float_any(tensor_f, out_dtype)
     }
@@ -1179,7 +1210,7 @@ pub trait QTensorOps<B: Backend> {
     /// where the size is 1. The elem in the `dim` axis is True if any element along this dim in the
     /// input evaluates to True, False otherwise.
     fn q_any_dim(tensor: QuantizedTensor<B>, dim: usize, out_dtype: BoolDType) -> BoolTensor<B> {
-        let dtype = get_device_settings::<B>(&Self::q_device(&tensor)).float_dtype;
+        let dtype = get_or_init_device_settings::<B>(&tensor.device()).float_dtype;
         let tensor_f = Self::dequantize(tensor, dtype);
         B::float_any_dim(tensor_f, dim, out_dtype)
     }
@@ -1195,7 +1226,7 @@ pub trait QTensorOps<B: Backend> {
     /// A boolean tensor `Tensor<B, 1, Bool>` with a single element, True if all elements in the input tensor
     /// evaluate to True, False otherwise.
     fn q_all(tensor: QuantizedTensor<B>, out_dtype: BoolDType) -> BoolTensor<B> {
-        let dtype = get_device_settings::<B>(&Self::q_device(&tensor)).float_dtype;
+        let dtype = get_or_init_device_settings::<B>(&tensor.device()).float_dtype;
         let tensor_f = Self::dequantize(tensor, dtype);
         B::float_all(tensor_f, out_dtype)
     }
@@ -1213,7 +1244,7 @@ pub trait QTensorOps<B: Backend> {
     /// where the size is 1. The elem in the `dim` axis is True if all elements along this dim in the input
     /// evaluates to True, False otherwise.
     fn q_all_dim(tensor: QuantizedTensor<B>, dim: usize, out_dtype: BoolDType) -> BoolTensor<B> {
-        let dtype = get_device_settings::<B>(&Self::q_device(&tensor)).float_dtype;
+        let dtype = get_or_init_device_settings::<B>(&tensor.device()).float_dtype;
         let tensor_f = Self::dequantize(tensor, dtype);
         B::float_all_dim(tensor_f, dim, out_dtype)
     }
@@ -1259,8 +1290,8 @@ pub trait QTensorOps<B: Backend> {
         descending: bool,
         out_dtype: IntDType,
     ) -> (QuantizedTensor<B>, IntTensor<B>) {
-        let scheme = *tensor.scheme();
-        let dtype = get_device_settings::<B>(&Self::q_device(&tensor)).float_dtype;
+        let scheme = tensor.scheme();
+        let dtype = get_or_init_device_settings::<B>(&tensor.device()).float_dtype;
 
         let tensor_f = Self::dequantize(tensor, dtype);
         let (out_f, indices) = B::float_sort_with_indices(tensor_f, dim, descending, out_dtype);
@@ -1287,7 +1318,7 @@ pub trait QTensorOps<B: Backend> {
         descending: bool,
         out_dtype: IntDType,
     ) -> IntTensor<B> {
-        let dtype = get_device_settings::<B>(&Self::q_device(&tensor)).float_dtype;
+        let dtype = get_or_init_device_settings::<B>(&tensor.device()).float_dtype;
         let tensor_f = Self::dequantize(tensor, dtype);
         B::float_argsort(tensor_f, dim, descending, out_dtype)
     }

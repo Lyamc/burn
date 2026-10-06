@@ -1,14 +1,42 @@
-use crate::backend::Backend;
+use burn_backend::ops::ActivationOps;
+use burn_dispatch::Dispatch;
+
 use crate::check::TensorCheck;
-use crate::{Tensor, TensorPrimitive, check, s};
+use crate::check::unwrap_dim_index;
+use crate::ops::BridgeTensor;
+use crate::{AsIndex, DType, Tensor, check, s};
 
 /// Applies the rectified linear unit function element-wise
 /// as described in the paper [Deep Learning using Rectified Linear Units (ReLU)](https://arxiv.org/pdf/1803.08375).
 ///
 #[cfg_attr(doc, doc = "$$\\text{ReLU}\\(x\\) = \\(x\\)^+ = \\max\\(0, x\\)$$")]
 #[cfg_attr(not(doc), doc = "`ReLU(x) = max(0, x)`")]
-pub fn relu<const D: usize, B: Backend>(tensor: Tensor<B, D>) -> Tensor<B, D> {
+pub fn relu<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
     tensor.relu()
+}
+
+/// Applies the HardTanh function element-wise, clamping each element to the
+/// range `[min_val, max_val]` (a cheap, piecewise-linear approximation of tanh).
+///
+#[cfg_attr(not(doc), doc = "`HardTanh(x) = max(min_val, min(max_val, x))`")]
+pub fn hardtanh<const D: usize>(tensor: Tensor<D>, min_val: f64, max_val: f64) -> Tensor<D> {
+    tensor.clamp(min_val, max_val)
+}
+
+/// Applies the Tanhshrink function element-wise, `x - tanh(x)`.
+///
+#[cfg_attr(not(doc), doc = "`Tanhshrink(x) = x - tanh(x)`")]
+pub fn tanhshrink<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
+    tensor.clone().sub(tensor.tanh())
+}
+
+/// Applies the ReLU6 function element-wise, the rectified linear unit clamped to
+/// the range `[0, 6]` (as used in [MobileNetV2](https://arxiv.org/abs/1801.04381)).
+///
+#[cfg_attr(doc, doc = "$$\\text{ReLU6}\\(x\\) = \\min\\(\\max\\(0, x\\), 6\\)$$")]
+#[cfg_attr(not(doc), doc = "`ReLU6(x) = min(max(0, x), 6)`")]
+pub fn relu6<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
+    tensor.clamp(0.0, 6.0)
 }
 
 /// Applies the leaky rectified linear unit function element-wise.
@@ -35,14 +63,8 @@ $$
     not(doc),
     doc = "`f(x) =`\n- `x for x >= 0`\n- `negative_slope * x if x < 0`"
 )]
-pub fn leaky_relu<const D: usize, B: Backend>(
-    tensor: Tensor<B, D>,
-    negative_slope: f64,
-) -> Tensor<B, D> {
-    Tensor::from_primitive(TensorPrimitive::Float(B::leaky_relu(
-        tensor.primitive.tensor(),
-        negative_slope.into(),
-    )))
+pub fn leaky_relu<const D: usize>(tensor: Tensor<D>, negative_slope: f64) -> Tensor<D> {
+    Tensor::new(leaky_relu_impl(tensor.primitive, negative_slope))
 }
 
 /// Applies the Gaussian Error Linear Units function as described in the paper
@@ -68,8 +90,8 @@ where $\Phi(x)$ is the cumulative distribution function for the Gaussian distrib
 where `Φ(x)` is the cumulative distribution function for the Gaussian distribution.
 "#
 )]
-pub fn gelu<const D: usize, B: Backend>(tensor: Tensor<B, D>) -> Tensor<B, D> {
-    Tensor::from_primitive(TensorPrimitive::Float(B::gelu(tensor.primitive.tensor())))
+pub fn gelu<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
+    Tensor::new(gelu_impl(tensor.primitive))
 }
 
 /// Applies the tanh-based approximate GELU function element-wise.
@@ -87,7 +109,7 @@ $$
     not(doc),
     doc = "`GELU_approx(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`"
 )]
-pub fn gelu_approximate<const D: usize, B: Backend>(tensor: Tensor<B, D>) -> Tensor<B, D> {
+pub fn gelu_approximate<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
     /// sqrt(2/π) precomputed as FRAC_2_SQRT_PI * FRAC_1_SQRT_2
     const SQRT_2_OVER_PI: f64 =
         core::f64::consts::FRAC_2_SQRT_PI * core::f64::consts::FRAC_1_SQRT_2;
@@ -123,10 +145,7 @@ $$
 "#
 )]
 #[cfg_attr(not(doc), doc = "`PReLu(x) = max(0,x) + alpha * min(0,x)`")]
-pub fn prelu<const D: usize, B: Backend>(
-    tensor: Tensor<B, D>,
-    alpha: Tensor<B, 1>,
-) -> Tensor<B, D> {
+pub fn prelu<const D: usize>(tensor: Tensor<D>, alpha: Tensor<1>) -> Tensor<D> {
     check!(TensorCheck::check_prelu_shape::<D>(
         &tensor.shape(),
         &alpha.shape()
@@ -145,10 +164,7 @@ pub fn prelu<const D: usize, B: Backend>(
         alpha.reshape(s)
     };
 
-    Tensor::from_primitive(TensorPrimitive::Float(B::prelu(
-        tensor.primitive.tensor(),
-        weight.primitive.tensor(),
-    )))
+    Tensor::new(prelu_impl(tensor.primitive, weight.primitive))
 }
 
 /// Applies the softmax function on the input tensor along the given dimension.
@@ -165,16 +181,13 @@ $$
 ///
 /// # Arguments
 /// - `dim`: the dimension along which Softmax will be computed.
+///   Negative dimensions are supported and count from the end.
 ///
 /// # Panics
-/// - If `dim` is outside [0, D)
-pub fn softmax<const D: usize, B: Backend>(tensor: Tensor<B, D>, dim: usize) -> Tensor<B, D> {
-    check!(TensorCheck::dim_ops::<D>("softmax", dim));
-
-    Tensor::from_primitive(TensorPrimitive::Float(B::softmax(
-        tensor.primitive.tensor(),
-        dim,
-    )))
+/// - If `dim` is outside [-D, D)
+pub fn softmax<const D: usize>(tensor: Tensor<D>, dim: impl AsIndex) -> Tensor<D> {
+    let dim = unwrap_dim_index(dim.try_dim_index(D), "Softmax");
+    Tensor::new(softmax_impl(tensor.primitive, dim))
 }
 
 /// Applies the softmin function on the input tensor along the given dimension.
@@ -190,17 +203,34 @@ $$
 #[cfg_attr(not(doc), doc = "`softmin(x_i) = exp(-x_i) / sum_j(exp(-x_j)`")]
 ///
 /// # Arguments
-/// - `dim`: the dimension along which Softmax will be computed.
+/// - `dim`: the dimension along which Softmin will be computed.
+///   Negative dimensions are supported and count from the end.
 ///
 /// # Panics
-/// - If `dim` is outside [0, D)
-pub fn softmin<const D: usize, B: Backend>(tensor: Tensor<B, D>, dim: usize) -> Tensor<B, D> {
-    check!(TensorCheck::dim_ops::<D>("softmin", dim));
+/// - If `dim` is outside [-D, D)
+pub fn softmin<const D: usize>(tensor: Tensor<D>, dim: impl AsIndex) -> Tensor<D> {
+    let dim = unwrap_dim_index(dim.try_dim_index(D), "Softmin");
+    Tensor::new(softmin_impl(tensor.primitive, dim))
+}
 
-    Tensor::from_primitive(TensorPrimitive::Float(B::softmin(
-        tensor.primitive.tensor(),
-        dim,
-    )))
+/// Default value of `beta * x` above which [`softplus`] falls back to the identity, matching
+/// the default of `torch.nn.functional.softplus`.
+pub const DEFAULT_SOFTPLUS_THRESHOLD: f64 = 20.0;
+
+/// Largest argument for which `exp` is still finite in the given float dtype, rounded down.
+fn max_finite_exp_arg(dtype: DType) -> f64 {
+    match dtype {
+        // Flex32 computes with f16-like limits; see `FloatDType::finfo`.
+        // ln(f16::MAX) = ln(65504) ~= 11.09
+        DType::F16 | DType::Flex32 => 11.0,
+        // ln(f64::MAX) ~= 709.78
+        DType::F64 => 709.0,
+        // ln(f32::MAX) ~= 88.72; bf16 has the same exponent range.
+        DType::F32 | DType::BF16 => 88.0,
+        // Quantized operations are evaluated through a floating-point representation. Use the
+        // most conservative floating-point bound; other kinds can't reach this float API.
+        _ => 11.0,
+    }
 }
 
 /// Applies the SoftPlus function element-wise.
@@ -216,9 +246,56 @@ $$
 #[cfg_attr(not(doc), doc = "`softplus(x_i) = log(1 + exp(beta * x_i)) / beta`")]
 ///
 /// The SoftPlus function is a smooth approximation of the ReLU function.
-pub fn softplus<const D: usize, B: Backend>(tensor: Tensor<B, D>, beta: f64) -> Tensor<B, D> {
-    let tensor = (tensor.mul_scalar(beta).exp() + 1).log();
-    tensor.div_scalar(beta)
+///
+/// Uses a default threshold of `20.0` for numerical stability. Use
+/// [`softplus_with_threshold`] to pick a different threshold.
+///
+/// # Arguments
+///
+/// - `beta`: Controls the sharpness of the approximation to ReLU.
+pub fn softplus<const D: usize>(tensor: Tensor<D>, beta: f64) -> Tensor<D> {
+    softplus_with_threshold(tensor, beta, DEFAULT_SOFTPLUS_THRESHOLD)
+}
+
+/// Applies the SoftPlus function element-wise, with an explicit stability threshold.
+///
+/// See [`softplus`] for the function itself, which uses the default threshold of `20.0`.
+///
+/// For values where `beta * x > threshold`, returns `x` directly to avoid overflow when
+/// evaluating the exponential. A threshold beyond the dtype's finite `exp` range is lowered to
+/// the largest safe value.
+///
+/// # Arguments
+///
+/// - `beta`: Controls the sharpness of the approximation to ReLU.
+/// - `threshold`: The value of `beta * x` above which the linear approximation is used.
+pub fn softplus_with_threshold<const D: usize>(
+    tensor: Tensor<D>,
+    beta: f64,
+    threshold: f64,
+) -> Tensor<D> {
+    // `exp` overflows at a much lower input in f16 and Flex32 than in the wider formats, so the
+    // requested threshold alone does not always keep it in range. Substituting the identity at
+    // the dtype's limit is safe because Softplus has already rounded to it by that magnitude.
+    let threshold = threshold.min(max_finite_exp_arg(tensor.dtype()));
+
+    let scaled = tensor.clone().mul_scalar(beta);
+    let mask = scaled.clone().greater_elem(threshold);
+
+    // The saturated elements are masked out below, but they are still evaluated here, so their
+    // input to `exp` is capped to keep them finite. Letting them reach `inf` would leave the
+    // discarded branch contributing `inf * 0 = NaN` to the backward pass.
+    //
+    // `log1p` rather than `log(1 + ..)` keeps the opposite tail: for `beta * x < ~-16` the
+    // `1 + exp(beta * x)` intermediate rounds to exactly `1.0` in `f32` and the result
+    // underflows to zero.
+    let nonlinear = scaled
+        .mask_fill(mask.clone(), threshold)
+        .exp()
+        .log1p()
+        .div_scalar(beta);
+
+    nonlinear.mask_where(mask, tensor)
 }
 
 /// Applies the "quiet softmax" function on the input tensor along the given dimension.
@@ -242,14 +319,19 @@ $$
 )]
 ///
 /// # Arguments
-/// - `dim`: the dimension along which Softmax will be computed.
+/// - `dim`: the dimension along which Quiet Softmax will be computed.
+///   Negative dimensions are supported and count from the end.
 ///
 /// # Panics
-/// - If `dim` is outside [0, D)
-pub fn quiet_softmax<const D: usize, B: Backend>(tensor: Tensor<B, D>, dim: usize) -> Tensor<B, D> {
-    check!(TensorCheck::dim_ops::<D>("softmax", dim));
-
+/// - If `dim` is outside [-D, D)
+pub fn quiet_softmax<const D: usize>(tensor: Tensor<D>, dim: impl AsIndex) -> Tensor<D> {
+    let dim = unwrap_dim_index(dim.try_dim_index(D), "Quiet Softmax");
     let max_vals = tensor.clone().detach().max_dim(dim);
+    let all_neg_inf = max_vals.clone().equal_scalar(f32::NEG_INFINITY);
+    // Subtracting an all-negative-infinity maximum would produce NaN. Replacing only that
+    // reduced maximum with zero preserves finite and mixed slices while evaluating an all-masked
+    // slice as exp(-inf) / (1 + sum(exp(-inf))) = 0.
+    let max_vals = max_vals.mask_fill(all_neg_inf, 0.0);
     let exp_x = (tensor - max_vals.clone()).exp();
     let sum_exp = exp_x.clone().sum_dim(dim);
 
@@ -274,17 +356,14 @@ $$
 )]
 ///
 /// # Arguments
-/// - `dim`: the dimension along which Softmax will be computed.
+/// - `dim`: the dimension along which Log Softmax will be computed.
+///   Negative dimensions are supported and count from the end.
 ///
 /// # Panics
-/// - If `dim` is outside [0, D)
-pub fn log_softmax<const D: usize, B: Backend>(tensor: Tensor<B, D>, dim: usize) -> Tensor<B, D> {
-    check!(TensorCheck::dim_ops::<D>("log softmax", dim));
-
-    Tensor::from_primitive(TensorPrimitive::Float(B::log_softmax(
-        tensor.primitive.tensor(),
-        dim,
-    )))
+/// - If `dim` is outside [-D, D)
+pub fn log_softmax<const D: usize>(tensor: Tensor<D>, dim: impl AsIndex) -> Tensor<D> {
+    let dim = unwrap_dim_index(dim.try_dim_index(D), "Log Softmax");
+    Tensor::new(log_softmax_impl(tensor.primitive, dim))
 }
 
 /// Applies the sigmoid function element-wise.
@@ -300,10 +379,8 @@ $$
 "#
 )]
 #[cfg_attr(not(doc), doc = "`sigmoid(x) = 1 / (1 + exp(-x))`")]
-pub fn sigmoid<const D: usize, B: Backend>(tensor: Tensor<B, D>) -> Tensor<B, D> {
-    Tensor::from_primitive(TensorPrimitive::Float(B::sigmoid(
-        tensor.primitive.tensor(),
-    )))
+pub fn sigmoid<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
+    Tensor::new(sigmoid_impl(tensor.primitive))
 }
 
 /// Applies the hard sigmoid function element-wise.
@@ -317,16 +394,8 @@ $$
 "#
 )]
 #[cfg_attr(not(doc), doc = "`hard_sigmoid(x) = max(0, min(1, alpha * x + beta))`")]
-pub fn hard_sigmoid<const D: usize, B: Backend>(
-    tensor: Tensor<B, D>,
-    alpha: f64,
-    beta: f64,
-) -> Tensor<B, D> {
-    Tensor::from_primitive(TensorPrimitive::Float(B::hard_sigmoid(
-        tensor.primitive.tensor(),
-        alpha.into(),
-        beta.into(),
-    )))
+pub fn hard_sigmoid<const D: usize>(tensor: Tensor<D>, alpha: f64, beta: f64) -> Tensor<D> {
+    Tensor::new(hard_sigmoid_impl(tensor.primitive, alpha, beta))
 }
 
 /// Applies the log sigmoid function element-wise.
@@ -340,10 +409,8 @@ $$
 "#
 )]
 #[cfg_attr(not(doc), doc = "`log_sigmoid(x) = log(1 / (1 + exp(-x)))`")]
-pub fn log_sigmoid<const D: usize, B: Backend>(tensor: Tensor<B, D>) -> Tensor<B, D> {
-    Tensor::from_primitive(TensorPrimitive::Float(B::log_sigmoid(
-        tensor.primitive.tensor(),
-    )))
+pub fn log_sigmoid<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
+    Tensor::new(log_sigmoid_impl(tensor.primitive))
 }
 
 /// Applies the SiLU function (also known as the swish function) element-wise.
@@ -357,7 +424,7 @@ $$
 "#
 )]
 #[cfg_attr(not(doc), doc = "`SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))`")]
-pub fn silu<const D: usize, B: Backend>(tensor: Tensor<B, D>) -> Tensor<B, D> {
+pub fn silu<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
     tensor.clone().mul(sigmoid(tensor))
 }
 
@@ -375,7 +442,7 @@ $$
     not(doc),
     doc = "`hard_swish(x) = x * hard_sigmoid(x) = x * max(0, min(1, x/6 + 0.5))`"
 )]
-pub fn hard_swish<const D: usize, B: Backend>(tensor: Tensor<B, D>) -> Tensor<B, D> {
+pub fn hard_swish<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
     tensor.clone().mul(hard_sigmoid(tensor, 1.0 / 6.0, 0.5))
 }
 
@@ -396,12 +463,12 @@ $$
     not(doc),
     doc = "`mish(x) = x * tanh(softplus(x)) = tanh(log(1 + exp(x)))`"
 )]
-pub fn mish<const D: usize, B: Backend>(tensor: Tensor<B, D>) -> Tensor<B, D> {
+pub fn mish<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
     tensor.clone().mul(softplus(tensor, 1.0).tanh())
 }
 
 /// Applies the tanh function element-wise.
-pub fn tanh<const D: usize, B: Backend>(tensor: Tensor<B, D>) -> Tensor<B, D> {
+pub fn tanh<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
     tensor.tanh()
 }
 
@@ -423,8 +490,8 @@ $$
     not(doc),
     doc = "`f(x) =`\n- `x for x > 0`\n- `alpha * (exp(x) - 1) for x <= 0`"
 )]
-pub fn elu<const D: usize, B: Backend>(tensor: Tensor<B, D>, alpha: f64) -> Tensor<B, D> {
-    let mask = tensor.clone().lower_equal_elem(0);
+pub fn elu<const D: usize>(tensor: Tensor<D>, alpha: f64) -> Tensor<D> {
+    let mask = tensor.clone().lower_equal_scalar(0);
     let scaled = tensor.clone().exp().sub_scalar(1).mul_scalar(alpha);
     tensor.mask_where(mask, scaled)
 }
@@ -452,8 +519,8 @@ $$
 ///
 /// # Arguments
 /// - `alpha`: scaling parameter for the negative part.
-pub fn celu<const D: usize, B: Backend>(tensor: Tensor<B, D>, alpha: f64) -> Tensor<B, D> {
-    let mask = tensor.clone().lower_equal_elem(0);
+pub fn celu<const D: usize>(tensor: Tensor<D>, alpha: f64) -> Tensor<D> {
+    let mask = tensor.clone().lower_equal_scalar(0);
     let scaled = tensor
         .clone()
         .div_scalar(alpha)
@@ -484,12 +551,12 @@ where $\alpha \approx 1.6733$ and $\gamma \approx 1.0507$.
     not(doc),
     doc = "`selu(x) = gamma * x if x > 0, gamma * alpha * (exp(x) - 1) if x <= 0`"
 )]
-pub fn selu<const D: usize, B: Backend>(tensor: Tensor<B, D>) -> Tensor<B, D> {
+pub fn selu<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
     // Constants from the SELU paper / ONNX spec
     const ALPHA: f64 = 1.6732632423543772848170429916717_f64;
     const GAMMA: f64 = 1.0507009873554804934193349852946_f64;
 
-    let mask = tensor.clone().greater_equal_elem(0.0);
+    let mask = tensor.clone().greater_equal_scalar(0.0);
     let positive = tensor.clone().mul_scalar(GAMMA);
     let negative = tensor.exp().sub_scalar(1.0).mul_scalar(ALPHA * GAMMA);
 
@@ -514,12 +581,26 @@ $$
 ///
 /// # Arguments
 /// - `alpha`: threshold value (default in ONNX is 1.0).
-pub fn thresholded_relu<const D: usize, B: Backend>(
-    tensor: Tensor<B, D>,
-    alpha: f64,
-) -> Tensor<B, D> {
-    let mask = tensor.clone().lower_equal_elem(alpha);
+pub fn thresholded_relu<const D: usize>(tensor: Tensor<D>, alpha: f64) -> Tensor<D> {
+    let mask = tensor.clone().lower_equal_scalar(alpha);
     tensor.mask_fill(mask, 0)
+}
+
+/// Applies the Threshold function element-wise, generalising `thresholded_relu`
+/// (which fixes `value = 0`): returns `x` where `x > threshold`, and `value`
+/// otherwise.
+///
+#[cfg_attr(
+    not(doc),
+    doc = "`f(x) =`\n- `x if x > threshold`\n- `value otherwise`"
+)]
+///
+/// # Arguments
+/// - `threshold`: the value to threshold at.
+/// - `value`: the value to replace with where `x <= threshold`.
+pub fn threshold<const D: usize>(tensor: Tensor<D>, threshold: f64, value: f64) -> Tensor<D> {
+    let mask = tensor.clone().lower_equal_scalar(threshold);
+    tensor.mask_fill(mask, value)
 }
 
 /// Applies the gated linear unit function.
@@ -528,15 +609,16 @@ pub fn thresholded_relu<const D: usize, B: Backend>(
 ///
 /// **Note**:
 /// * The size of the input tensor along `dim` must be divisible by 2.
+/// * Negative dimensions are supported and count from the end.
 ///
 /// ### Arguments
 /// * `tensor` - The input tensor.
+/// * `dim` - The dimension on which to split the input.
 ///
 /// ### Returns
 /// * A tensor with the same shape as the input, except the size along `dim` is halved.
-pub fn glu<const D: usize, B: Backend>(tensor: Tensor<B, D>, dim: usize) -> Tensor<B, D> {
-    // TODO: Handle negative indices with AsIndex for compatibility with Pytorch nn.GLU.
-
+pub fn glu<const D: usize>(tensor: Tensor<D>, dim: impl AsIndex) -> Tensor<D> {
+    let dim = unwrap_dim_index(dim.try_dim_index(D), "GLU");
     assert!(
         tensor.dims()[dim].is_multiple_of(2),
         "Input tensor along dimension {dim} must have an even size. N is divisible by 2."
@@ -560,7 +642,7 @@ $$
 "#
 )]
 #[cfg_attr(not(doc), doc = "`softsign(x_i) = x_i / (1 + |x_i|)`")]
-pub fn softsign<const D: usize, B: Backend>(tensor: Tensor<B, D>) -> Tensor<B, D> {
+pub fn softsign<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
     tensor.clone().div(tensor.abs() + 1)
 }
 
@@ -585,8 +667,8 @@ $$
 )]
 /// # Arguments
 /// - `lambda`: the lambda value for the Hard Shrink formulation. Default is 0.5.
-pub fn hard_shrink<const D: usize, B: Backend>(tensor: Tensor<B, D>, lambda: f64) -> Tensor<B, D> {
-    let mask = tensor.clone().abs().lower_equal_elem(lambda);
+pub fn hard_shrink<const D: usize>(tensor: Tensor<D>, lambda: f64) -> Tensor<D> {
+    let mask = tensor.clone().abs().lower_equal_scalar(lambda);
     tensor.mask_fill(mask, 0)
 }
 
@@ -611,7 +693,7 @@ $$
 )]
 /// # Arguments
 /// - `lambda`: the lambda value for the Soft Shrink formulation. Default is 0.5.
-pub fn soft_shrink<const D: usize, B: Backend>(tensor: Tensor<B, D>, lambda: f64) -> Tensor<B, D> {
+pub fn soft_shrink<const D: usize>(tensor: Tensor<D>, lambda: f64) -> Tensor<D> {
     shrink(tensor, lambda, lambda)
 }
 
@@ -637,14 +719,69 @@ $$
 /// # Arguments
 /// - `lambda`: the lambda value for the Shrink formulation.
 /// - `bias`: the bias value for the Shrink formulation.
-pub fn shrink<const D: usize, B: Backend>(
-    tensor: Tensor<B, D>,
-    lambda: f64,
-    bias: f64,
-) -> Tensor<B, D> {
+pub fn shrink<const D: usize>(tensor: Tensor<D>, lambda: f64, bias: f64) -> Tensor<D> {
     let abs_tensor = tensor.clone().abs();
     let sign = tensor.clone().sign();
     let shrunk = tensor.sub(sign.mul_scalar(bias));
-    let mask = abs_tensor.lower_equal_elem(lambda);
+    let mask = abs_tensor.lower_equal_scalar(lambda);
     shrunk.mask_fill(mask, 0)
+}
+
+// =========================================================================
+// Non-generic implementation helpers (outlined from the generic API).
+// See the crate-level docs for the rationale behind this pattern.
+// =========================================================================
+
+fn leaky_relu_impl(p: BridgeTensor, negative_slope: f64) -> BridgeTensor {
+    BridgeTensor::float(Dispatch::leaky_relu(p.into_float(), negative_slope.into()))
+}
+
+fn gelu_impl(p: BridgeTensor) -> BridgeTensor {
+    BridgeTensor::float(Dispatch::gelu(p.into_float()))
+}
+
+fn prelu_impl(p: BridgeTensor, weight: BridgeTensor) -> BridgeTensor {
+    BridgeTensor::float(Dispatch::prelu(p.into_float(), weight.into_float()))
+}
+
+fn softmax_impl(p: BridgeTensor, dim: usize) -> BridgeTensor {
+    BridgeTensor::float(Dispatch::softmax(p.into_float(), dim))
+}
+
+fn softmin_impl(p: BridgeTensor, dim: usize) -> BridgeTensor {
+    BridgeTensor::float(Dispatch::softmin(p.into_float(), dim))
+}
+
+fn log_softmax_impl(p: BridgeTensor, dim: usize) -> BridgeTensor {
+    BridgeTensor::float(Dispatch::log_softmax(p.into_float(), dim))
+}
+
+fn sigmoid_impl(p: BridgeTensor) -> BridgeTensor {
+    BridgeTensor::float(Dispatch::sigmoid(p.into_float()))
+}
+
+fn hard_sigmoid_impl(p: BridgeTensor, alpha: f64, beta: f64) -> BridgeTensor {
+    BridgeTensor::float(Dispatch::hard_sigmoid(
+        p.into_float(),
+        alpha.into(),
+        beta.into(),
+    ))
+}
+
+fn log_sigmoid_impl(p: BridgeTensor) -> BridgeTensor {
+    BridgeTensor::float(Dispatch::log_sigmoid(p.into_float()))
+}
+
+#[cfg(test)]
+mod softplus_threshold_tests {
+    use super::*;
+
+    #[test]
+    fn thresholds_follow_dtype_exp_range() {
+        assert_eq!(max_finite_exp_arg(DType::F64), 709.0);
+        assert_eq!(max_finite_exp_arg(DType::F32), 88.0);
+        assert_eq!(max_finite_exp_arg(DType::BF16), 88.0);
+        assert_eq!(max_finite_exp_arg(DType::F16), 11.0);
+        assert_eq!(max_finite_exp_arg(DType::Flex32), 11.0);
+    }
 }

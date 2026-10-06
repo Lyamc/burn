@@ -1,16 +1,15 @@
 use burn_core as burn;
 
-use super::SimpleOptimizer;
-use super::adaptor::OptimizerAdaptor;
+use super::Optimizer;
 use super::decay::{WeightDecay, WeightDecayConfig};
+use super::module_optimizer::ModuleOptimizer;
 use super::momentum::{Momentum, MomentumConfig, MomentumState};
 use crate::LearningRate;
+use crate::RecordState;
 use crate::grad_clipping::GradientClippingConfig;
 use burn::config::Config;
-use burn::module::AutodiffModule;
-use burn::record::Record;
+use burn::tensor::Device;
 use burn::tensor::Tensor;
-use burn::tensor::backend::{AutodiffBackend, Backend};
 
 /// Configuration to create the [Sgd](Sgd) optimizer.
 #[derive(Config, Debug)]
@@ -27,32 +26,35 @@ pub struct SgdConfig {
 ///
 /// The optimizer can be configured with [SgdConfig](SgdConfig).
 #[derive(Clone)]
-pub struct Sgd<B: Backend> {
-    momentum: Option<Momentum<B>>,
+pub struct Sgd {
+    momentum: Option<Momentum>,
     weight_decay: Option<WeightDecay>,
 }
 
 /// State of [Sgd](Sgd).
-#[derive(Record, Clone, new)]
-pub struct SgdState<B: Backend, const D: usize> {
+#[derive(RecordState, Clone, new)]
+pub struct SgdState<const D: usize> {
     /// The current state of the momentum (if any).
-    pub momentum: Option<MomentumState<B, D>>,
+    pub momentum: Option<MomentumState<D>>,
 }
 
 impl SgdConfig {
     /// Build a [`Sgd`] from the config.
-    pub fn build<B: Backend>(&self) -> Sgd<B> {
+    ///
+    /// The bare optimizer, which
+    /// [`ModuleOptimizer::with_group`](crate::ModuleOptimizer::with_group) takes to
+    /// optimize one parameter group. [`init`](Self::init) is the whole-module
+    /// counterpart, and the only one that applies the configured gradient clipping.
+    pub fn build(&self) -> Sgd {
         Sgd {
             momentum: self.momentum.as_ref().map(Momentum::new),
             weight_decay: self.weight_decay.as_ref().map(WeightDecay::new),
         }
     }
 
-    /// Creates a new [SgdConfig](SgdConfig) with default values.
-    pub fn init<B: AutodiffBackend, M: AutodiffModule<B>>(
-        &self,
-    ) -> OptimizerAdaptor<Sgd<B::InnerBackend>, M, B> {
-        let mut optim = OptimizerAdaptor::from(self.build());
+    /// Initializes the SGD optimizer from the configuration.
+    pub fn init(&self) -> ModuleOptimizer {
+        let mut optim = ModuleOptimizer::from(self.build());
         if let Some(config) = &self.gradient_clipping {
             optim = optim.with_grad_clipping(config.init());
         }
@@ -60,16 +62,16 @@ impl SgdConfig {
     }
 }
 
-impl<B: Backend> SimpleOptimizer<B> for Sgd<B> {
-    type State<const D: usize> = SgdState<B, D>;
+impl Optimizer for Sgd {
+    type State<const D: usize> = SgdState<D>;
 
     fn step<const D: usize>(
         &self,
         lr: LearningRate,
-        tensor: Tensor<B, D>,
-        mut grad: Tensor<B, D>,
+        tensor: Tensor<D>,
+        mut grad: Tensor<D>,
         state: Option<Self::State<D>>,
-    ) -> (Tensor<B, D>, Option<Self::State<D>>) {
+    ) -> (Tensor<D>, Option<Self::State<D>>) {
         let mut state_momentum = None;
 
         if let Some(state) = state {
@@ -92,7 +94,7 @@ impl<B: Backend> SimpleOptimizer<B> for Sgd<B> {
         (tensor - delta, Some(state))
     }
 
-    fn to_device<const D: usize>(mut state: Self::State<D>, device: &B::Device) -> Self::State<D> {
+    fn to_device<const D: usize>(mut state: Self::State<D>, device: &Device) -> Self::State<D> {
         state.momentum = state.momentum.map(|state| state.to_device(device));
         state
     }
@@ -101,11 +103,8 @@ impl<B: Backend> SimpleOptimizer<B> for Sgd<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        TestAutodiffBackend, TestBackend,
-        grad_clipping::GradientClipping,
-        optim::{GradientsParams, Optimizer},
-    };
+    use crate::optim::test_utils::assert_optimizer_resume;
+    use crate::{grad_clipping::GradientClipping, optim::GradientsParams};
     use burn::tensor::{Distribution, Shape};
     use burn_nn::{Linear, LinearConfig};
 
@@ -113,10 +112,10 @@ mod tests {
 
     #[test]
     fn with_updated_params_should_have_state() {
-        let device = Default::default();
-        let layer = layer::<TestAutodiffBackend>(&device);
+        let device = Device::default().autodiff();
+        let layer = layer(&device);
         let mut optim = sgd_with_all();
-        let loss = layer.forward(random_tensor::<TestAutodiffBackend>(&device));
+        let loss = layer.forward(random_tensor(&device));
         let grads = loss.backward();
         let grads = GradientsParams::from_grads(grads, &layer);
         let _layer = optim.step(LEARNING_RATE, layer, grads);
@@ -141,34 +140,78 @@ mod tests {
 
     #[test]
     fn should_load_state() {
-        let device = Default::default();
-        let layer = layer::<TestAutodiffBackend>(&device);
-        let mut optim = sgd_with_all();
-        let loss = layer.forward(random_tensor(&device));
-        let grads = loss.backward();
-        let grads = GradientsParams::from_grads(grads, &layer);
-        let _layer = optim.step(LEARNING_RATE, layer, grads);
-
-        let record = optim.to_record();
-        let optim_new = sgd_with_all();
-        let record_new = optim_new.to_record();
-        let optim_new = optim_new.load_record(record.clone());
-        let state_restored = optim_new.to_record();
-
-        assert_ne!(record.len(), record_new.len());
-        assert_eq!(record.len(), state_restored.len());
+        let device = Device::default().autodiff();
+        assert_optimizer_resume(sgd_with_all, layer(&device), LEARNING_RATE);
     }
 
-    fn random_tensor<B: Backend>(device: &B::Device) -> Tensor<B, 2> {
-        Tensor::<B, 2>::random(Shape::new([2, 20]), Distribution::Default, device)
+    #[test]
+    fn lora_finetune_trains_adapter_and_freezes_base() {
+        use burn::module::{Lora, Module};
+        use burn::tensor::Tolerance;
+
+        let device = Device::default().autodiff();
+        let linear = LinearConfig::new(8, 8).init(&device);
+
+        // Snapshot the base weight before applying LoRA / training.
+        let base_before = linear.weight.val();
+
+        // Apply LoRA transparently — no change to `Linear` or its forward code.
+        let mut model = linear.apply_lora(Lora::new(4, 8.0));
+        assert!(model.weight.adapter().is_some());
+        let b_before = model.weight.adapter().unwrap().b.val();
+
+        let x = Tensor::<2>::random(Shape::new([16, 8]), Distribution::Default, &device);
+        let target = Tensor::<2>::random(Shape::new([16, 8]), Distribution::Default, &device);
+
+        let mut optim = SgdConfig::new().init();
+
+        let mut first_loss = None;
+        let mut last_loss = 0.0f32;
+        for _ in 0..30 {
+            let output = model.forward(x.clone());
+            let loss = (output - target.clone()).powf_scalar(2.0).mean();
+            last_loss = loss.clone().into_scalar::<f32>();
+            first_loss.get_or_insert(last_loss);
+
+            let grads = loss.backward();
+            let grads = GradientsParams::from_grads(grads, &model);
+            model = optim.step(0.5, model, grads);
+        }
+
+        // Training reduced the loss...
+        assert!(
+            last_loss < first_loss.unwrap(),
+            "expected loss to decrease ({} -> {})",
+            first_loss.unwrap(),
+            last_loss
+        );
+
+        // ...the adapter is still attached and its B factor moved away from the zero init...
+        assert!(model.weight.adapter().is_some());
+        let b_after = model.weight.adapter().unwrap().b.val();
+        let b_change = (b_after - b_before).abs().sum().into_scalar::<f32>();
+        assert!(
+            b_change > 0.0,
+            "adapter factor B should be updated by training"
+        );
+
+        // ...while the frozen base weight is left untouched.
+        model
+            .weight
+            .base()
+            .into_data()
+            .assert_approx_eq::<f32>(&base_before.into_data(), Tolerance::default());
     }
 
-    fn layer<B: Backend>(device: &B::Device) -> Linear<B> {
+    fn random_tensor(device: &Device) -> Tensor<2> {
+        Tensor::<2>::random(Shape::new([2, 20]), Distribution::Default, device)
+    }
+
+    fn layer(device: &Device) -> Linear {
         LinearConfig::new(20, 20).init(device)
     }
 
-    fn sgd_with_all()
-    -> OptimizerAdaptor<Sgd<TestBackend>, Linear<TestAutodiffBackend>, TestAutodiffBackend> {
+    fn sgd_with_all() -> ModuleOptimizer {
         SgdConfig {
             weight_decay: Some(WeightDecayConfig { penalty: 0.05 }),
             momentum: Some(MomentumConfig {

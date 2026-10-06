@@ -1,7 +1,6 @@
 use crate::kernel::utils::{shape_divmod, shape_divmod_range};
-use crate::{
-    CubeRuntime, kernel::utils::address_type, ops::numeric::empty_device_dtype, tensor::CubeTensor,
-};
+use crate::{kernel::utils::address_type, ops::numeric::empty_device_dtype, tensor::CubeTensor};
+use burn_backend::cubecl::dtype_to_storage_type;
 use cubecl::prelude::*;
 use cubecl::std::FastDivmod;
 use cubecl::std::tensor::layout::linear::LinearView;
@@ -14,14 +13,14 @@ use cubecl::{CubeDim, calculate_cube_count_elemwise};
 #[cube(launch_unchecked, address_type = "dynamic")]
 fn gather_nd_kernel<T: Numeric, I: Int>(
     data: &Tensor<T>,
-    indices: &LinearView<I>,
+    indices: LinearView<'_, I>,
     output: &mut Tensor<T>,
     output_shape: Sequence<FastDivmod<usize>>,
     data_slice_shape: Sequence<FastDivmod<usize>>,
     slice_size: usize,
     k: usize,
     working_units: usize,
-    #[define(T, I)] _dtypes: [StorageType; 2],
+    #[define(T, I)] _dtypes: [ElemType; 2],
 ) {
     if ABSOLUTE_POS >= working_units {
         terminate!();
@@ -34,7 +33,7 @@ fn gather_nd_kernel<T: Numeric, I: Int>(
     let idx_base = index_idx * k;
     let mut base_offset = 0usize;
     for j in 0..k {
-        let idx_val = usize::cast_from(indices[idx_base + j]);
+        let idx_val = usize::cast_from(indices.read(idx_base + j));
         base_offset += idx_val * data.stride(j);
     }
 
@@ -63,10 +62,7 @@ fn gather_nd_kernel<T: Numeric, I: Int>(
     output[out_offset] = data[base_offset + data_slice_offset];
 }
 
-pub(crate) fn gather_nd<R: CubeRuntime>(
-    tensor: CubeTensor<R>,
-    indices: CubeTensor<R>,
-) -> CubeTensor<R> {
+pub(crate) fn gather_nd(tensor: CubeTensor, indices: CubeTensor) -> CubeTensor {
     let data_shape = &tensor.meta.shape;
     let idx_shape = &indices.meta.shape;
     let m = idx_shape.num_dims();
@@ -112,7 +108,10 @@ pub(crate) fn gather_nd<R: CubeRuntime>(
             slice_size,
             k,
             total_elem,
-            [dtype.into(), indices_dtype.into()],
+            [
+                dtype_to_storage_type(dtype),
+                dtype_to_storage_type(indices_dtype),
+            ],
         )
     }
 

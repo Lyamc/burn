@@ -1,28 +1,24 @@
-use crate::metric::{MetricAttributes, MetricName, SerializedEntry};
+use crate::metric::{MetricAttributes, MetricName, NumericEntry, SerializedEntry, format_float};
 
-use super::super::{
-    Metric, MetricMetadata,
-    state::{FormatOptions, NumericMetricState},
-};
+use super::super::{Metric, MetricMetadata, state::FormatOptions};
+use burn_core::tensor::TensorReadError;
 use burn_core::{
-    prelude::{Backend, Tensor},
-    tensor::{ElementConversion, Int, s},
+    prelude::Tensor,
+    tensor::{Int, s},
 };
-use core::marker::PhantomData;
 
 /// Input type for the [DiceMetric].
 ///
 /// # Type Parameters
-/// - `B`: Backend type.
 /// - `D`: Number of dimensions. Should be more than, or equal to 3 (default 4).
-pub struct DiceInput<B: Backend, const D: usize = 4> {
+pub struct DiceInput<const D: usize = 4> {
     /// Model outputs (predictions), as a tensor.
-    outputs: Tensor<B, D, Int>,
+    outputs: Tensor<D, Int>,
     /// Ground truth targets, as a tensor.
-    targets: Tensor<B, D, Int>,
+    targets: Tensor<D, Int>,
 }
 
-impl<B: Backend, const D: usize> DiceInput<B, D> {
+impl<const D: usize> DiceInput<D> {
     /// Creates a new DiceInput with the given outputs and targets.
     ///
     /// Inputs are expected to have the dimensions `[B, C, ...]`
@@ -44,7 +40,7 @@ impl<B: Backend, const D: usize> DiceInput<B, D> {
     /// - If `outputs` and `targets` do not have the same dimensions.
     /// - If `outputs` or `targets` do not have exactly `D` dimensions.
     /// - If `outputs` and `targets` do not have the same shape.
-    pub fn new(outputs: Tensor<B, D, Int>, targets: Tensor<B, D, Int>) -> Self {
+    pub fn new(outputs: Tensor<D, Int>, targets: Tensor<D, Int>) -> Self {
         assert!(D >= 3, "DiceInput requires at least 3 dimensions.");
         assert!(
             outputs.dims() == targets.dims(),
@@ -59,7 +55,8 @@ impl<B: Backend, const D: usize> DiceInput<B, D> {
 /// Configuration for the [DiceMetric].
 #[derive(Debug, Clone, Copy)]
 pub struct DiceMetricConfig {
-    /// Epsilon value to avoid division by zero.
+    /// Epsilon added to the numerator and denominator to avoid division by zero.
+    /// This defines two empty masks as a perfect match with a Dice score of `1.0`.
     pub epsilon: f64,
     /// Whether to include the background class in the metric calculation.
     /// The background is assumed to be the first class (index 0).
@@ -76,26 +73,147 @@ impl Default for DiceMetricConfig {
     }
 }
 
+/// Accumulates the raw Dice numerator and denominator across batches.
+///
+/// Averaging per-batch Dice coefficients is biased when batches contain different amounts of
+/// foreground. Keeping the raw statistics allows the running and final values to be computed over
+/// the complete epoch instead.
+#[derive(Clone)]
+struct DiceMetricState {
+    numerator: f64,
+    denominator: f64,
+    count: usize,
+    current: f64,
+    current_count: usize,
+}
+
+impl DiceMetricState {
+    fn new() -> Self {
+        Self {
+            numerator: 0.0,
+            denominator: 0.0,
+            count: 0,
+            current: f64::NAN,
+            current_count: 0,
+        }
+    }
+
+    fn dice(numerator: f64, denominator: f64, epsilon: f64) -> f64 {
+        (numerator + epsilon) / (denominator + epsilon)
+    }
+
+    fn update(
+        &mut self,
+        intersection: f64,
+        outputs_sum: f64,
+        targets_sum: f64,
+        batch_size: usize,
+        epsilon: f64,
+    ) {
+        let numerator = 2.0 * intersection;
+        let denominator = outputs_sum + targets_sum;
+
+        self.numerator += numerator;
+        self.denominator += denominator;
+        self.count += batch_size;
+        self.current = Self::dice(numerator, denominator, epsilon);
+        self.current_count = batch_size;
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn running(&self, epsilon: f64) -> f64 {
+        if self.count == 0 {
+            f64::NAN
+        } else {
+            Self::dice(self.numerator, self.denominator, epsilon)
+        }
+    }
+
+    fn compute_update(&self, format: FormatOptions, epsilon: f64) -> SerializedEntry {
+        self.compute(format, epsilon, false)
+    }
+
+    fn compute_final(&self, format: FormatOptions, epsilon: f64) -> SerializedEntry {
+        self.compute(format, epsilon, true)
+    }
+
+    fn compute(&self, format: FormatOptions, epsilon: f64, final_entry: bool) -> SerializedEntry {
+        let running = self.running(epsilon);
+        let serialized = if final_entry {
+            NumericEntry::Final(running).serialize()
+        } else {
+            NumericEntry::Aggregated {
+                aggregated_value: self.current,
+                count: self.current_count,
+            }
+            .serialize()
+        };
+
+        let (formatted_current, formatted_running) = match format.precision_value() {
+            Some(precision) => (
+                format_float(self.current, precision),
+                format_float(running, precision),
+            ),
+            None => (format!("{}", self.current), format!("{running}")),
+        };
+
+        SerializedEntry::new(
+            format!("epoch {formatted_running} - batch {formatted_current}"),
+            serialized,
+        )
+    }
+
+    fn current_value(&self) -> NumericEntry {
+        NumericEntry::Aggregated {
+            aggregated_value: self.current,
+            count: self.current_count,
+        }
+    }
+
+    fn running_value(&self, epsilon: f64) -> NumericEntry {
+        NumericEntry::Aggregated {
+            aggregated_value: self.running(epsilon),
+            count: self.count,
+        }
+    }
+
+    fn final_value(&self, epsilon: f64) -> NumericEntry {
+        NumericEntry::Final(self.running(epsilon))
+    }
+}
+
+impl Default for DiceMetricState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The Dice-Sorenson coefficient (DSC) for evaluating overlap between two binary masks.
 /// The DSC is defined as:
 /// `DSC = 2 * (|X ∩ Y|) / (|X| + |Y|)`
 /// where `X` is the model output and `Y` is the ground truth target.
 ///
+/// # Aggregation
+///
+/// The batch value is computed globally over all samples and classes in the batch. Running and
+/// final values use global micro-aggregation over the epoch: batch numerators and denominators are
+/// summed before their ratio is calculated.
+///
 ///  # Type Parameters
-/// - `B`: Backend type.
 /// - `D`: Number of dimensions. Should be more than, or equal to 3 (default 4).
 #[derive(Default, Clone)]
-pub struct DiceMetric<B: Backend, const D: usize = 4> {
+pub struct DiceMetric<const D: usize = 4> {
     name: MetricName,
-    /// Internal state for numeric metric aggregation.
-    state: NumericMetricState,
-    /// Marker for backend type.
-    _b: PhantomData<B>,
+    /// Internal state for raw Dice statistic aggregation.
+    state: DiceMetricState,
     /// Configuration for the metric.
     config: DiceMetricConfig,
 }
 
-impl<B: Backend, const D: usize> DiceMetric<B, D> {
+impl<const D: usize> DiceMetric<D> {
     /// Creates a new Dice metric instance with default config.
     pub fn new() -> Self {
         Self::with_config(DiceMetricConfig::default())
@@ -105,6 +223,10 @@ impl<B: Backend, const D: usize> DiceMetric<B, D> {
     pub fn with_config(config: DiceMetricConfig) -> Self {
         let name = MetricName::new(format!("{D}D Dice Metric"));
         assert!(D >= 3, "DiceMetric requires at least 3 dimensions.");
+        assert!(
+            config.epsilon.is_finite() && config.epsilon > 0.0,
+            "epsilon must be finite and positive"
+        );
         Self {
             name,
             config,
@@ -113,14 +235,18 @@ impl<B: Backend, const D: usize> DiceMetric<B, D> {
     }
 }
 
-impl<B: Backend, const D: usize> Metric for DiceMetric<B, D> {
-    type Input = DiceInput<B, D>;
+impl<const D: usize> Metric for DiceMetric<D> {
+    type Input = DiceInput<D>;
 
     fn name(&self) -> MetricName {
         self.name.clone()
     }
 
-    fn update(&mut self, item: &Self::Input, _metadata: &MetricMetadata) -> SerializedEntry {
+    fn update(
+        &mut self,
+        item: &Self::Input,
+        _metadata: &MetricMetadata,
+    ) -> Result<SerializedEntry, TensorReadError> {
         // Dice coefficient: 2 * (|X ∩ Y|) / (|X| + |Y|)
         if item.outputs.dims() != item.targets.dims() {
             panic!(
@@ -151,20 +277,28 @@ impl<B: Backend, const D: usize> Metric for DiceMetric<B, D> {
         let targets_sum = targets.sum();
 
         // Convert to f64
-        let intersection_val = intersection.into_scalar().elem::<f64>();
-        let outputs_sum_val = outputs_sum.into_scalar().elem::<f64>();
-        let targets_sum_val = targets_sum.into_scalar().elem::<f64>();
-
-        // Use epsilon from config
-        let epsilon = self.config.epsilon;
-        let dice =
-            (2.0 * intersection_val + epsilon) / (outputs_sum_val + targets_sum_val + epsilon);
+        let intersection_val = intersection.try_into_scalar::<f64>()?;
+        let outputs_sum_val = outputs_sum.try_into_scalar::<f64>()?;
+        let targets_sum_val = targets_sum.try_into_scalar::<f64>()?;
 
         self.state.update(
-            dice,
+            intersection_val,
+            outputs_sum_val,
+            targets_sum_val,
             batch_size,
+            self.config.epsilon,
+        );
+        Ok(self.state.compute_update(
             FormatOptions::new(self.name()).precision(4),
-        )
+            self.config.epsilon,
+        ))
+    }
+
+    fn compute(&mut self) -> Result<SerializedEntry, TensorReadError> {
+        Ok(self.state.compute_final(
+            FormatOptions::new(self.name()).precision(4),
+            self.config.epsilon,
+        ))
     }
 
     /// Clears the metric state.
@@ -181,81 +315,251 @@ impl<B: Backend, const D: usize> Metric for DiceMetric<B, D> {
     }
 }
 
-impl<B: Backend, const D: usize> crate::metric::Numeric for DiceMetric<B, D> {
-    fn value(&self) -> crate::metric::NumericEntry {
-        self.state.current_value()
+impl<const D: usize> crate::metric::Numeric for DiceMetric<D> {
+    fn value(&self) -> Option<crate::metric::NumericEntry> {
+        Some(self.state.current_value())
     }
 
-    fn running_value(&self) -> crate::metric::NumericEntry {
-        self.state.running_value()
+    fn running_value(&self) -> Option<crate::metric::NumericEntry> {
+        Some(self.state.running_value(self.config.epsilon))
+    }
+
+    fn final_value(&self) -> crate::metric::NumericEntry {
+        self.state.final_value(self.config.epsilon)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{TestBackend, metric::Numeric};
+    use crate::metric::Numeric;
     use burn_core::tensor::{Shape, Tensor};
+    use rstest::rstest;
 
     #[test]
     fn test_dice_perfect_overlap() {
         let device = Default::default();
-        let mut metric = DiceMetric::<TestBackend, 4>::new();
+        let mut metric = DiceMetric::<4>::new();
         let input = DiceInput::new(
             Tensor::from_data([[[[1, 0], [1, 0]]]], &device),
             Tensor::from_data([[[[1, 0], [1, 0]]]], &device),
         );
-        let _entry = metric.update(&input, &MetricMetadata::fake());
-        assert!((metric.value().current() - 1.0).abs() < 1e-6);
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
+        assert!((metric.value().unwrap().current() - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn test_dice_no_overlap() {
         let device = Default::default();
-        let mut metric = DiceMetric::<TestBackend, 4>::new();
+        let mut metric = DiceMetric::<4>::new();
         let input = DiceInput::new(
             Tensor::from_data([[[[1, 0], [1, 0]]]], &device),
             Tensor::from_data([[[[0, 1], [0, 1]]]], &device),
         );
-        let _entry = metric.update(&input, &MetricMetadata::fake());
-        assert!(metric.value().current() < 1e-6);
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
+        assert!(metric.value().unwrap().current() < 1e-6);
     }
 
     #[test]
     fn test_dice_partial_overlap() {
         let device = Default::default();
-        let mut metric = DiceMetric::<TestBackend, 4>::new();
+        let mut metric = DiceMetric::<4>::new();
         let input = DiceInput::new(
             Tensor::from_data([[[[1, 1], [0, 0]]]], &device),
             Tensor::from_data([[[[1, 0], [1, 0]]]], &device),
         );
-        let _entry = metric.update(&input, &MetricMetadata::fake());
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
         // intersection = 1, sum = 2+2=4, dice = 2*1/4 = 0.5
-        assert!((metric.value().current() - 0.5).abs() < 1e-6);
+        assert!((metric.value().unwrap().current() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dice_epoch_accumulates_raw_statistics() {
+        let device = Default::default();
+        let mut metric = DiceMetric::<4>::new();
+
+        // A perfect batch with one foreground pixel.
+        metric
+            .update(
+                &DiceInput::new(
+                    Tensor::from_data([[[[1]]]], &device),
+                    Tensor::from_data([[[[1]]]], &device),
+                ),
+                &MetricMetadata::fake(),
+            )
+            .unwrap();
+
+        // A batch with four false-positive foreground pixels.
+        metric
+            .update(
+                &DiceInput::new(
+                    Tensor::from_data([[[[1, 1, 1, 1]]]], &device),
+                    Tensor::from_data([[[[0, 0, 0, 0]]]], &device),
+                ),
+                &MetricMetadata::fake(),
+            )
+            .unwrap();
+
+        // Global Dice: (2 * 1 + epsilon) / (5 + 1 + epsilon) = 1 / 3.
+        // Averaging the two batch scores would incorrectly produce approximately 1 / 2.
+        let expected = (2.0 + metric.config.epsilon) / (6.0 + metric.config.epsilon);
+        let current = metric.value().unwrap().current();
+        let running = metric.running_value().unwrap().current();
+        let computed = NumericEntry::deserialize(&metric.compute().unwrap().serialized)
+            .unwrap()
+            .current();
+        let final_value = metric.final_value().current();
+
+        assert!(current < 1e-6);
+        assert!((running - expected).abs() < 1e-6);
+        assert!((computed - expected).abs() < 1e-6);
+        assert!((final_value - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dice_epoch_matches_pytorch_with_varying_batch_sizes() {
+        let device = Default::default();
+        let mut metric = DiceMetric::<4>::new();
+
+        metric
+            .update(
+                &DiceInput::new(
+                    Tensor::from_data([[[[1, 0, 1, 0]]]], &device),
+                    Tensor::from_data([[[[1, 0, 0, 0]]]], &device),
+                ),
+                &MetricMetadata::fake(),
+            )
+            .unwrap();
+        metric
+            .update(
+                &DiceInput::new(
+                    Tensor::from_data([[[[1]]], [[[1]]], [[[1]]]], &device),
+                    Tensor::from_data([[[[0]]], [[[1]]], [[[0]]]], &device),
+                ),
+                &MetricMetadata::fake(),
+            )
+            .unwrap();
+
+        // PyTorch global-micro reference: (2 * 2 + epsilon) / (5 + 2 + epsilon).
+        let expected = (4.0 + metric.config.epsilon) / (7.0 + metric.config.epsilon);
+        let running = metric.running_value().unwrap().current();
+
+        assert!((running - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dice_epoch_empty_masks() {
+        let device = Default::default();
+        let mut metric = DiceMetric::<4>::new();
+
+        metric
+            .update(
+                &DiceInput::new(
+                    Tensor::from_data([[[[0, 0]]]], &device),
+                    Tensor::from_data([[[[0, 0]]]], &device),
+                ),
+                &MetricMetadata::fake(),
+            )
+            .unwrap();
+        metric
+            .update(
+                &DiceInput::new(
+                    Tensor::from_data([[[[0, 0, 0]]], [[[0, 0, 0]]]], &device),
+                    Tensor::from_data([[[[0, 0, 0]]], [[[0, 0, 0]]]], &device),
+                ),
+                &MetricMetadata::fake(),
+            )
+            .unwrap();
+
+        // Burn's epsilon convention defines two empty masks as a perfect match.
+        assert!((metric.value().unwrap().current() - 1.0).abs() < 1e-6);
+        assert!((metric.running_value().unwrap().current() - 1.0).abs() < 1e-6);
+        assert!((metric.final_value().current() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dice_epoch_excludes_background() {
+        let device = Default::default();
+        let mut metric = DiceMetric::<4>::new();
+
+        metric
+            .update(
+                &DiceInput::new(
+                    Tensor::from_data([[[[1, 1, 0, 0]], [[0, 1, 1, 0]]]], &device),
+                    Tensor::from_data([[[[1, 0, 1, 0]], [[0, 1, 0, 1]]]], &device),
+                ),
+                &MetricMetadata::fake(),
+            )
+            .unwrap();
+        metric
+            .update(
+                &DiceInput::new(
+                    Tensor::from_data([[[[0, 0]], [[1, 1]]]], &device),
+                    Tensor::from_data([[[[1, 1]], [[1, 1]]]], &device),
+                ),
+                &MetricMetadata::fake(),
+            )
+            .unwrap();
+
+        // Only class 1 is included: (2 * 3 + epsilon) / (4 + 4 + epsilon).
+        let expected = (6.0 + metric.config.epsilon) / (8.0 + metric.config.epsilon);
+        let running = metric.running_value().unwrap().current();
+
+        assert!((running - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dice_clear_resets_epoch_statistics() {
+        let device = Default::default();
+        let mut metric = DiceMetric::<4>::new();
+        let input = DiceInput::new(
+            Tensor::from_data([[[[1]]]], &device),
+            Tensor::from_data([[[[1]]]], &device),
+        );
+
+        metric.update(&input, &MetricMetadata::fake()).unwrap();
+        metric.clear();
+
+        assert!(metric.value().unwrap().current().is_nan());
+        assert!(metric.running_value().unwrap().current().is_nan());
+        assert!(metric.final_value().current().is_nan());
+    }
+
+    #[rstest]
+    #[case(0.0)]
+    #[case(-1.0)]
+    #[case(f64::NAN)]
+    #[case(f64::INFINITY)]
+    #[should_panic(expected = "epsilon must be finite and positive")]
+    fn test_dice_invalid_epsilon(#[case] epsilon: f64) {
+        let _ = DiceMetric::<4>::with_config(DiceMetricConfig {
+            epsilon,
+            ..Default::default()
+        });
     }
 
     #[test]
     fn test_dice_empty_masks() {
         let device = Default::default();
-        let mut metric = DiceMetric::<TestBackend, 4>::new();
+        let mut metric = DiceMetric::<4>::new();
         let input = DiceInput::new(
             Tensor::from_data([[[[0, 0], [0, 0]]]], &device),
             Tensor::from_data([[[[0, 0], [0, 0]]]], &device),
         );
-        let _entry = metric.update(&input, &MetricMetadata::fake());
-        assert!((metric.value().current() - 1.0).abs() < 1e-6);
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
+        assert!((metric.value().unwrap().current() - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn test_dice_no_background() {
         let device = Default::default();
-        let mut metric = DiceMetric::<TestBackend, 4>::new();
+        let mut metric = DiceMetric::<4>::new();
         let input = DiceInput::new(
             Tensor::ones(Shape::new([1, 1, 2, 2]), &device),
             Tensor::ones(Shape::new([1, 1, 2, 2]), &device),
         );
-        let _entry = metric.update(&input, &MetricMetadata::fake());
-        assert!((metric.value().current() - 1.0).abs() < 1e-6);
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
+        assert!((metric.value().unwrap().current() - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -265,13 +569,13 @@ mod tests {
             epsilon: 1e-7,
             include_background: true,
         };
-        let mut metric = DiceMetric::<TestBackend, 4>::with_config(config);
+        let mut metric = DiceMetric::<4>::with_config(config);
         let input = DiceInput::new(
             Tensor::ones(Shape::new([1, 2, 2, 2]), &device),
             Tensor::ones(Shape::new([1, 2, 2, 2]), &device),
         );
-        let _entry = metric.update(&input, &MetricMetadata::fake());
-        assert!((metric.value().current() - 1.0).abs() < 1e-6);
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
+        assert!((metric.value().unwrap().current() - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -281,13 +585,13 @@ mod tests {
             epsilon: 1e-7,
             include_background: false,
         };
-        let mut metric = DiceMetric::<TestBackend, 4>::with_config(config);
+        let mut metric = DiceMetric::<4>::with_config(config);
         let input = DiceInput::new(
             Tensor::ones(Shape::new([1, 2, 2, 2]), &device),
             Tensor::ones(Shape::new([1, 2, 2, 2]), &device),
         );
-        let _entry = metric.update(&input, &MetricMetadata::fake());
-        assert!((metric.value().current() - 1.0).abs() < 1e-6);
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
+        assert!((metric.value().unwrap().current() - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -295,7 +599,7 @@ mod tests {
     fn test_invalid_input_dimensions() {
         let device = Default::default();
         // D = 2, should panic
-        let _ = DiceInput::<TestBackend, 2>::new(
+        let _ = DiceInput::<2>::new(
             Tensor::from_data([[0.0, 0.0]], &device),
             Tensor::from_data([[0.0, 0.0]], &device),
         );
@@ -308,7 +612,7 @@ mod tests {
     fn test_mismatched_shape() {
         let device = Default::default();
         // shapes differ
-        let _ = DiceInput::<TestBackend, 4>::new(
+        let _ = DiceInput::<4>::new(
             Tensor::from_data([[[[0.0; 2]; 2]; 1]; 1], &device),
             Tensor::from_data([[[[0.0; 3]; 2]; 1]; 1], &device),
         );
@@ -322,24 +626,24 @@ mod tests {
             epsilon: 1e-7,
             include_background: true,
         };
-        let mut metric = DiceMetric::<TestBackend, 4>::with_config(config);
+        let mut metric = DiceMetric::<4>::with_config(config);
         let input = DiceInput::new(
             Tensor::from_data([[[[1.0; 2]; 1]; 1]; 1], &device),
             Tensor::from_data([[[[1.0; 2]; 1]; 1]; 1], &device),
         );
         // n_classes = 2, should not panic
-        let _entry = metric.update(&input, &MetricMetadata::fake());
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
 
         let config = DiceMetricConfig {
             epsilon: 1e-7,
             include_background: true,
         };
-        let mut metric = DiceMetric::<TestBackend, 4>::with_config(config);
+        let mut metric = DiceMetric::<4>::with_config(config);
         let input = DiceInput::new(
             Tensor::from_data([[[[1.0; 1]; 1]; 1]; 1], &device),
             Tensor::from_data([[[[1.0; 1]; 1]; 1]; 1], &device),
         );
         // n_classes = 1, should panic
-        let _entry = metric.update(&input, &MetricMetadata::fake());
+        let _entry = metric.update(&input, &MetricMetadata::fake()).unwrap();
     }
 }

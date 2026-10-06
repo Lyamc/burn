@@ -1,11 +1,11 @@
 use super::{ConvOptions, UnfoldOptions};
 use crate::tensor::FloatTensor;
-use crate::{Backend, TensorData, TensorMetadata, element::ElementConversion};
+use crate::{Backend, TensorData, TensorMetadata};
 use alloc::vec;
-use alloc::vec::Vec;
 use burn_std::{DType, Shape};
 
-/// Constructs a special weight tensor used for unfolding.
+/// Constructs the one-hot weight tensor used for unfolding and folding with the specified number
+/// of convolution groups.
 ///
 /// # Notes
 ///
@@ -16,12 +16,15 @@ use burn_std::{DType, Shape};
 pub(crate) fn create_unfolding_weight<B: Backend>(
     in_channels: usize,
     kernel_size: [usize; 2],
+    groups: usize,
     device: &B::Device,
     dtype: DType,
 ) -> FloatTensor<B> {
+    assert!(groups > 0 && in_channels.is_multiple_of(groups));
+    let in_channels_per_group = in_channels / groups;
     let shape = Shape::new([
         in_channels * kernel_size[0] * kernel_size[1],
-        in_channels,
+        in_channels_per_group,
         kernel_size[0],
         kernel_size[1],
     ]);
@@ -35,16 +38,19 @@ pub(crate) fn create_unfolding_weight<B: Backend>(
 
     let num_elements = shape.num_elements();
 
-    let mut weight: Vec<B::FloatElem> = vec![0.0.elem(); num_elements];
+    let mut weight = vec![0f32; num_elements];
 
     for k in 0..in_channels {
         for i in 0..kernel_size[0] {
             for j in 0..kernel_size[1] {
                 let output_channel = k * kernel_size[0] * kernel_size[1] + i * kernel_size[1] + j;
-                let index =
-                    output_channel * strides[0] + k * strides[1] + i * strides[2] + j * strides[3];
+                let input_channel = k % in_channels_per_group;
+                let index = output_channel * strides[0]
+                    + input_channel * strides[1]
+                    + i * strides[2]
+                    + j * strides[3];
 
-                weight[index] = 1.elem();
+                weight[index] = 1.;
             }
         }
     }
@@ -59,8 +65,7 @@ pub(crate) fn unfold4d_using_conv2d<B: Backend>(
     options: UnfoldOptions,
 ) -> FloatTensor<B> {
     let [_batch_size, in_channels, _in_height, _in_width] = x.shape().dims();
-    let weight =
-        create_unfolding_weight::<B>(in_channels, kernel_size, &B::float_device(&x), x.dtype());
+    let weight = create_unfolding_weight::<B>(in_channels, kernel_size, 1, &x.device(), x.dtype());
     let unfolded = B::conv2d(
         x,
         weight,
@@ -92,7 +97,8 @@ pub fn calculate_unfold_windows(dim_size: usize, window_size: usize, step_size: 
 /// The operation yields a view with all complete windows of size `size` in dimension `dim`;
 /// where windows are advanced by `step` at each index.
 ///
-/// The number of windows is `max(0, (shape[dim] - size).ceil_div(step))`.
+/// The number of windows is `0` when `shape[dim] < size`, and otherwise
+/// `(shape[dim] - size) / step + 1`.
 ///
 /// # Arguments
 ///

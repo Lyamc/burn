@@ -7,93 +7,106 @@ edition.workspace = true
 keywords = ["deep-learning", "machine-learning", "tensor", "pytorch", "ndarray"]
 license.workspace = true
 name = "burn-backend-tests"
-readme.workspace = true
+readme = "README.md"
 repository = "https://github.com/tracel-ai/burn/tree/main/crates/burn-backend-tests"
 version.workspace = true
 
 [lints]
 workspace = true
 
+[lib]
+proc-macro = true
+
 [features]
 default = [
     "burn-tensor/default",
-    "burn-dispatch/default",
     # Default
     # "ndarray",
     "std",
 ]
-std = ["burn-tensor/std", "burn-dispatch/std"]
-
+std = ["burn-tensor/std"]
+bench-disable-alloc = []
 # Backends
-cuda = ["burn-dispatch/cuda", "quantization", "cube"]
-flex = ["burn-dispatch/flex", "quantization"]
-rocm = ["burn-dispatch/rocm", "quantization", "cube"]
-ndarray = ["burn-dispatch/ndarray", "quantization"]
-tch = ["burn-dispatch/tch"]
-vulkan = ["wgpu", "burn-dispatch/vulkan"]
-webgpu = ["wgpu", "burn-dispatch/webgpu"]
-metal = ["wgpu", "burn-dispatch/metal"]
-wgpu = ["burn-dispatch/wgpu", "quantization", "cube"]
-cpu = ["burn-dispatch/cpu", "cube"]
+cuda = ["burn-tensor/cuda", "quantization", "cube"]
+rocm = ["burn-tensor/rocm", "quantization", "cube"]
+flex = ["burn-tensor/flex", "quantization"]
+flex-simd = ["flex", "burn-flex/simd"]
+flex-rayon = ["flex", "burn-flex/rayon"]
+ndarray = ["burn-tensor/ndarray", "quantization"]
+tch = ["burn-tensor/tch"]
+vulkan = ["wgpu", "burn-tensor/vulkan"]
+webgpu = ["wgpu", "burn-tensor/webgpu"]
+metal = ["wgpu", "burn-tensor/metal"]
+wgpu = ["burn-tensor/wgpu", "quantization", "cube"]
+cpu = ["burn-tensor/cpu", "cube"]
+# Runs the test suite against a remote `burn-remote` server.
+# At runtime, set `BURN_DEVICE=remote` (and optionally `BURN_REMOTE_ADDRESS=ws://host:port`).
+remote = ["burn-tensor/remote-websocket"]
 
-autotune = ["burn-dispatch/autotune"]
-autotune-checks = ["burn-dispatch/autotune-checks"]
+autotune = ["burn-tensor/autotune"]
+autotune-checks = ["burn-tensor/autotune-checks"]
 memory-checks = ["burn-fusion?/memory-checks"]
-fusion = ["burn-dispatch/fusion", "burn-fusion/test-util"]
-distributed = [
-    "std",
-    "burn-dispatch/distributed"
+fusion = [
+    "burn-tensor/fusion",
+    "burn-fusion/test-util",
+    "burn-cubecl-fusion?/test-util",
 ]
 
 # CubeCL backends
 cube = [
     "cubek",
     "autotune",
-    "burn-dispatch/ndarray",
+    "burn-tensor/ndarray",
     "burn-ndarray",
-    # Not used directly, but included to avoid recompiling with and without fusion
-    "burn-cubecl",
+    # Direct dependency so fusion tests can assert launch-level decisions (in-place aliasing).
+    "burn-cubecl-fusion",
 ]
 
 # Test configs
 quantization = []
+# Enables the collective (all-reduce) tests, which require a CUDA backend built with NCCL.
+# Kept separate from `cuda` so the rest of the suite can run on CUDA without NCCL.
+distributed = ["cuda"]
 
 [dependencies]
-burn-tensor = { workspace = true }
-burn-tensor-testgen = { workspace = true }
-burn-dispatch = { workspace = true, features = [
-    "autodiff",
-] }
+burn-tensor = { workspace = true, features = ["autodiff"] }
+burn-backend = { workspace = true }
 
 # For random tests
 cubek = { workspace = true, features = ["random"], optional = true }
 
 # Explicitly enable test-only checks
-burn-autodiff = { workspace = true, features = [
-    "export_tests",
-] }
+burn-autodiff = { workspace = true, features = ["export_tests"] }
 burn-ndarray = { workspace = true, optional = true, features = [
     "export_tests",
 ] }
 
-# Manually enable so running the tests again with fusion feature doesn't have to compile other crates
-burn-cubecl = { workspace = true, optional = true, features = [
-    "default",
-    "fusion",
-] }
+burn-cubecl-fusion = { workspace = true, optional = true }
 
 # Enabled alongside the `fusion` feature so spy-based tests can import the spy API.
 burn-fusion = { workspace = true, optional = true }
+
+# allows us to explicitly enable simd without rayon
+burn-flex = { workspace = true, optional = true }
 
 num-traits = { workspace = true }
 serial_test = { workspace = true }
 rand.workspace = true
 
+# might-panic macro
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true }
+
 
 [dev-dependencies]
 # Used to initialize device settings (test dtypes)
-ctor = "0.10.1"
+ctor = "1.0.13"
 divan = "0.1"
+
+[[test]]
+name = "autodiff_transfer"
+required-features = ["flex", "ndarray"]
 
 [[bench]]
 name = "attention"
@@ -133,10 +146,6 @@ harness = false
 
 [[bench]]
 name = "deform_conv_ops"
-harness = false
-
-[[bench]]
-name = "fft_ops"
 harness = false
 
 [[bench]]

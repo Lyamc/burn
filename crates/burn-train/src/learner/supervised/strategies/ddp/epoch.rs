@@ -1,27 +1,26 @@
 use burn_core::data::dataloader::Progress;
-use burn_core::module::AutodiffModule;
 use burn_optim::GradientsAccumulator;
 use std::sync::{Arc, Mutex};
 
 use crate::SupervisedTrainingEventProcessor;
 use crate::learner::base::Interrupter;
 use crate::metric::processor::{EventProcessorTraining, LearnerEvent, TrainingItem};
-use crate::{InferenceStep, Learner, LearningComponentsTypes, TrainLoader, ValidLoader};
+use crate::{InferenceStep, Learner, LearnerModel, TrainLoader, ValidLoader};
 
 /// A validation epoch.
 #[derive(new)]
-pub struct DdpValidEpoch<LC: LearningComponentsTypes> {
-    dataloader: ValidLoader<LC>,
+pub struct DdpValidEpoch<M: LearnerModel> {
+    dataloader: ValidLoader<M>,
 }
 
 /// A training epoch.
 #[derive(new)]
-pub struct DdpTrainEpoch<LC: LearningComponentsTypes> {
-    dataloader: TrainLoader<LC>,
+pub struct DdpTrainEpoch<M: LearnerModel> {
+    dataloader: TrainLoader<M>,
     grad_accumulation: Option<usize>,
 }
 
-impl<LC: LearningComponentsTypes> DdpValidEpoch<LC> {
+impl<M: LearnerModel> DdpValidEpoch<M> {
     /// Runs the validation epoch.
     ///
     /// # Arguments
@@ -30,9 +29,9 @@ impl<LC: LearningComponentsTypes> DdpValidEpoch<LC> {
     /// * `processor` - The event processor to use.
     pub fn run(
         &self,
-        model: &<LC as LearningComponentsTypes>::TrainingModel,
+        model: &M,
         global_progress: &Progress,
-        processor: &mut SupervisedTrainingEventProcessor<LC>,
+        processor: &mut SupervisedTrainingEventProcessor<M>,
         interrupter: &Interrupter,
     ) {
         let epoch = global_progress.items_processed;
@@ -43,30 +42,32 @@ impl<LC: LearningComponentsTypes> DdpValidEpoch<LC> {
         let mut iteration = 0;
 
         while let Some(item) = iterator.next() {
+            let item = match item {
+                Ok(item) => item,
+                Err(err) => {
+                    interrupter.fail(err);
+                    break;
+                }
+            };
             let progress = iterator.progress();
             iteration += 1;
 
-            let item = model.step(item);
-            let item = TrainingItem::new(
-                item,
-                progress,
-                global_progress.clone(),
-                Some(iteration),
-                None,
-            );
+            let item = InferenceStep::step(&model, item);
+            let item = TrainingItem::new(item, progress, Some(iteration), None);
 
-            processor.process_valid(LearnerEvent::ProcessedItem(item));
+            processor
+                .process_valid(LearnerEvent::ProcessedItem(item))
+                .unwrap();
 
             if interrupter.should_stop() {
                 log::info!("Training interrupted.");
                 break;
             }
         }
-        processor.process_valid(LearnerEvent::EndEpoch(epoch));
     }
 }
 
-impl<LC: LearningComponentsTypes> DdpTrainEpoch<LC> {
+impl<M: LearnerModel> DdpTrainEpoch<M> {
     /// Runs the training epoch.
     ///
     /// # Arguments
@@ -79,15 +80,13 @@ impl<LC: LearningComponentsTypes> DdpTrainEpoch<LC> {
     /// # Returns
     ///
     /// The trained model and the optimizer.
-    #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
-        learner: &mut Learner<LC>,
+        learner: &mut Learner<M>,
         global_progress: &Progress,
-        processor: Arc<Mutex<SupervisedTrainingEventProcessor<LC>>>,
+        processor: Arc<Mutex<SupervisedTrainingEventProcessor<M>>>,
         interrupter: &Interrupter,
         peer_count: usize,
-        is_main: bool,
     ) {
         let epoch = global_progress.items_processed;
         log::info!("Executing training step for epoch {}", epoch,);
@@ -98,10 +97,14 @@ impl<LC: LearningComponentsTypes> DdpTrainEpoch<LC> {
         let mut accumulation_current = 0;
 
         while let Some(item) = iterator.next() {
-            for _ in 0..peer_count {
-                iteration += 1;
-                learner.lr_step();
-            }
+            let item = match item {
+                Ok(item) => item,
+                Err(err) => {
+                    interrupter.fail(err);
+                    break;
+                }
+            };
+            iteration += peer_count;
             log::info!("Iteration {iteration}");
 
             let mut progress = iterator.progress();
@@ -115,14 +118,16 @@ impl<LC: LearningComponentsTypes> DdpTrainEpoch<LC> {
                     accumulator.accumulate(&learner.model(), item.grads);
                     accumulation_current += 1;
 
-                    if accumulation <= accumulation_current {
+                    if accumulation <= accumulation_current || progress.is_completed() {
                         let grads = accumulator.grads();
 
+                        learner.lr_step();
                         learner.optimizer_step(grads);
                         accumulation_current = 0;
                     }
                 }
                 None => {
+                    learner.lr_step();
                     learner.optimizer_step(item.grads);
                 }
             }
@@ -130,25 +135,21 @@ impl<LC: LearningComponentsTypes> DdpTrainEpoch<LC> {
             let item = TrainingItem::new(
                 item.item,
                 progress,
-                global_progress.clone(),
                 Some(iteration),
                 Some(learner.lr_current()),
             );
 
             {
                 let mut processor = processor.lock().unwrap();
-                processor.process_train(LearnerEvent::ProcessedItem(item));
+                processor
+                    .process_train(LearnerEvent::ProcessedItem(item))
+                    .unwrap();
             }
 
             if interrupter.should_stop() {
                 log::info!("Training interrupted.");
                 break;
             }
-        }
-
-        if is_main {
-            let mut processor = processor.lock().unwrap();
-            processor.process_train(LearnerEvent::EndEpoch(epoch));
         }
     }
 }

@@ -1,9 +1,24 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![recursion_limit = "256"]
 
-//! Burn neural network module.
+//! Neural network building blocks for Burn.
+//!
+//! Every layer is a [`Module`](burn_core::module::Module) built from a `Config`:
+//! `LinearConfig::new(784, 128).init(&device)` returns a [`Linear`]. Applications use these through
+//! `burn::nn`.
+//!
+//! - Layers: linear, convolution and transposed convolution (1D to 3D), pooling, normalization
+//!   (batch, layer, group, instance, RMS), embeddings, dropout, recurrent layers (LSTM, GRU),
+//!   attention and transformers, positional and rotary encodings, interpolation, and more.
+//! - [`activation`]: activation functions as modules.
+//! - [`loss`]: loss functions, from mean squared error and cross-entropy to CTC.
+//! - [`Initializer`]: weight initialization schemes.
+//!
+//! # Feature flags
+//!
+//! - `std` (default): standard library support. Without it the crate is `no_std` with `alloc`.
+//! - `tracing`: instrument operations with the `tracing` crate.
 
 /// Loss module
 pub mod loss;
@@ -19,45 +34,15 @@ pub use activation::{
     tanh::*, thresholded_relu::*,
 };
 
+mod initializer;
 mod padding;
-pub use padding::*;
 
-// For backward compat, `burn::nn::Initializer`
-pub use burn_core::module::Initializer;
+pub use initializer::*;
+pub use padding::*;
 
 extern crate alloc;
 
-/// Backend for test cases
-#[cfg(all(
-    test,
-    not(feature = "test-tch"),
-    not(feature = "test-wgpu"),
-    not(feature = "test-cuda"),
-    not(feature = "test-rocm")
-))]
-pub type TestBackend = burn_flex::Flex;
-
-#[cfg(all(test, feature = "test-tch"))]
-/// Backend for test cases
-pub type TestBackend = burn_tch::LibTorch<f32>;
-
-#[cfg(all(test, feature = "test-wgpu"))]
-/// Backend for test cases
-pub type TestBackend = burn_wgpu::Wgpu;
-
-#[cfg(all(test, feature = "test-cuda"))]
-/// Backend for test cases
-pub type TestBackend = burn_cuda::Cuda;
-
-#[cfg(all(test, feature = "test-rocm"))]
-/// Backend for test cases
-pub type TestBackend = burn_rocm::Rocm;
-
-/// Backend for autodiff test cases
 #[cfg(test)]
-pub type TestAutodiffBackend = burn_autodiff::Autodiff<TestBackend>;
-
-#[cfg(all(test, feature = "test-memory-checks"))]
-mod tests {
-    burn_fusion::memory_checks!();
+fn test_device() -> burn_core::tensor::Device {
+    burn_core::tensor::Device::flex()
 }

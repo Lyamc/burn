@@ -29,7 +29,8 @@ makes it possible to build and run the model with the `wasm32-unknown-unknown` t
 special system library, such as [WASI](https://wasi.dev/). (See [Cargo.toml](./Cargo.toml) on how to
 include burn dependencies without `std`).
 
-For this demo, we use trained parameters (`model.bin`) and model (`model.rs`) from the
+For this demo, we use trained parameters (`model.bpk`, in the burnpack format) and model
+(`model.rs`) from the
 [`burn` MNIST example](https://github.com/tracel-ai/burn/tree/main/examples/mnist).
 
 The inference API for JavaScript is exposed with the help of
@@ -38,6 +39,12 @@ The inference API for JavaScript is exposed with the help of
 JavaScript (`index.js`) is used to transform hand-drawn digits to a format that the inference API
 accepts. The transformation includes image cropping, scaling down, and converting it to grayscale
 values.
+
+The model runs in a module Web Worker (`inference-worker.js`) with either backend, leaving the
+main thread available for drawing. Predictions update while drawing, with one inference in flight
+at a time. When drawing changes during inference, the next request captures the latest canvas
+instead of queuing intermediate images. Clearing the canvas discards pending updates and ignores
+results from earlier drawings.
 
 ## Model
 

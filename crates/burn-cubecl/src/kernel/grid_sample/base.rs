@@ -1,16 +1,12 @@
 use cubecl::prelude::*;
 
-use crate::{CubeRuntime, tensor::CubeTensor};
+use crate::tensor::CubeTensor;
 use burn_backend::ops::{GridSampleOptions, GridSamplePaddingMode, InterpolateMode};
 
 use super::bilinear::grid_sample_bilinear_launch;
 
 /// Grid sample operation supporting bilinear interpolation
-pub fn grid_sample<R: CubeRuntime>(
-    input: CubeTensor<R>,
-    grid: CubeTensor<R>,
-    options: GridSampleOptions,
-) -> CubeTensor<R> {
+pub fn grid_sample(input: CubeTensor, grid: CubeTensor, options: GridSampleOptions) -> CubeTensor {
     match options.mode {
         InterpolateMode::Bilinear => grid_sample_bilinear_launch(input, grid, options),
         _ => panic!(
@@ -79,7 +75,7 @@ pub(crate) fn fetch_with_zeros<F: Float>(
     let x_clamped = clamp(x, 0, w - 1) as usize;
     let y_clamped = clamp(y, 0, h - 1) as usize;
     let idx = base + y_clamped * stride_h + x_clamped * stride_w;
-    select(in_bounds, input[idx], F::new(0.0))
+    select(in_bounds, input[idx], F::new(0.0_f32))
 }
 
 /// Fetch value with border padding (clamp to edge).
@@ -139,9 +135,9 @@ fn reflect_coord_bounded(idx: i32, size: i32) -> usize {
 pub(crate) fn reflect_coord<F: Float>(coord: F, size: u32, #[comptime] align_corners: bool) -> F {
     let size_f = F::cast_from(size);
     if align_corners {
-        reflect_float_impl::<F>(coord, F::new(0.0), size_f - F::new(1.0))
+        reflect_float_impl::<F>(coord, F::new(0.0_f32), size_f - F::new(1.0_f32))
     } else {
-        reflect_float_impl::<F>(coord, F::new(-0.5), size_f - F::new(0.5))
+        reflect_float_impl::<F>(coord, F::new(-0.5_f32), size_f - F::new(0.5_f32))
     }
 }
 
@@ -150,11 +146,11 @@ pub(crate) fn reflect_coord<F: Float>(coord: F, size: u32, #[comptime] align_cor
 fn reflect_float_impl<F: Float>(coord: F, min_val: F, max_val: F) -> F {
     let span = max_val - min_val;
 
-    let is_valid = span > F::new(0.0);
-    let safe_span = select(is_valid, span, F::new(1.0));
+    let is_valid = span > F::new(0.0_f32);
+    let safe_span = select(is_valid, span, F::new(1.0_f32));
 
     // Triangle wave formula: span - |((x mod 2*span) - span)| + min_val
-    let period = safe_span * F::new(2.0);
+    let period = safe_span * F::new(2.0_f32);
     let x = (coord - min_val).abs();
     let x_mod = x - (x / period).floor() * period;
     let reflected = safe_span - (x_mod - safe_span).abs() + min_val;

@@ -1,8 +1,7 @@
 use burn_core as burn;
 
 use burn::config::Config;
-use burn::module::{Content, DisplaySettings, Module, ModuleDisplay};
-use burn::tensor::backend::Backend;
+use burn::module::{Content, DisplaySettings, Flag, Module, ModuleDisplay, Param};
 use burn::tensor::{Distribution, Tensor};
 
 /// Configuration to create a [GaussianNoise](GaussianNoise) layer using the [init function](GaussianNoiseConfig::init).
@@ -19,23 +18,30 @@ pub struct GaussianNoiseConfig {
 /// distortion.
 ///
 /// Should be created with [GaussianNoiseConfig].
-#[derive(Module, Clone, Debug)]
+#[derive(Module, Debug)]
 #[module(custom_display)]
 pub struct GaussianNoise {
     /// Standard deviation of the normal noise distribution.
     pub std: f64,
+    /// Whether to behave as during training. Cleared by
+    /// [`freeze`](burn::module::Module::freeze) and matching
+    /// [`freeze_group`](burn::module::Module::freeze_group) traversals.
+    pub training: Param<Flag>,
 }
 
 impl GaussianNoiseConfig {
     /// Initialize a new [Gaussian noise](GaussianNoise) module.
     pub fn init(&self) -> GaussianNoise {
-        if self.std.is_sign_negative() {
+        if !self.std.is_finite() || self.std < 0.0 {
             panic!(
-                "Standard deviation is required to be non-negative, but got {}",
+                "Standard deviation must be finite and non-negative, but got {}",
                 self.std
             );
         }
-        GaussianNoise { std: self.std }
+        GaussianNoise {
+            std: self.std,
+            training: Param::from_bool(true),
+        }
     }
 }
 
@@ -48,8 +54,8 @@ impl GaussianNoise {
     ///
     /// - input: `[..., any]`
     /// - output: `[..., any]`
-    pub fn forward<B: Backend, const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
-        if B::ad_enabled(&input.device()) && self.std != 0.0 {
+    pub fn forward<const D: usize>(&self, input: Tensor<D>) -> Tensor<D> {
+        if self.training.is_enabled() && input.device().is_autodiff() && self.std != 0.0 {
             let noise = Tensor::random(
                 input.shape(),
                 Distribution::Normal(0.0, self.std),
@@ -70,26 +76,24 @@ impl ModuleDisplay for GaussianNoise {
     }
 
     fn custom_content(&self, content: Content) -> Option<Content> {
-        content.add("std", &self.std).optional()
+        let content = content.add("std", &self.std);
+        match self.training.is_enabled() {
+            true => content.optional(),
+            false => content.add("training", &self.training).optional(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::tensor::Shape;
-
-    #[cfg(feature = "std")]
-    use crate::{TestAutodiffBackend, TestBackend};
-
-    #[cfg(not(feature = "std"))]
-    use crate::TestBackend;
+    use burn::tensor::{Device, Shape};
 
     #[cfg(feature = "std")]
     #[test]
     fn with_ad_backend_should_mark_input() {
-        let tensor =
-            Tensor::<TestAutodiffBackend, 2>::ones(Shape::new([100, 100]), &Default::default());
+        let device = Device::default().autodiff();
+        let tensor = Tensor::<2>::ones(Shape::new([100, 100]), &device);
         let noise = GaussianNoiseConfig::new(0.5).init();
 
         let output = noise.forward(tensor.clone());
@@ -99,7 +103,7 @@ mod tests {
 
     #[test]
     fn without_ad_backend_should_not_change_input() {
-        let tensor = Tensor::<TestBackend, 2>::ones(Shape::new([100, 100]), &Default::default());
+        let tensor = Tensor::<2>::ones(Shape::new([100, 100]), &Default::default());
         let noise = GaussianNoiseConfig::new(0.5).init();
 
         let output = noise.forward(tensor.clone());
@@ -107,10 +111,42 @@ mod tests {
         assert_eq!(tensor.to_data(), output.to_data());
     }
 
+    #[cfg(feature = "std")]
     #[test]
-    #[should_panic(expected = "Standard deviation is required to be non-negative")]
+    fn frozen_noise_on_a_training_device_passes_its_input_through() {
+        use burn::module::Module;
+        use burn::tensor::Device;
+        // Frozen where partial finetuning leaves it: on the training device,
+        // because that is where the rest of the graph is.
+        let device = Device::default().autodiff();
+        let tensor = Tensor::<2>::ones(Shape::new([100, 100]), &device);
+        let noise = GaussianNoiseConfig::new(0.5).init().freeze();
+
+        let output = noise.forward(tensor.clone());
+
+        assert_eq!(
+            tensor.to_data(),
+            output.to_data(),
+            "a frozen layer should not perturb a subtree the caller froze"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Standard deviation must be finite and non-negative")]
     fn negative_std_should_panic() {
         GaussianNoiseConfig { std: -0.5 }.init();
+    }
+
+    #[test]
+    #[should_panic(expected = "Standard deviation must be finite and non-negative")]
+    fn nan_std_should_panic() {
+        GaussianNoiseConfig::new(f64::NAN).init();
+    }
+
+    #[test]
+    #[should_panic(expected = "Standard deviation must be finite and non-negative")]
+    fn infinite_std_should_panic() {
+        GaussianNoiseConfig::new(f64::INFINITY).init();
     }
 
     #[test]
@@ -119,5 +155,16 @@ mod tests {
         let layer = config.init();
 
         assert_eq!(alloc::format!("{layer}"), "GaussianNoise {std: 0.5}");
+    }
+
+    #[test]
+    fn display_shows_a_frozen_layer() {
+        use burn::module::Module;
+        let layer = GaussianNoiseConfig::new(0.5).init().freeze();
+
+        assert_eq!(
+            alloc::format!("{layer}"),
+            "GaussianNoise {std: 0.5, training: disabled}"
+        );
     }
 }

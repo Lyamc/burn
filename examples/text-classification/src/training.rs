@@ -17,13 +17,11 @@ use burn::{
     nn::{attention::SeqLengthOption, transformer::TransformerEncoderConfig},
     optim::AdamConfig,
     prelude::*,
-    record::{CompactRecorder, Recorder},
-    tensor::backend::AutodiffBackend,
     train::metric::{
         AccuracyMetric, CudaMetric, IterationSpeedMetric, LearningRateMetric, LossMetric,
     },
 };
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 // Define configuration struct for the experiment
 #[derive(Config, Debug)]
@@ -32,21 +30,24 @@ pub struct ExperimentConfig {
     pub optimizer: AdamConfig,
     #[config(default = "SeqLengthOption::Fixed(256)")]
     pub seq_length: SeqLengthOption,
-    #[config(default = 8)]
+    #[config(default = 32)]
     pub batch_size: usize,
     #[config(default = 5)]
     pub num_epochs: usize,
+    /// Noam scheduler factor. The peak learning rate is roughly
+    /// `factor / sqrt(d_model * warmup_steps)`.
+    #[config(default = 1e-2)]
+    pub lr_factor: f64,
 }
 
-fn create_artifact_dir(artifact_dir: &str) {
-    // Remove existing artifacts before to get an accurate learner summary
-    std::fs::remove_dir_all(artifact_dir).ok();
+pub(crate) fn create_artifact_dir(artifact_dir: &str) {
+    std::fs::remove_file(PathBuf::from(artifact_dir).join("experiment.log")).ok();
     std::fs::create_dir_all(artifact_dir).ok();
 }
 
 // Define train function
-pub fn train<B: AutodiffBackend, D: TextClassificationDataset + 'static>(
-    strategy: ExecutionStrategy<B>,
+pub fn train<D: TextClassificationDataset + 'static>(
+    strategy: ExecutionStrategy,
     dataset_train: D,         // Training dataset
     dataset_test: D,          // Testing dataset
     config: ExperimentConfig, // Experiment configuration
@@ -67,23 +68,23 @@ pub fn train<B: AutodiffBackend, D: TextClassificationDataset + 'static>(
         tokenizer.vocab_size(),
         config.seq_length,
     )
-    .init::<B>(strategy.main_device());
+    .init(&strategy.main_device().clone().autodiff());
 
     // Initialize data loaders for training and testing data
     let dataloader_train = DataLoaderBuilder::new(batcher.clone())
         .batch_size(config.batch_size)
         .num_workers(1)
-        .build(SamplerDataset::new(dataset_train, 50_000));
+        .build(SamplerDataset::new(dataset_train, 25_000));
     let dataloader_test = DataLoaderBuilder::new(batcher)
         .batch_size(config.batch_size)
         .num_workers(1)
-        .build(SamplerDataset::new(dataset_test, 5_000));
+        .build(SamplerDataset::new(dataset_test, 2500));
 
     // Initialize optimizer
     let optim = config.optimizer.init();
 
     // Initialize learning rate scheduler
-    let lr_scheduler = NoamLrSchedulerConfig::new(1e-2)
+    let lr_scheduler = NoamLrSchedulerConfig::new(config.lr_factor)
         .with_warmup_steps(1000)
         .with_model_size(config.transformer.d_model)
         .init()
@@ -99,7 +100,7 @@ pub fn train<B: AutodiffBackend, D: TextClassificationDataset + 'static>(
         .metric_train_numeric(AccuracyMetric::new())
         .metric_valid_numeric(AccuracyMetric::new())
         .metric_train_numeric(LearningRateMetric::new())
-        .with_file_checkpointer(CompactRecorder::new())
+        .with_default_checkpointers()
         .with_training_strategy(strategy.into())
         .num_epochs(config.num_epochs)
         .summary();
@@ -109,10 +110,9 @@ pub fn train<B: AutodiffBackend, D: TextClassificationDataset + 'static>(
 
     // Save the configuration and the trained model
     config.save(format!("{artifact_dir}/config.json")).unwrap();
-    CompactRecorder::new()
-        .record(
-            result.model.into_record(),
-            format!("{artifact_dir}/model").into(),
-        )
+    result
+        .model
+        .into_record()
+        .save(format!("{artifact_dir}/model"))
         .unwrap();
 }

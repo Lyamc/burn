@@ -12,7 +12,7 @@ use crate::{FlexTensor, Layout};
 
 /// Apply a float predicate element-wise, producing a boolean tensor.
 ///
-/// Delegates to [`crate::ops::comparison::make_bool_tensor`] for output
+/// Delegates to make_bool_tensor for output
 /// construction, so it shares the same `BoolDType` support (Native/U8 only,
 /// panics on U32).
 pub fn float_predicate<F32P, F64P>(
@@ -375,6 +375,7 @@ pub fn erf_f64(x: f64) -> f64 {
 // (erf_f32/f64, round_ties_even); otherwise add them to
 // crates/burn-backend-tests/tests/tensor/float/ops/.
 #[cfg(test)]
+#[allow(clippy::excessive_precision)]
 mod tests {
     use alloc::vec;
     use burn_backend::TensorData;
@@ -387,7 +388,7 @@ mod tests {
         let data = vec![2e18_f32, -2e18_f32, f32::MAX, f32::MIN];
         let tensor = FlexTensor::from_data(TensorData::new(data.clone(), [data.len()]));
         let result = super::round(tensor);
-        let out: Vec<f32> = result.into_data().to_vec().unwrap();
+        let out: Vec<f32> = result.into_data().try_into_vec().unwrap();
         for (a, b) in out.iter().zip(data.iter()) {
             assert_eq!(a.to_bits(), b.to_bits());
         }

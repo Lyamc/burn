@@ -5,8 +5,7 @@ use burn::config::Config;
 use burn::module::Module;
 use burn::module::{Content, DisplaySettings, ModuleDisplay};
 use burn::tensor::Tensor;
-use burn::tensor::backend::Backend;
-use burn::tensor::ops::PadMode;
+use burn::tensor::ops::MaxPoolOptions;
 
 use burn::tensor::module::max_pool1d;
 
@@ -35,7 +34,7 @@ pub struct MaxPool1dConfig {
 /// Applies a 1D max pooling over input tensors.
 ///
 /// Should be created with [MaxPool1dConfig](MaxPool1dConfig).
-#[derive(Module, Clone, Debug)]
+#[derive(Module, Debug)]
 #[module(custom_display)]
 pub struct MaxPool1d {
     /// The stride.
@@ -43,6 +42,7 @@ pub struct MaxPool1d {
     /// The size of the kernel.
     pub kernel_size: usize,
     /// The padding configuration.
+    #[module(skip)]
     pub padding: PaddingConfig1d,
     /// The dilation.
     pub dilation: usize,
@@ -90,49 +90,26 @@ impl MaxPool1d {
     ///
     /// - input: `[batch_size, channels, length_in]`
     /// - output: `[batch_size, channels, length_out]`
-    pub fn forward<B: Backend>(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn forward(&self, input: Tensor<3>) -> Tensor<3> {
         let [_batch_size, _channels, length] = input.dims();
+        let padding = self
+            .padding
+            .calculate_padding_1d_pair(length, self.kernel_size, self.stride);
 
-        // Calculate padding as pair - handles Same, Valid, and Explicit uniformly
-        let (left, right) =
-            self.padding
-                .calculate_padding_1d_pair(length, self.kernel_size, self.stride);
-
-        // TODO: Move asymmetric padding to functional level via PoolOptions
-        // See: https://github.com/tracel-ai/burn/issues/4362
-        // Handle asymmetric padding by applying explicit pad operation first
-        if left != right {
-            // For 1D (NCL format), pad the length dimension with (left, right)
-            // and no padding for channel dimension (top=0, bottom=0)
-            // Use -inf for max pooling so padded values don't affect the max
-            let padded = input.pad((left, right, 0, 0), PadMode::Constant(f32::NEG_INFINITY));
-            // Use zero padding for the pool operation since we already padded
-            max_pool1d(
-                padded,
-                self.kernel_size,
-                self.stride,
-                0,
-                self.dilation,
-                self.ceil_mode,
-            )
-        } else {
-            // Symmetric padding
-            max_pool1d(
-                input,
-                self.kernel_size,
-                self.stride,
-                left,
-                self.dilation,
-                self.ceil_mode,
-            )
-        }
+        max_pool1d(
+            input,
+            MaxPoolOptions::new([self.kernel_size])
+                .with_stride([self.stride])
+                .with_padding_pairs([padding])
+                .with_dilation([self.dilation])
+                .with_ceil_mode(self.ceil_mode),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestBackend;
     use rstest::rstest;
 
     #[test]
@@ -144,7 +121,7 @@ mod tests {
         let pool = config.init();
 
         // Input: [batch=1, channels=2, length=5]
-        let input = Tensor::<TestBackend, 3>::ones([1, 2, 5], &device);
+        let input = Tensor::<3>::ones([1, 2, 5], &device);
         let output = pool.forward(input);
 
         // Same padding should preserve spatial dimensions
@@ -186,7 +163,7 @@ mod tests {
         let pool = config.init();
 
         // Input: [batch=1, channels=2, length=4]
-        let input = Tensor::<TestBackend, 3>::ones([1, 2, 4], &device);
+        let input = Tensor::<3>::ones([1, 2, 4], &device);
         let output = pool.forward(input);
 
         // With asymmetric padding (1, 2), input length 4 becomes 4+1+2=7
@@ -204,7 +181,7 @@ mod tests {
         let pool = config.init();
 
         // Input: [batch=1, channels=2, length=4]
-        let input = Tensor::<TestBackend, 3>::ones([1, 2, 4], &device);
+        let input = Tensor::<3>::ones([1, 2, 4], &device);
         let output = pool.forward(input);
 
         // With symmetric padding (2, 2), input length 4 becomes 4+2+2=8

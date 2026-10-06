@@ -5,8 +5,10 @@ mod base;
 mod bool;
 mod cartesian_grid;
 mod cast;
+mod einsum;
 mod float;
 mod fmod;
+mod graph;
 mod int;
 mod numeric;
 mod options;
@@ -18,13 +20,18 @@ mod transaction;
 
 mod trunc;
 
+#[cfg(feature = "autodiff")]
 pub use autodiff::*;
 pub use base::*;
 pub use cartesian_grid::cartesian_grid;
 pub use cast::*;
+pub use einsum::{__einsum, EinsumOperand};
 pub use float::{DEFAULT_ATOL, DEFAULT_RTOL};
-pub use numeric::*;
+pub use graph::{Graph, capture};
 pub use options::*;
 pub use transaction::*;
 
-pub use burn_backend::tensor::IndexingUpdateOp;
+#[cfg(feature = "extension")]
+mod extension;
+#[cfg(feature = "extension")]
+pub use extension::*;

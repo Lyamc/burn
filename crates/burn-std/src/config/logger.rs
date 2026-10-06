@@ -1,16 +1,18 @@
 use alloc::{string::String, vec::Vec};
 use core::fmt::Display;
-use cubecl_common::{
+use cubecl_environment::{
     config::{
         RuntimeConfig,
         logger::{LogLevel, LoggerConfig, LoggerSinks},
     },
-    stub::Arc,
+    sync::{Arc, Mutex},
 };
 
-use super::{autodiff::AutodiffLogLevel, base::BurnConfig, fusion::FusionLogLevel};
+use super::{
+    autodiff::AutodiffLogLevel, base::BurnConfig, fusion::FusionLogLevel, remote::RemoteLogLevel,
+};
 
-static BURN_LOGGER: spin::Mutex<Option<Logger>> = spin::Mutex::new(None);
+static BURN_LOGGER: Mutex<Option<Logger>> = Mutex::new(None);
 
 #[cfg(feature = "std")]
 std::thread_local! {
@@ -44,6 +46,7 @@ pub struct Logger {
     sinks: LoggerSinks,
     fusion_index: Vec<usize>,
     autodiff_index: Vec<usize>,
+    remote_index: Vec<usize>,
     /// The configuration snapshot the logger was initialized with.
     pub config: Arc<BurnConfig>,
 }
@@ -65,41 +68,57 @@ impl Logger {
 
         let fusion_index = register_enabled(
             &mut sinks,
-            &config.fusion.logger,
-            config.fusion.logger.level != FusionLogLevel::Disabled,
+            &config.fusion().logger,
+            config.fusion().logger.level != FusionLogLevel::Disabled,
         );
         let autodiff_index = register_enabled(
             &mut sinks,
-            &config.autodiff.logger,
-            config.autodiff.logger.level != AutodiffLogLevel::Disabled,
+            &config.autodiff().logger,
+            config.autodiff().logger.level != AutodiffLogLevel::Disabled,
+        );
+        let remote_index = register_enabled(
+            &mut sinks,
+            &config.remote().logger,
+            config.remote().logger.level != RemoteLogLevel::Disabled,
         );
 
         Self {
             sinks,
             fusion_index,
             autodiff_index,
+            remote_index,
             config,
         }
     }
 
     /// Writes `msg` to all configured fusion sinks.
     pub fn log_fusion<S: Display>(&mut self, msg: &S) {
-        self.sinks.log(&self.fusion_index, msg);
+        self.sinks.log(&self.fusion_index, "burn::fusion", msg);
     }
 
     /// Writes `msg` to all configured autodiff sinks.
     pub fn log_autodiff<S: Display>(&mut self, msg: &S) {
-        self.sinks.log(&self.autodiff_index, msg);
+        self.sinks.log(&self.autodiff_index, "burn::autodiff", msg);
+    }
+
+    /// Writes `msg` to all configured remote-backend sinks.
+    pub fn log_remote<S: Display>(&mut self, msg: &S) {
+        self.sinks.log(&self.remote_index, "burn::remote", msg);
     }
 
     /// Returns the current fusion log level.
     pub fn log_level_fusion(&self) -> FusionLogLevel {
-        self.config.fusion.logger.level
+        self.config.fusion().logger.level
+    }
+
+    /// Returns the current remote-backend log level.
+    pub fn log_level_remote(&self) -> RemoteLogLevel {
+        self.config.remote().logger.level
     }
 
     /// Returns the current autodiff log level.
     pub fn log_level_autodiff(&self) -> AutodiffLogLevel {
-        self.config.autodiff.logger.level
+        self.config.autodiff().logger.level
     }
 }
 
@@ -122,7 +141,7 @@ pub fn log_fusion<F>(level: FusionLogLevel, f: F)
 where
     F: FnOnce() -> String,
 {
-    let current = config().fusion.logger.level;
+    let current = config().fusion().logger.level;
     if current < level {
         return;
     }
@@ -139,7 +158,7 @@ pub fn log_autodiff<F>(level: AutodiffLogLevel, f: F)
 where
     F: FnOnce() -> String,
 {
-    let current = config().autodiff.logger.level;
+    let current = config().autodiff().logger.level;
     if current < level {
         return;
     }
@@ -147,4 +166,21 @@ where
     let mut guard = BURN_LOGGER.lock();
     let logger = guard.get_or_insert_with(Logger::new);
     logger.log_autodiff(&msg);
+}
+
+/// Emit a remote-backend log message when the configured level is at least `level`.
+///
+/// The message is only constructed when logging is enabled.
+pub fn log_remote<F>(level: RemoteLogLevel, f: F)
+where
+    F: FnOnce() -> String,
+{
+    let current = config().remote().logger.level;
+    if current < level {
+        return;
+    }
+    let msg = f();
+    let mut guard = BURN_LOGGER.lock();
+    let logger = guard.get_or_insert_with(Logger::new);
+    logger.log_remote(&msg);
 }

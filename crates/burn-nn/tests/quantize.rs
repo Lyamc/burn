@@ -2,50 +2,24 @@ use burn_core as burn;
 
 use burn::module::{Module, Quantizer};
 use burn::tensor::{
-    Device, Distribution, Tensor, Tolerance,
-    ops::{FloatElem, QuantizedTensor},
-    quantization::{
-        Calibration, QTensorPrimitive, QuantLevel, QuantParam, QuantScheme, QuantValue,
-    },
+    Distribution, Tensor, Tolerance,
+    quantization::{Calibration, QuantScheme, QuantValue, ScaleDtype},
 };
 use burn_nn::{
-    Linear, LinearConfig,
+    LinearConfig,
     transformer::{TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput},
 };
 
-#[cfg(all(
-    test,
-    not(feature = "test-wgpu"),
-    not(feature = "test-cuda"),
-    not(feature = "test-rocm")
-))]
-pub type B = burn_flex::Flex;
-
-#[cfg(all(test, feature = "test-wgpu"))]
-/// Backend for test cases
-pub type B = burn_wgpu::Wgpu;
-
-#[cfg(all(test, feature = "test-cuda"))]
-/// Backend for test cases
-pub type B = burn_cuda::Cuda;
-
-#[cfg(all(test, feature = "test-rocm"))]
-/// Backend for test cases
-pub type B = burn_rocm::Rocm;
-
-fn should_quantize_module<M: Module<B>, const D: usize, F: Fn(&M) -> Tensor<B, D>>(
+fn should_quantize_module<M: Module, const D: usize, F: Fn(&M) -> Tensor<D>>(
     module: M,
     scheme: QuantScheme,
     func: F,
-    tolerance: Tolerance<FloatElem<B>>,
+    tolerance: Tolerance<f32>,
 ) {
     let result = func(&module);
 
     let calibration = Calibration::MinMax;
-    let mut quantizer = Quantizer {
-        calibration,
-        scheme,
-    };
+    let mut quantizer = Quantizer::new(calibration, scheme);
     let q_module = module.quantize_weights(&mut quantizer);
     let q_result = func(&q_module);
 
@@ -56,14 +30,16 @@ fn should_quantize_module<M: Module<B>, const D: usize, F: Fn(&M) -> Tensor<B, D
 
 #[test]
 fn should_quantize_transformer() {
-    let device: Device<B> = Default::default();
-    let transformer: TransformerEncoder<B> =
+    let device = Default::default();
+    let transformer: TransformerEncoder =
         TransformerEncoderConfig::new(128, 256, 2, 2).init(&device);
     let signal = Tensor::random([2, 32, 128], Distribution::Default, &device);
-    let scheme = <QuantizedTensor<B> as QTensorPrimitive>::default_scheme()
+    let scheme = device
+        .settings()
+        .quantization
+        .scheme
         .with_value(QuantValue::Q8S)
-        .with_level(QuantLevel::block([32]))
-        .with_param(QuantParam::F32);
+        .per_block([32], ScaleDtype::F32);
 
     should_quantize_module(
         transformer,
@@ -75,13 +51,14 @@ fn should_quantize_transformer() {
 
 #[test]
 fn should_quantize_linear_128_256() {
-    let device: Device<B> = Default::default();
-    let transformer: Linear<B> = LinearConfig::new(128, 256).with_bias(false).init(&device);
-    let signal = Tensor::<B, 2>::random([1, 128], Distribution::Default, &device);
-    let scheme = <QuantizedTensor<B> as QTensorPrimitive>::default_scheme()
-        .with_value(QuantValue::Q8S)
-        .with_level(QuantLevel::Tensor)
-        .with_param(QuantParam::F32);
+    let device = Default::default();
+    let transformer = LinearConfig::new(128, 256).with_bias(false).init(&device);
+    let signal = Tensor::<2>::random([1, 128], Distribution::Default, &device);
+    let scheme = device
+        .settings()
+        .quantization
+        .scheme
+        .with_value(QuantValue::Q8S);
 
     should_quantize_module(
         transformer,
@@ -93,16 +70,17 @@ fn should_quantize_linear_128_256() {
 
 #[test]
 fn should_quantize_linear() {
-    let device: Device<B> = Default::default();
-    let transformer: Linear<B> = LinearConfig::new(32, 32).with_bias(false).init(&device);
-    let signal = Tensor::<B, 2>::random([1, 32], Distribution::Default, &device);
+    let device = Default::default();
+    let transformer = LinearConfig::new(32, 32).with_bias(false).init(&device);
+    let signal = Tensor::<2>::random([1, 32], Distribution::Default, &device);
     // Default scheme should select supported QuantStore default
     // TODO: set native if dtype is supported by the test backend
-    let scheme = <QuantizedTensor<B> as QTensorPrimitive>::default_scheme()
-        .with_value(QuantValue::Q8S)
-        .with_level(QuantLevel::Tensor)
+    let scheme = device
+        .settings()
+        .quantization
+        .scheme
         // .with_store(QuantStore::Native)
-        .with_param(QuantParam::F32);
+        .with_value(QuantValue::Q8S);
 
     should_quantize_module(
         transformer,
@@ -114,12 +92,13 @@ fn should_quantize_linear() {
 
 #[test]
 fn should_quantize_linear_weights() {
-    let device: Device<B> = Default::default();
-    let transformer: Linear<B> = LinearConfig::new(32, 32).with_bias(false).init(&device);
-    let scheme = <QuantizedTensor<B> as QTensorPrimitive>::default_scheme()
-        .with_value(QuantValue::Q8S)
-        .with_level(QuantLevel::Tensor)
-        .with_param(QuantParam::F32);
+    let device = Default::default();
+    let transformer = LinearConfig::new(32, 32).with_bias(false).init(&device);
+    let scheme = device
+        .settings()
+        .quantization
+        .scheme
+        .with_value(QuantValue::Q8S);
 
     should_quantize_module(
         transformer,
@@ -131,14 +110,16 @@ fn should_quantize_linear_weights() {
 
 #[test]
 fn should_quantize_linear_blocks() {
-    let device: Device<B> = Default::default();
-    let transformer: Linear<B> = LinearConfig::new(32, 32).with_bias(false).init(&device);
-    let signal = Tensor::<B, 2>::random([1, 32], Distribution::Default, &device);
-    let scheme = <QuantizedTensor<B> as QTensorPrimitive>::default_scheme()
+    let device = Default::default();
+    let transformer = LinearConfig::new(32, 32).with_bias(false).init(&device);
+    let signal = Tensor::<2>::random([1, 32], Distribution::Default, &device);
+    let scheme = device
+        .settings()
+        .quantization
+        .scheme
         .with_value(QuantValue::Q8S)
-        .with_level(QuantLevel::block([16]))
         // .with_store(QuantStore::Native)
-        .with_param(QuantParam::F32);
+        .per_block([16], ScaleDtype::F32);
 
     should_quantize_module(
         transformer,
@@ -150,13 +131,15 @@ fn should_quantize_linear_blocks() {
 
 #[test]
 fn should_quantize_linear_weights_blocks() {
-    let device: Device<B> = Default::default();
-    let transformer: Linear<B> = LinearConfig::new(32, 32).with_bias(false).init(&device);
-    let scheme = <QuantizedTensor<B> as QTensorPrimitive>::default_scheme()
+    let device = Default::default();
+    let transformer = LinearConfig::new(32, 32).with_bias(false).init(&device);
+    let scheme = device
+        .settings()
+        .quantization
+        .scheme
         .with_value(QuantValue::Q8S)
-        .with_level(QuantLevel::block([16]))
         // .with_store(QuantStore::Native)
-        .with_param(QuantParam::F32);
+        .per_block([16], ScaleDtype::F32);
 
     should_quantize_module(
         transformer,

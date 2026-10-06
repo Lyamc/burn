@@ -6,14 +6,115 @@ use crate::graph::NodeId;
 use crate::ops::{Backward, Ops, unary};
 use crate::tensor::AutodiffTensor;
 
-use burn_backend::Backend;
+use burn_backend::TensorMetadata;
 use burn_backend::ops::attention::attention_fallback;
 use burn_backend::ops::*;
 use burn_backend::tensor::{FloatTensor, IntTensor};
+use burn_backend::{Backend, get_or_init_device_settings};
+use burn_std::IntDType;
 
 use super::OpsKind;
 
 impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B, C> {
+    fn batch_norm_train(
+        x: AutodiffTensor<B>,
+        gamma: AutodiffTensor<B>,
+        beta: AutodiffTensor<B>,
+        epsilon: f64,
+    ) -> BatchNormTrain<Self> {
+        #[derive(Debug)]
+        struct BatchNormTrainOps;
+
+        impl<B: Backend> Backward<B, 3> for BatchNormTrainOps {
+            // The input and gamma are checkpointed; the batch statistics come
+            // along as the forward computed them.
+            type State = (
+                NodeId,
+                NodeId,
+                B::FloatTensorPrimitive,
+                B::FloatTensorPrimitive,
+                f64,
+            );
+
+            fn backward(
+                self,
+                ops: Ops<Self::State, 3>,
+                grads: &mut Gradients,
+                checkpointer: &mut Checkpointer,
+            ) {
+                let [node_x, node_gamma, node_beta] = ops.parents;
+                let grad = grads.consume::<B>(&ops.node);
+                let (x_state, gamma_state, mean, variance, epsilon) = ops.state;
+                let x = checkpointer.retrieve_node_output::<B::FloatTensorPrimitive>(x_state);
+                let gamma =
+                    checkpointer.retrieve_node_output::<B::FloatTensorPrimitive>(gamma_state);
+
+                let backward =
+                    B::batch_norm_train_backward(x, gamma, mean, variance, epsilon, grad);
+
+                if let Some(node) = node_x {
+                    grads.register::<B>(node.id, backward.x_grad);
+                }
+                if let Some(node) = node_gamma {
+                    grads.register::<B>(node.id, backward.gamma_grad);
+                }
+                if let Some(node) = node_beta {
+                    grads.register::<B>(node.id, backward.beta_grad);
+                }
+            }
+        }
+
+        match BatchNormTrainOps
+            .prepare::<C>([x.node(), gamma.node(), beta.node()])
+            .compute_bound()
+            .stateful()
+        {
+            OpsKind::Tracked(mut prep) => {
+                let x_state = prep.checkpoint(&x);
+                let gamma_state = prep.checkpoint(&gamma);
+                let result =
+                    B::batch_norm_train(x.primitive, gamma.primitive, beta.primitive, epsilon);
+                let output = prep.finish(
+                    (
+                        x_state,
+                        gamma_state,
+                        result.mean.clone(),
+                        result.variance.clone(),
+                        epsilon,
+                    ),
+                    result.output,
+                );
+
+                BatchNormTrain::new(
+                    output,
+                    AutodiffTensor::new(result.mean),
+                    AutodiffTensor::new(result.variance),
+                )
+            }
+            OpsKind::UnTracked(prep) => {
+                let result =
+                    B::batch_norm_train(x.primitive, gamma.primitive, beta.primitive, epsilon);
+
+                BatchNormTrain::new(
+                    prep.finish(result.output),
+                    AutodiffTensor::new(result.mean),
+                    AutodiffTensor::new(result.variance),
+                )
+            }
+        }
+    }
+
+    fn batch_norm_train_backward(
+        _x: AutodiffTensor<B>,
+        _gamma: AutodiffTensor<B>,
+        _mean: AutodiffTensor<B>,
+        _variance: AutodiffTensor<B>,
+        _epsilon: f64,
+        _output_grad: AutodiffTensor<B>,
+    ) -> BatchNormTrainBackward<Self> {
+        panic!("Can't differentiate batch norm train backward.");
+    }
+
     fn embedding(weights: AutodiffTensor<B>, indices: IntTensor<B>) -> AutodiffTensor<B> {
         #[derive(Debug)]
         struct Embedding;
@@ -36,7 +137,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
         }
 
         match Embedding
-            .prepare::<C>([weights.node])
+            .prepare::<C>([weights.node()])
             .compute_bound()
             .stateful()
         {
@@ -133,7 +234,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
 
         match bias {
             Some(bias) => match LinearWithBias
-                .prepare::<C>([x.node.clone(), weight.node.clone(), bias.node.clone()])
+                .prepare::<C>([x.node(), weight.node(), bias.node()])
                 .compute_bound()
                 .stateful()
             {
@@ -153,7 +254,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
                 )),
             },
             None => match LinearNoBias
-                .prepare::<C>([x.node.clone(), weight.node.clone()])
+                .prepare::<C>([x.node(), weight.node()])
                 .compute_bound()
                 .stateful()
             {
@@ -273,7 +374,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
         }
         match bias {
             Some(bias) => match Conv1DWithBias
-                .prepare::<C>([x.node.clone(), weight.node.clone(), bias.node.clone()])
+                .prepare::<C>([x.node(), weight.node(), bias.node()])
                 .compute_bound()
                 .stateful()
             {
@@ -294,7 +395,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
                 )),
             },
             None => match Conv1DNoBias
-                .prepare::<C>([x.node.clone(), weight.node.clone()])
+                .prepare::<C>([x.node(), weight.node()])
                 .compute_bound()
                 .stateful()
             {
@@ -400,7 +501,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
 
         match bias {
             Some(bias) => match ConvTranspose1DWithBias
-                .prepare::<C>([x.node.clone(), weight.node.clone(), bias.node.clone()])
+                .prepare::<C>([x.node(), weight.node(), bias.node()])
                 .compute_bound()
                 .stateful()
             {
@@ -426,7 +527,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
                 )),
             },
             None => match ConvTranspose1DNoBias
-                .prepare::<C>([x.node.clone(), weight.node.clone()])
+                .prepare::<C>([x.node(), weight.node()])
                 .compute_bound()
                 .stateful()
             {
@@ -533,7 +634,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
 
         match bias {
             Some(bias) => match Conv2DWithBias
-                .prepare::<C>([x.node.clone(), weight.node.clone(), bias.node.clone()])
+                .prepare::<C>([x.node(), weight.node(), bias.node()])
                 .compute_bound()
                 .stateful()
             {
@@ -554,7 +655,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
                 )),
             },
             None => match Conv2DNoBias
-                .prepare::<C>([x.node.clone(), weight.node.clone()])
+                .prepare::<C>([x.node(), weight.node()])
                 .compute_bound()
                 .stateful()
             {
@@ -739,11 +840,11 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
         match (mask, bias) {
             (Some(mask), Some(bias)) => match DeformConv2DWithMaskWithBias
                 .prepare::<C>([
-                    x.node.clone(),
-                    offset.node.clone(),
-                    weight.node.clone(),
-                    mask.node.clone(),
-                    bias.node.clone(),
+                    x.node(),
+                    offset.node(),
+                    weight.node(),
+                    mask.node(),
+                    bias.node(),
                 ])
                 .compute_bound()
                 .stateful()
@@ -783,12 +884,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
                 )),
             },
             (Some(mask), None) => match DeformConv2DWithMaskNoBias
-                .prepare::<C>([
-                    x.node.clone(),
-                    offset.node.clone(),
-                    weight.node.clone(),
-                    mask.node.clone(),
-                ])
+                .prepare::<C>([x.node(), offset.node(), weight.node(), mask.node()])
                 .compute_bound()
                 .stateful()
             {
@@ -825,12 +921,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
                 )),
             },
             (None, Some(bias)) => match DeformConv2DNoMaskWithBias
-                .prepare::<C>([
-                    x.node.clone(),
-                    offset.node.clone(),
-                    weight.node.clone(),
-                    bias.node.clone(),
-                ])
+                .prepare::<C>([x.node(), offset.node(), weight.node(), bias.node()])
                 .compute_bound()
                 .stateful()
             {
@@ -867,7 +958,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
                 )),
             },
             (None, None) => match DeformConv2DNoMaskNoBias
-                .prepare::<C>([x.node.clone(), offset.node.clone(), weight.node.clone()])
+                .prepare::<C>([x.node(), offset.node(), weight.node()])
                 .compute_bound()
                 .stateful()
             {
@@ -998,7 +1089,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
 
         match bias {
             Some(bias) => match ConvTranspose2DWithBias
-                .prepare::<C>([x.node.clone(), weight.node.clone(), bias.node.clone()])
+                .prepare::<C>([x.node(), weight.node(), bias.node()])
                 .compute_bound()
                 .stateful()
             {
@@ -1025,7 +1116,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
                 )),
             },
             None => match ConvTranspose2DNoBias
-                .prepare::<C>([x.node.clone(), weight.node.clone()])
+                .prepare::<C>([x.node(), weight.node()])
                 .compute_bound()
                 .stateful()
             {
@@ -1133,7 +1224,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
 
         match bias {
             Some(bias) => match Conv3DWithBias
-                .prepare::<C>([x.node.clone(), weight.node.clone(), bias.node.clone()])
+                .prepare::<C>([x.node(), weight.node(), bias.node()])
                 .compute_bound()
                 .stateful()
             {
@@ -1154,7 +1245,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
                 )),
             },
             None => match Conv3DNoBias
-                .prepare::<C>([x.node.clone(), weight.node.clone()])
+                .prepare::<C>([x.node(), weight.node()])
                 .compute_bound()
                 .stateful()
             {
@@ -1261,7 +1352,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
 
         match bias {
             Some(bias) => match ConvTranspose3DWithBias
-                .prepare::<C>([x.node.clone(), weight.node.clone(), bias.node.clone()])
+                .prepare::<C>([x.node(), weight.node(), bias.node()])
                 .compute_bound()
                 .stateful()
             {
@@ -1288,7 +1379,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
                 )),
             },
             None => match ConvTranspose3DNoBias
-                .prepare::<C>([x.node.clone(), weight.node.clone()])
+                .prepare::<C>([x.node(), weight.node()])
                 .compute_bound()
                 .stateful()
             {
@@ -1368,7 +1459,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
         }
 
         match AvgPool1D
-            .prepare::<C>([x.node.clone()])
+            .prepare::<C>([x.node()])
             .compute_bound()
             .stateful()
         {
@@ -1446,7 +1537,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
         }
 
         match AvgPool2D
-            .prepare::<C>([x.node.clone()])
+            .prepare::<C>([x.node()])
             .compute_bound()
             .stateful()
         {
@@ -1503,12 +1594,13 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
         ceil_mode: bool,
     ) -> AutodiffTensor<B> {
         match MaxPool1D
-            .prepare::<C>([x.node.clone()])
+            .prepare::<C>([x.node()])
             .compute_bound()
             .stateful()
         {
             OpsKind::Tracked(mut prep) => {
                 let x_state = prep.checkpoint(&x);
+                let settings = get_or_init_device_settings::<B>(&x.primitive.device());
                 let output = B::max_pool1d_with_indices(
                     x.primitive,
                     kernel_size,
@@ -1516,6 +1608,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
                     padding,
                     dilation,
                     ceil_mode,
+                    settings.int_dtype,
                 );
                 prep.finish(
                     (
@@ -1548,9 +1641,10 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
         padding: usize,
         dilation: usize,
         ceil_mode: bool,
+        int_dtype: IntDType,
     ) -> MaxPool1dWithIndices<Self> {
         match MaxPool1D
-            .prepare::<C>([x.node.clone()])
+            .prepare::<C>([x.node()])
             .compute_bound()
             .stateful()
         {
@@ -1563,6 +1657,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
                     padding,
                     dilation,
                     ceil_mode,
+                    int_dtype,
                 );
 
                 let output_tensor = prep.finish(
@@ -1588,6 +1683,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
                     padding,
                     dilation,
                     ceil_mode,
+                    int_dtype,
                 );
                 let output_tensor = prep.finish(output.output);
 
@@ -1628,12 +1724,13 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
         ceil_mode: bool,
     ) -> AutodiffTensor<B> {
         match MaxPool2D
-            .prepare::<C>([x.node.clone()])
+            .prepare::<C>([x.node()])
             .compute_bound()
             .stateful()
         {
             OpsKind::Tracked(mut prep) => {
                 let x_state = prep.checkpoint(&x);
+                let settings = get_or_init_device_settings::<B>(&x.primitive.device());
                 let output = B::max_pool2d_with_indices(
                     x.primitive,
                     kernel_size,
@@ -1641,6 +1738,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
                     padding,
                     dilation,
                     ceil_mode,
+                    settings.int_dtype,
                 );
                 prep.finish(
                     (
@@ -1673,9 +1771,10 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
         padding: [usize; 2],
         dilation: [usize; 2],
         ceil_mode: bool,
+        int_dtype: IntDType,
     ) -> MaxPool2dWithIndices<Self> {
         match MaxPool2D
-            .prepare::<C>([x.node.clone()])
+            .prepare::<C>([x.node()])
             .compute_bound()
             .stateful()
         {
@@ -1689,6 +1788,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
                     padding,
                     dilation,
                     ceil_mode,
+                    int_dtype,
                 );
 
                 let output_tensor = prep.finish(
@@ -1714,6 +1814,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
                     padding,
                     dilation,
                     ceil_mode,
+                    int_dtype,
                 );
                 let output_tensor = prep.finish(output.output);
 
@@ -1759,7 +1860,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
         }
 
         match AdaptiveAvgPool1D
-            .prepare::<C>([x.node.clone()])
+            .prepare::<C>([x.node()])
             .compute_bound()
             .stateful()
         {
@@ -1798,7 +1899,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
         }
 
         match AdaptiveAvgPool2D
-            .prepare::<C>([x.node.clone()])
+            .prepare::<C>([x.node()])
             .compute_bound()
             .stateful()
         {
@@ -1817,6 +1918,52 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
         _grad: AutodiffTensor<B>,
     ) -> AutodiffTensor<B> {
         panic!("Can't differentiate adaptive avg pool2d backward.");
+    }
+
+    fn adaptive_avg_pool3d(x: AutodiffTensor<B>, output_size: [usize; 3]) -> AutodiffTensor<B> {
+        #[derive(Debug)]
+        struct AdaptiveAvgPool3D;
+
+        impl<B: Backend> Backward<B, 1> for AdaptiveAvgPool3D {
+            type State = NodeId;
+
+            fn backward(
+                self,
+                ops: Ops<Self::State, 1>,
+                grads: &mut Gradients,
+                checkpointer: &mut Checkpointer,
+            ) {
+                let [node_parent] = ops.parents;
+                let grad = grads.consume::<B>(&ops.node);
+                let state = checkpointer.retrieve_node_output(ops.state);
+
+                if let Some(node) = node_parent {
+                    let grad = B::adaptive_avg_pool3d_backward(state, grad);
+                    grads.register::<B>(node.id, grad);
+                }
+            }
+        }
+
+        match AdaptiveAvgPool3D
+            .prepare::<C>([x.node()])
+            .compute_bound()
+            .stateful()
+        {
+            OpsKind::Tracked(mut prep) => {
+                let x_state = prep.checkpoint(&x);
+                prep.finish(x_state, B::adaptive_avg_pool3d(x.primitive, output_size))
+            }
+            OpsKind::UnTracked(prep) => {
+                prep.finish(B::adaptive_avg_pool3d(x.primitive, output_size))
+            }
+        }
+    }
+
+    fn adaptive_avg_pool3d_backward(
+        _x: AutodiffTensor<B>,
+        _grad: AutodiffTensor<B>,
+    ) -> AutodiffTensor<B> {
+        panic!("Can't differentiate adaptive avg pool3d backward.");
     }
 
     fn interpolate(
@@ -1849,7 +1996,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
         }
 
         match Interpolate
-            .prepare::<C>([x.node.clone()])
+            .prepare::<C>([x.node()])
             .compute_bound()
             .stateful()
         {
@@ -1938,7 +2085,7 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
         }
 
         match CtcLoss
-            .prepare::<C>([log_probs.node.clone()])
+            .prepare::<C>([log_probs.node()])
             .compute_bound()
             .stateful()
         {
@@ -1970,23 +2117,6 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
                 blank,
             )),
         }
-    }
-
-    fn rfft(
-        _signal: FloatTensor<Autodiff<B, C>>,
-        _dim: usize,
-        _n: Option<usize>,
-    ) -> (FloatTensor<Autodiff<B, C>>, FloatTensor<Autodiff<B, C>>) {
-        todo!("rfft not yet supported for autodiff")
-    }
-
-    fn irfft(
-        _spectrum_re: FloatTensor<Autodiff<B, C>>,
-        _spectrum_im: FloatTensor<Autodiff<B, C>>,
-        _dim: usize,
-        _n: Option<usize>,
-    ) -> FloatTensor<Autodiff<B, C>> {
-        todo!("irfft not yet supported for autodiff")
     }
 }
 

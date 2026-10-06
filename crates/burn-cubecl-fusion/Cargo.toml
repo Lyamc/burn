@@ -7,7 +7,7 @@ edition.workspace = true
 keywords = ["deep-learning", "machine-learning", "gpu"]
 license.workspace = true
 name = "burn-cubecl-fusion"
-readme.workspace = true
+readme = "README.md"
 repository = "https://github.com/tracel-ai/burn/tree/main/crates/burn-cubecl-fusion"
 version.workspace = true
 
@@ -18,9 +18,10 @@ workspace = true
 default = ["autotune", "std", "cubecl/default", "burn-fusion/default"]
 
 autotune = []
-autotune-checks = ["cubecl/autotune-checks", "burn-backend", "half"]
+autotune-checks = ["cubecl/autotune-checks", "half"]
 doc = ["default"]
-std = ["cubecl/std", "burn-backend?/std", "burn-fusion/std"]
+test-util = []
+std = ["cubecl/std", "burn-backend/std", "burn-fusion/std"]
 tracing = [
     "cubecl/tracing",
     "burn-std/tracing",
@@ -31,24 +32,23 @@ tracing = [
 [dependencies]
 burn-fusion = { workspace = true }
 burn-ir = { workspace = true }
-burn-std = { workspace = true, features = [
-    "default",
-    "cubecl",
-] }
+burn-std = { workspace = true, features = ["default"] }
 cubecl = { workspace = true }
 cubek = { workspace = true, features = [
     "matmul",
+    "matmul-multi-level",
     "reduce",
     "quantization",
     "stdlib",
 ] }
 half = { workspace = true, optional = true }
 
-# Only for `TensorData` with autotune-checks
-burn-backend = { workspace = true, optional = true }
+# Needed for the cubecl dtype helpers (`burn_backend::cubecl::*`).
+burn-backend = { workspace = true, features = ["cubecl"] }
 
 derive-new = { workspace = true }
 hashbrown = { workspace = true }
+ciborium = { workspace = true }
 serde = { workspace = true }
 spin = { workspace = true }
 

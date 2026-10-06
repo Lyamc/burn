@@ -2,18 +2,21 @@ use std::net::SocketAddr;
 
 use crate::{
     base::{CommunicationChannel, CommunicationError, Message, ProtocolServer},
-    util::init_logging,
+    websocket::base::{DeadPeerTimeout, MAX_MESSAGE_SIZE},
 };
 use axum::{
     Router,
     extract::{
-        State, WebSocketUpgrade,
+        ConnectInfo, State, WebSocketUpgrade,
         ws::{self, WebSocket},
     },
     routing::get,
+    serve::ListenerExt,
 };
-use futures::StreamExt;
-
+use futures::{
+    SinkExt, StreamExt,
+    stream::{SplitSink, SplitStream},
+};
 #[derive(Clone, Debug)]
 pub struct WsServer {
     port: u16,
@@ -22,6 +25,7 @@ pub struct WsServer {
 
 pub struct WsServerChannel {
     inner: WebSocket,
+    peer_addr: SocketAddr,
 }
 
 impl WsServer {
@@ -30,6 +34,40 @@ impl WsServer {
             port,
             router: Router::new(),
         }
+    }
+
+    /// Serve on an already-bound listener instead of binding `0.0.0.0:port` ourselves.
+    ///
+    /// This is what [`serve`](ProtocolServer::serve) delegates to; it is exposed so a caller
+    /// that needs the actual bound address — e.g. a test binding an ephemeral `:0` port and
+    /// reading the port back from `listener.local_addr()` — can do so without a fixed port.
+    pub async fn serve_on<F>(
+        self,
+        listener: tokio::net::TcpListener,
+        shutdown: F,
+    ) -> Result<(), WsServerError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        // Report the address the listener actually bound to (resolves an ephemeral `:0` port to
+        // the real one), so the log confirms the server is accepting connections and tells the
+        // operator where.
+        match listener.local_addr() {
+            Ok(addr) => log::info!("Server started, listening on {addr}"),
+            Err(err) => log::info!("Server started (could not resolve bound address: {err})"),
+        }
+
+        let listener = listener.tap_io(|tcp| tcp.set_dead_peer_timeout());
+
+        axum::serve(
+            listener,
+            self.router
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown)
+        .await?;
+
+        Ok(())
     }
 }
 
@@ -41,22 +79,12 @@ impl ProtocolServer for WsServer {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        init_logging();
-
         let address = format!("0.0.0.0:{}", self.port);
         log::info!("Starting server {address}");
 
         let listener = tokio::net::TcpListener::bind(address).await?;
 
-        axum::serve(
-            listener,
-            self.router
-                .into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(shutdown)
-        .await?;
-
-        Ok(())
+        self.serve_on(listener, shutdown).await
     }
 
     fn route<C, Fut>(mut self, path: &str, callback: C) -> Self
@@ -71,11 +99,22 @@ impl ProtocolServer for WsServer {
             format!("/{path}")
         };
 
-        let method = get(|ws: WebSocketUpgrade, _: State<()>| async {
-            ws.on_upgrade(async move |socket| {
-                callback(WsServerChannel { inner: socket }).await;
-            })
-        });
+        let method = get(
+            |ws: WebSocketUpgrade,
+             ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+             _: State<()>| async move {
+                // Left unset, axum reads with tungstenite's defaults: 16 MiB a frame, 64 MiB a message.
+                ws.max_message_size(MAX_MESSAGE_SIZE)
+                    .max_frame_size(MAX_MESSAGE_SIZE)
+                    .on_upgrade(async move |socket| {
+                        callback(WsServerChannel {
+                            inner: socket,
+                            peer_addr,
+                        })
+                        .await;
+                    })
+            },
+        );
 
         self.router = self.router.route(&path, method);
 
@@ -93,14 +132,26 @@ impl CommunicationChannel for WsServerChannel {
     }
 
     async fn recv(&mut self) -> Result<Option<Message>, WsServerError> {
-        match self.inner.next().await {
-            Some(next) => match next {
-                Ok(ws::Message::Binary(data)) => Ok(Some(Message { data })),
-                Ok(ws::Message::Close(_close_frame)) => Ok(None),
-                Err(err) => Err(WsServerError::Axum(err)),
-                msg => Err(WsServerError::UnknownMessage(format!("{msg:?}"))),
-            },
-            None => todo!(),
+        // Keep reading until we get a data frame, a close, an error, or the stream ends.
+        // Ping/Pong (keepalives) and Text frames must be skipped, not turned into errors: a
+        // single keepalive ping would otherwise look like a fatal error to the consuming loop
+        // and kill an otherwise-healthy connection. tungstenite already answers pings with
+        // pongs at the protocol layer, so ignoring them here is safe.
+        loop {
+            match self.inner.next().await {
+                Some(Ok(ws::Message::Binary(data))) => return Ok(Some(Message { data })),
+                // A close frame is an orderly end-of-stream.
+                Some(Ok(ws::Message::Close(_close_frame))) => return Ok(None),
+                // Control/text frames carry no protocol payload: skip and keep reading.
+                Some(Ok(ws::Message::Ping(_) | ws::Message::Pong(_) | ws::Message::Text(_))) => {
+                    continue;
+                }
+                Some(Err(err)) => return Err(WsServerError::Axum(err)),
+                // The stream is exhausted: the peer went away without a close frame (closed
+                // tab, network drop, killed client). This is a common disconnect path, not an
+                // error — treat it as a clean end-of-stream rather than panicking.
+                None => return Ok(None),
+            }
         }
     }
 
@@ -115,6 +166,68 @@ impl CommunicationChannel for WsServerChannel {
             .await?;
 
         Ok(())
+    }
+}
+
+impl WsServerChannel {
+    /// The address the client connected from.
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
+    }
+
+    /// Split into independently-owned send and receive halves, so a writer task and a reader loop
+    /// can run concurrently over one full-duplex socket.
+    pub fn split(self) -> (WsServerSink, WsServerStream) {
+        let (sink, stream) = self.inner.split();
+        (
+            WsServerSink { inner: sink },
+            WsServerStream { inner: stream },
+        )
+    }
+}
+
+/// Send half of a split [`WsServerChannel`].
+pub struct WsServerSink {
+    inner: SplitSink<WebSocket, ws::Message>,
+}
+
+impl WsServerSink {
+    pub async fn send(&mut self, message: Message) -> Result<(), WsServerError> {
+        self.inner.send(ws::Message::Binary(message.data)).await?;
+        Ok(())
+    }
+
+    pub async fn close(&mut self) -> Result<(), WsServerError> {
+        self.inner
+            .send(ws::Message::Close(Some(ws::CloseFrame {
+                code: 1000, // Normal
+                reason: "Peer is closing".to_string().into(),
+            })))
+            .await?;
+        Ok(())
+    }
+}
+
+/// Receive half of a split [`WsServerChannel`].
+pub struct WsServerStream {
+    inner: SplitStream<WebSocket>,
+}
+
+impl WsServerStream {
+    /// Mirrors [`WsServerChannel::recv`]: surface binary frames, skip keepalive/text frames, and
+    /// treat a close frame or an exhausted stream as a clean end-of-stream.
+    pub async fn recv(&mut self) -> Result<Option<Message>, WsServerError> {
+        loop {
+            match self.inner.next().await {
+                Some(Ok(ws::Message::Binary(data))) => return Ok(Some(Message { data })),
+                Some(Ok(ws::Message::Close(_close_frame))) => return Ok(None),
+                Some(Ok(ws::Message::Ping(_) | ws::Message::Pong(_) | ws::Message::Text(_))) => {
+                    continue;
+                }
+                Some(Err(err)) => return Err(WsServerError::Axum(err)),
+                None => return Ok(None),
+            }
+        }
     }
 }
 
@@ -139,3 +252,16 @@ impl From<axum::Error> for WsServerError {
         Self::Axum(err)
     }
 }
+
+impl core::fmt::Display for WsServerError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "io error: {err}"),
+            Self::Axum(err) => write!(f, "websocket error: {err}"),
+            Self::UnknownMessage(msg) => write!(f, "unknown message: {msg}"),
+            Self::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for WsServerError {}

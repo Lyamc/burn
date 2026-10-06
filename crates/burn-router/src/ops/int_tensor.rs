@@ -2,21 +2,41 @@ use alloc::vec::Vec;
 use burn_backend::backend::ExecutionError;
 use burn_std::{BoolDType, FloatDType};
 
-use crate::{BackendRouter, RunnerChannel, RunnerClient, get_client};
-use burn_backend::tensor::{BoolTensor, Device, FloatTensor, IndexingUpdateOp, IntElem, IntTensor};
+use crate::{BackendRouter, RouterChannel, RouterClient, get_client};
+use burn_backend::tensor::{BoolTensor, Device, FloatTensor, IndexingUpdateOp, IntTensor};
 use burn_backend::{
-    Distribution, Element, IntDType, Scalar, Shape, Slice, TensorData, ops::IntTensorOps,
+    Distribution, IntDType, Scalar, Shape, Slice, TensorData,
+    ops::{IntTensorOps, PadMode},
 };
 use burn_ir::{
     BaseOperationIr, BinaryOpIr, CastOpIr, CatOpIr, ClampOpIr, CreationOpIr, DimOpIr, FlipOpIr,
-    GatherNdOpIr, GatherOpIr, InitOperationIr, IntOperationIr, MaskFillOpIr, MaskWhereOpIr,
-    MatmulOpIr, NumericOperationIr, OperationIr, OperationOutput, PermuteOpIr, RandomOpIr,
-    ReduceDimOpIr, ReduceDimWithIndicesOpIr, ReduceOpIr, RepeatDimOpIr, ScalarOpIr, ScatterNdOpIr,
-    ScatterOpIr, SelectAssignOpIr, SelectOpIr, ShapeOpIr, SliceAssignOpIr, SliceOpIr, SwapDimsOpIr,
+    FullOpIr, GatherNdOpIr, GatherOpIr, InitOperationIr, IntOperationIr, MaskFillOpIr,
+    MaskWhereOpIr, MatmulOpIr, NumericOperationIr, OperationIr, OperationOutput, PadOpIr,
+    PermuteOpIr, RandomOpIr, ReduceDimOpIr, ReduceDimWithIndicesOpIr, ReduceOpIr, RepeatDimOpIr,
+    ScalarOpIr, ScatterNdOpIr, ScatterOpIr, SelectAssignOpIr, SelectOpIr, ShapeOpIr,
+    SliceAssignOpIr, SliceOpIr, SortOpIr, SortWithIndicesOpIr, SwapDimsOpIr, TopKWithIndicesOpIr,
     UnaryOpIr, UnfoldOpIr,
 };
 
-impl<R: RunnerChannel> IntTensorOps<Self> for BackendRouter<R> {
+impl<R: RouterChannel> IntTensorOps<Self> for BackendRouter<R> {
+    fn int_pad(
+        tensor: IntTensor<Self>,
+        padding: &[(usize, usize)],
+        mode: PadMode,
+    ) -> IntTensor<Self> {
+        let client = tensor.client.clone();
+        let desc = PadOpIr::create(tensor.into_ir(), padding.into(), mode.into(), || {
+            client.create_empty_handle()
+        });
+
+        client
+            .register(OperationIr::NumericInt(
+                desc.out.dtype,
+                NumericOperationIr::Pad(desc),
+            ))
+            .output()
+    }
+
     fn int_empty(shape: Shape, device: &Device<Self>, dtype: IntDType) -> IntTensor<Self> {
         let client = get_client::<R>(device);
         let desc = CreationOpIr::create(shape, dtype.into(), || client.create_empty_handle());
@@ -27,11 +47,7 @@ impl<R: RunnerChannel> IntTensorOps<Self> for BackendRouter<R> {
     }
 
     async fn int_into_data(tensor: IntTensor<Self>) -> Result<TensorData, ExecutionError> {
-        Ok(tensor
-            .into_data()
-            .await?
-            // Since underlying backends can have different data types, we convert to the current elem
-            .convert::<IntElem<Self>>())
+        tensor.into_data().await
     }
 
     fn int_from_data(data: TensorData, device: &Device<Self>) -> IntTensor<Self> {
@@ -45,10 +61,6 @@ impl<R: RunnerChannel> IntTensorOps<Self> for BackendRouter<R> {
         client.register_op(OperationIr::Init(desc));
 
         out
-    }
-
-    fn int_device(tensor: &IntTensor<Self>) -> Device<Self> {
-        tensor.client.device()
     }
 
     fn int_to_device(tensor: IntTensor<Self>, device: &Device<Self>) -> IntTensor<Self> {
@@ -151,11 +163,12 @@ impl<R: RunnerChannel> IntTensorOps<Self> for BackendRouter<R> {
             .output()
     }
 
-    fn int_scatter_add(
+    fn int_scatter(
         dim: usize,
         tensor: IntTensor<Self>,
         indices: IntTensor<Self>,
         value: IntTensor<Self>,
+        update: IndexingUpdateOp,
     ) -> IntTensor<Self> {
         let client = tensor.client.clone();
         let desc = ScatterOpIr::create(
@@ -163,7 +176,7 @@ impl<R: RunnerChannel> IntTensorOps<Self> for BackendRouter<R> {
             dim,
             indices.into_ir(),
             value.into_ir(),
-            IndexingUpdateOp::Add,
+            update,
             || client.create_empty_handle(),
         );
 
@@ -218,11 +231,12 @@ impl<R: RunnerChannel> IntTensorOps<Self> for BackendRouter<R> {
             .output()
     }
 
-    fn int_select_add(
+    fn int_select_assign(
         tensor: IntTensor<Self>,
         dim: usize,
         indices: IntTensor<Self>,
         value: IntTensor<Self>,
+        update: IndexingUpdateOp,
     ) -> IntTensor<Self> {
         let client = tensor.client.clone();
         let desc = SelectAssignOpIr::create(
@@ -230,7 +244,7 @@ impl<R: RunnerChannel> IntTensorOps<Self> for BackendRouter<R> {
             dim,
             indices.into_ir(),
             value.into_ir(),
-            IndexingUpdateOp::Add,
+            update,
             || client.create_empty_handle(),
         );
 
@@ -578,6 +592,25 @@ impl<R: RunnerChannel> IntTensorOps<Self> for BackendRouter<R> {
             .output()
     }
 
+    fn int_full(
+        shape: Shape,
+        fill_value: Scalar,
+        device: &Device<Self>,
+        dtype: IntDType,
+    ) -> IntTensor<Self> {
+        let client = get_client::<R>(device);
+        let dtype = dtype.into();
+        let value = fill_value.into();
+        let desc = FullOpIr::create(shape, dtype, value, || client.create_empty_handle());
+
+        client
+            .register(OperationIr::NumericInt(
+                desc.out.dtype,
+                NumericOperationIr::Full(desc),
+            ))
+            .output()
+    }
+
     fn int_sum(tensor: IntTensor<Self>) -> IntTensor<Self> {
         let client = tensor.client.clone();
         let desc = ReduceOpIr::create(tensor.into_ir(), || client.create_empty_handle());
@@ -819,17 +852,37 @@ impl<R: RunnerChannel> IntTensorOps<Self> for BackendRouter<R> {
             .output()
     }
 
+    fn int_topk_with_indices(
+        tensor: IntTensor<Self>,
+        dim: usize,
+        k: usize,
+    ) -> (IntTensor<Self>, IntTensor<Self>) {
+        // Forwarded explicitly rather than left to the trait default: the default would run
+        // its own sort here and never reach the backend's fused top-k.
+        let dtype = tensor.dtype;
+        let client = tensor.client.clone();
+        let desc = TopKWithIndicesOpIr::create(tensor.into_ir(), dim, k, dtype, || {
+            client.create_empty_handle()
+        });
+
+        client
+            .register(OperationIr::NumericInt(
+                desc.tensor.dtype,
+                NumericOperationIr::TopKWithIndices(desc),
+            ))
+            .outputs()
+            .into()
+    }
+
     fn int_max_dim_with_indices(
         tensor: IntTensor<Self>,
         dim: usize,
     ) -> (IntTensor<Self>, IntTensor<Self>) {
+        let dtype = tensor.dtype;
         let client = tensor.client.clone();
-        let desc = ReduceDimWithIndicesOpIr::create(
-            tensor.into_ir(),
-            dim,
-            IntElem::<Self>::dtype(),
-            || client.create_empty_handle(),
-        );
+        let desc = ReduceDimWithIndicesOpIr::create(tensor.into_ir(), dim, dtype, || {
+            client.create_empty_handle()
+        });
 
         client
             .register(OperationIr::NumericInt(
@@ -892,13 +945,11 @@ impl<R: RunnerChannel> IntTensorOps<Self> for BackendRouter<R> {
         tensor: IntTensor<Self>,
         dim: usize,
     ) -> (IntTensor<Self>, IntTensor<Self>) {
+        let dtype = tensor.dtype;
         let client = tensor.client.clone();
-        let desc = ReduceDimWithIndicesOpIr::create(
-            tensor.into_ir(),
-            dim,
-            IntElem::<Self>::dtype(),
-            || client.create_empty_handle(),
-        );
+        let desc = ReduceDimWithIndicesOpIr::create(tensor.into_ir(), dim, dtype, || {
+            client.create_empty_handle()
+        });
 
         client
             .register(OperationIr::NumericInt(
@@ -1124,6 +1175,170 @@ impl<R: RunnerChannel> IntTensorOps<Self> for BackendRouter<R> {
             .register(OperationIr::NumericInt(
                 desc.out.dtype,
                 NumericOperationIr::Powi(desc),
+            ))
+            .output()
+    }
+
+    fn int_neg(tensor: IntTensor<Self>) -> IntTensor<Self> {
+        let client = tensor.client.clone();
+        let desc = UnaryOpIr::create(tensor.into_ir(), || client.create_empty_handle());
+        client
+            .register(OperationIr::NumericInt(
+                desc.out.dtype,
+                NumericOperationIr::Neg(desc),
+            ))
+            .output()
+    }
+
+    fn int_sign(tensor: IntTensor<Self>) -> IntTensor<Self> {
+        let client = tensor.client.clone();
+        let desc = UnaryOpIr::create(tensor.into_ir(), || client.create_empty_handle());
+        client
+            .register(OperationIr::NumericInt(
+                desc.out.dtype,
+                NumericOperationIr::Sign(desc),
+            ))
+            .output()
+    }
+
+    fn int_clamp_min(tensor: IntTensor<Self>, min: Scalar) -> IntTensor<Self> {
+        let client = tensor.client.clone();
+        let desc = ScalarOpIr::create(tensor.into_ir(), min.into(), || {
+            client.create_empty_handle()
+        });
+        client
+            .register(OperationIr::NumericInt(
+                desc.out.dtype,
+                NumericOperationIr::ClampMin(desc),
+            ))
+            .output()
+    }
+
+    fn int_clamp_max(tensor: IntTensor<Self>, max: Scalar) -> IntTensor<Self> {
+        let client = tensor.client.clone();
+        let desc = ScalarOpIr::create(tensor.into_ir(), max.into(), || {
+            client.create_empty_handle()
+        });
+        client
+            .register(OperationIr::NumericInt(
+                desc.out.dtype,
+                NumericOperationIr::ClampMax(desc),
+            ))
+            .output()
+    }
+
+    fn int_not_equal(
+        lhs: IntTensor<Self>,
+        rhs: IntTensor<Self>,
+        out_dtype: BoolDType,
+    ) -> BoolTensor<Self> {
+        let client = lhs.client.clone();
+        let desc =
+            BinaryOpIr::create_comparison(lhs.into_ir(), rhs.into_ir(), out_dtype.into(), || {
+                client.create_empty_handle()
+            });
+        client
+            .register(OperationIr::BaseInt(BaseOperationIr::NotEqual(desc)))
+            .output()
+    }
+
+    fn int_not_equal_elem(
+        lhs: IntTensor<Self>,
+        rhs: Scalar,
+        out_dtype: BoolDType,
+    ) -> BoolTensor<Self> {
+        let client = lhs.client.clone();
+        let desc =
+            ScalarOpIr::create_comparison(lhs.into_ir(), rhs.into(), out_dtype.into(), || {
+                client.create_empty_handle()
+            });
+        client
+            .register(OperationIr::BaseInt(BaseOperationIr::NotEqualElem(desc)))
+            .output()
+    }
+
+    fn int_all(tensor: IntTensor<Self>, out_dtype: BoolDType) -> BoolTensor<Self> {
+        let client = tensor.client.clone();
+        let desc = ReduceOpIr::create_bool(tensor.into_ir(), out_dtype.into(), || {
+            client.create_empty_handle()
+        });
+        client
+            .register(OperationIr::BaseInt(BaseOperationIr::All(desc)))
+            .output()
+    }
+
+    fn int_any(tensor: IntTensor<Self>, out_dtype: BoolDType) -> BoolTensor<Self> {
+        let client = tensor.client.clone();
+        let desc = ReduceOpIr::create_bool(tensor.into_ir(), out_dtype.into(), || {
+            client.create_empty_handle()
+        });
+        client
+            .register(OperationIr::BaseInt(BaseOperationIr::Any(desc)))
+            .output()
+    }
+
+    fn int_all_dim(tensor: IntTensor<Self>, dim: usize, out_dtype: BoolDType) -> BoolTensor<Self> {
+        let client = tensor.client.clone();
+        let desc = ReduceDimOpIr::create_bool(tensor.into_ir(), dim, 1, out_dtype.into(), || {
+            client.create_empty_handle()
+        });
+        client
+            .register(OperationIr::BaseInt(BaseOperationIr::AllDim(desc)))
+            .output()
+    }
+
+    fn int_any_dim(tensor: IntTensor<Self>, dim: usize, out_dtype: BoolDType) -> BoolTensor<Self> {
+        let client = tensor.client.clone();
+        let desc = ReduceDimOpIr::create_bool(tensor.into_ir(), dim, 1, out_dtype.into(), || {
+            client.create_empty_handle()
+        });
+        client
+            .register(OperationIr::BaseInt(BaseOperationIr::AnyDim(desc)))
+            .output()
+    }
+
+    fn int_sort(tensor: IntTensor<Self>, dim: usize, descending: bool) -> IntTensor<Self> {
+        let client = tensor.client.clone();
+        let desc = SortOpIr::create(tensor.into_ir(), dim, descending, || {
+            client.create_empty_handle()
+        });
+        client
+            .register(OperationIr::NumericInt(
+                desc.out.dtype,
+                NumericOperationIr::Sort(desc),
+            ))
+            .output()
+    }
+
+    fn int_sort_with_indices(
+        tensor: IntTensor<Self>,
+        dim: usize,
+        descending: bool,
+    ) -> (IntTensor<Self>, IntTensor<Self>) {
+        let client = tensor.client.clone();
+        let dtype = tensor.dtype;
+        let desc = SortWithIndicesOpIr::create(tensor.into_ir(), dim, descending, dtype, || {
+            client.create_empty_handle()
+        });
+        client
+            .register(OperationIr::NumericInt(
+                desc.out.dtype,
+                NumericOperationIr::SortWithIndices(desc),
+            ))
+            .outputs()
+            .into()
+    }
+
+    fn int_argsort(tensor: IntTensor<Self>, dim: usize, descending: bool) -> IntTensor<Self> {
+        let client = tensor.client.clone();
+        let dtype = tensor.dtype;
+        let desc = SortOpIr::create_arg(tensor.into_ir(), dim, descending, dtype, || {
+            client.create_empty_handle()
+        });
+        client
+            .register(OperationIr::NumericInt(
+                dtype,
+                NumericOperationIr::ArgSort(desc),
             ))
             .output()
     }

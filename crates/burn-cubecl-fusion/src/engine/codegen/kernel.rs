@@ -3,10 +3,12 @@ use crate::engine::codegen::{DynElem, DynSize};
 use super::{io::*, ir::*};
 use burn_std::quantization::{QuantScheme, QuantStore, QuantValue};
 use cubecl::{
-    ir::{ElemType, FloatKind, StorageType, UIntKind},
+    ir::{ElemType, FloatKind, UIntKind},
     prelude::*,
 };
-use cubek::quantization::{dequantize::dequantize_symmetric_packed_value_at, scheme::QuantMode};
+use cubek::quantization::{
+    dequantize::dequantize_symmetric_packed_value_at, scale::Scales, scheme::QuantMode,
+};
 
 #[cube]
 /// Fuse element-wise operations at the given write position.
@@ -78,13 +80,23 @@ pub fn fuse_on_read<E: Scalar, N: Size>(
     #[unroll]
     for i in 0..read_args.len() {
         let arg = comptime![read_args.index(i).clone()];
-        let value = read::<E, N>(inputs, outputs, locals, read_pos, arg, config);
+        let value = read::<E, N>(inputs, &*outputs, &*locals, read_pos, arg, config);
 
         output.push(value);
     }
 
     comment!("Fuse on read end");
     output
+}
+
+#[cube]
+/// Canonicalizes the harmless zero stride produced by metadata-only broadcasts.
+///
+/// A singleton dimension always has coordinate zero, but reference strides are
+/// used as divisors throughout fused indexing and therefore must be nonzero. Keep
+/// every other physical stride unchanged.
+fn normalize_reference_stride(shape: usize, stride: usize) -> usize {
+    select(shape == 1, stride.max(1usize), stride)
 }
 
 #[cube]
@@ -110,13 +122,16 @@ pub fn init_locals(
 
                 #[unroll]
                 for i in 0..config.rank {
-                    ref_shape[i] = layout.tensor.shape(i);
-                    ref_strides[i] = layout.tensor.stride(i);
+                    let shape = layout.tensor.shape(i);
+                    let stride = layout.tensor.stride(i);
+
+                    ref_shape[i] = shape;
+                    ref_strides[i] = normalize_reference_stride(shape, stride);
                 }
 
                 LocalArgs::new(
-                    ref_shape.to_slice(),
-                    ref_strides.to_slice(),
+                    ref_shape.as_slice(),
+                    ref_strides.as_slice(),
                     layout.tensor.vector_size(),
                 )
             }
@@ -125,13 +140,16 @@ pub fn init_locals(
 
                 #[unroll]
                 for i in 0..config.rank {
-                    ref_shape[i] = layout.tensor.shape(i);
-                    ref_strides[i] = layout.tensor.stride(i);
+                    let shape = layout.tensor.shape(i);
+                    let stride = layout.tensor.stride(i);
+
+                    ref_shape[i] = shape;
+                    ref_strides[i] = normalize_reference_stride(shape, stride);
                 }
 
                 LocalArgs::new(
-                    ref_shape.to_slice(),
-                    ref_strides.to_slice(),
+                    ref_shape.as_slice(),
+                    ref_strides.as_slice(),
                     layout.tensor.vector_size(),
                 )
             }
@@ -161,8 +179,8 @@ pub fn init_locals(
                 }
 
                 LocalArgs::new(
-                    ref_shape.to_slice(),
-                    ref_strides.to_slice(),
+                    ref_shape.as_slice(),
+                    ref_strides.as_slice(),
                     layout.tensor.vector_size(),
                 )
             }
@@ -186,7 +204,7 @@ pub fn init_locals(
                     stride_curr *= ref_shape[comptime![reverse]];
                 }
 
-                LocalArgs::new(ref_shape.to_slice(), ref_strides.to_slice(), vector_size)
+                LocalArgs::new(ref_shape.as_slice(), ref_strides.as_slice(), vector_size)
             }
             VirtualLayout::Runtime { pos } => {
                 let start_shape = (pos * 2) * config.rank;
@@ -196,12 +214,14 @@ pub fn init_locals(
                 for i in 0..config.rank {
                     let shape_index = start_shape + i;
                     let strides_index = start_strides + i;
+                    let shape = *inputs.runtime_layouts.index(shape_index);
+                    let stride = *inputs.runtime_layouts.index(strides_index);
 
-                    ref_shape[i] = *inputs.runtime_layouts.index(shape_index);
-                    ref_strides[i] = *inputs.runtime_layouts.index(strides_index);
+                    ref_shape[i] = shape;
+                    ref_strides[i] = normalize_reference_stride(shape, stride);
                 }
 
-                LocalArgs::new(ref_shape.to_slice(), ref_strides.to_slice(), config.width)
+                LocalArgs::new(ref_shape.as_slice(), ref_strides.as_slice(), config.width)
             }
             VirtualLayout::Shape(original, vector_size) => {
                 let layout = match original.clone() {
@@ -223,7 +243,7 @@ pub fn init_locals(
                     stride_curr *= ref_shape[comptime![reverse]];
                 }
 
-                LocalArgs::new(ref_shape.to_slice(), ref_strides.to_slice(), vector_size)
+                LocalArgs::new(ref_shape.as_slice(), ref_strides.as_slice(), vector_size)
             }
         },
     };
@@ -270,6 +290,16 @@ fn fuse(
             }
             FuseOp::Lower(op) => lower::<E, N>(inputs, outputs, locals, pos, op, config),
             FuseOp::LowerEqual(op) => lower_equal::<E, N>(inputs, outputs, locals, pos, op, config),
+            FuseOp::BitwiseAnd(op) => bitwise_and::<E, N>(inputs, outputs, locals, pos, op, config),
+            FuseOp::BitwiseOr(op) => bitwise_or::<E, N>(inputs, outputs, locals, pos, op, config),
+            FuseOp::BitwiseXor(op) => bitwise_xor::<E, N>(inputs, outputs, locals, pos, op, config),
+            FuseOp::BitwiseLeftShift(op) => {
+                bitwise_left_shift::<E, N>(inputs, outputs, locals, pos, op, config)
+            }
+            FuseOp::BitwiseRightShift(op) => {
+                bitwise_right_shift::<E, N>(inputs, outputs, locals, pos, op, config)
+            }
+            FuseOp::BitwiseNot(op) => bitwise_not::<E, N>(inputs, outputs, locals, pos, op, config),
             FuseOp::ConditionalAssign {
                 cond,
                 lhs,
@@ -294,6 +324,11 @@ fn fuse(
             } => select_indices::<E, N>(
                 inputs, outputs, locals, pos, dim, input, indices, output, config,
             ),
+            FuseOp::Cat {
+                inputs: tensors,
+                output,
+                dim,
+            } => concat::<E, N>(inputs, outputs, locals, pos, dim, tensors, output, config),
             FuseOp::Dequantize {
                 values,
                 params,
@@ -332,9 +367,48 @@ macro_rules! binary_op {
             #[comptime] op: BinaryFuseArgs,
             #[comptime] config: &FuseBlockConfig,
         ) {
-            let lhs = read::<C, N>(inputs, outputs, &locals, write_pos, op.lhs, config);
-            let rhs = read::<C, N>(inputs, outputs, &locals, write_pos, op.rhs, config);
+            let lhs = read::<C, N>(inputs, &*outputs, &*locals, write_pos, op.lhs, config);
+            let rhs = read::<C, N>(inputs, &*outputs, &*locals, write_pos, op.rhs, config);
             let result = lhs $op rhs;
+
+            write::<C, N>(inputs, outputs, locals, write_pos, result, op.out, config);
+        }
+    };
+}
+
+macro_rules! binary_int_op {
+    ($ident:ident, $op:tt) => {
+        #[cube]
+        fn $ident<C: Int, N: Size>(
+            inputs: &GlobalArgs,
+            outputs: &mut GlobalArgs,
+            locals: &mut LocalArgs,
+            write_pos: usize,
+            #[comptime] op: BinaryFuseArgs,
+            #[comptime] config: &FuseBlockConfig,
+        ) {
+            let lhs = read::<C, N>(inputs, &*outputs, &*locals, write_pos, op.lhs, config);
+            let rhs = read::<C, N>(inputs, &*outputs, &*locals, write_pos, op.rhs, config);
+            let result = lhs $op rhs;
+
+            write::<C, N>(inputs, outputs, locals, write_pos, result, op.out, config);
+        }
+    };
+}
+
+macro_rules! unary_int_op {
+    ($ident:ident, $op:tt) => {
+        #[cube]
+        fn $ident<C: Int, N: Size>(
+            inputs: &GlobalArgs,
+            outputs: &mut GlobalArgs,
+            locals: &mut LocalArgs,
+            write_pos: usize,
+            #[comptime] op: UnaryFuseArgs,
+            #[comptime] config: &FuseBlockConfig,
+        ) {
+            let input = read::<C, N>(inputs, &*outputs, &*locals, write_pos, op.input, config);
+            let result = $op input;
 
             write::<C, N>(inputs, outputs, locals, write_pos, result, op.out, config);
         }
@@ -352,8 +426,8 @@ macro_rules! binary_func {
             #[comptime] op: BinaryFuseArgs,
             #[comptime] config: &FuseBlockConfig,
         ) {
-            let lhs = read::<C, N>(inputs, outputs, &locals, write_pos, op.lhs, config);
-            let rhs = read::<C, N>(inputs, outputs, &locals, write_pos, op.rhs, config);
+            let lhs = read::<C, N>(inputs, &*outputs, &*locals, write_pos, op.lhs, config);
+            let rhs = read::<C, N>(inputs, &*outputs, &*locals, write_pos, op.rhs, config);
             let result = $func(lhs, rhs);
 
             write::<C, N>(inputs, outputs, locals, write_pos, result, op.out, config);
@@ -362,9 +436,9 @@ macro_rules! binary_func {
 }
 
 macro_rules! comparison_op {
-    ($ident:ident, $op:tt) => {
+    ($ident:ident, $func:expr) => {
         #[cube]
-        fn $ident<C: Scalar + core::cmp::PartialOrd, N: Size>(
+        fn $ident<C: Scalar + ScalarPartialOrd, N: Size>(
             inputs: &GlobalArgs,
             outputs: &mut GlobalArgs,
             locals: &mut LocalArgs,
@@ -372,9 +446,9 @@ macro_rules! comparison_op {
             #[comptime] op: BinaryFuseArgs,
             #[comptime] config: &FuseBlockConfig,
         ) {
-            let lhs = read::<C, N>(inputs, outputs, &locals, write_pos, op.lhs, config);
-            let rhs = read::<C, N>(inputs, outputs, &locals, write_pos, op.rhs, config);
-            let result = Vector::new(lhs $op rhs);
+            let lhs = read::<C, N>(inputs, &*outputs, &*locals, write_pos, op.lhs, config);
+            let rhs = read::<C, N>(inputs, &*outputs, &*locals, write_pos, op.rhs, config);
+            let result = $func(&lhs, &rhs);
 
             write::<bool, N>(inputs, outputs, locals, write_pos, result, op.out, config);
         }
@@ -392,7 +466,7 @@ macro_rules! unary_func {
             #[comptime] op: UnaryFuseArgs,
             #[comptime] config: &FuseBlockConfig,
         ) {
-            let input = read::<C, N>(inputs, outputs, &locals, write_pos, op.input, config);
+            let input = read::<C, N>(inputs, &*outputs, &*locals, write_pos, op.input, config);
             let result = $func(input);
 
             write::<C, N>(inputs, outputs, locals, write_pos, result, op.out, config);
@@ -409,7 +483,7 @@ fn assign<C: Scalar, N: Size>(
     #[comptime] op: UnaryFuseArgs,
     #[comptime] config: &FuseBlockConfig,
 ) {
-    let input = read::<C, N>(inputs, outputs, locals, write_pos, op.input, config);
+    let input = read::<C, N>(inputs, &*outputs, &*locals, write_pos, op.input, config);
 
     write::<C, N>(inputs, outputs, locals, write_pos, input, op.out, config);
 }
@@ -449,8 +523,8 @@ fn gather<C: Numeric, N: Size>(
     if comptime![dim > 0] {
         let index_before = global_offset(
             inputs,
-            outputs,
-            locals,
+            &*outputs,
+            &*locals,
             write_pos,
             input.clone(),
             comptime![Some((0, dim))],
@@ -462,8 +536,8 @@ fn gather<C: Numeric, N: Size>(
     if comptime![dim + 1 < config.rank] {
         let index_after = global_offset(
             inputs,
-            outputs,
-            locals,
+            &*outputs,
+            &*locals,
             write_pos,
             input,
             comptime![Some((dim + 1, config.rank))],
@@ -474,8 +548,8 @@ fn gather<C: Numeric, N: Size>(
 
     let index_offset = global_offset(
         inputs,
-        outputs,
-        locals,
+        &*outputs,
+        &*locals,
         write_pos,
         indices,
         comptime![Some((0, config.rank))],
@@ -491,7 +565,7 @@ fn gather<C: Numeric, N: Size>(
         for i in 0..vector_size {
             let offset = read_input::<u32, Const<1>>(
                 inputs,
-                locals,
+                &*locals,
                 pos_indices,
                 index_offset + i * stride_indices_vector,
                 LayoutInfo::IsRef,
@@ -501,14 +575,14 @@ fn gather<C: Numeric, N: Size>(
 
             let input = read_input::<C, Const<1>>(
                 inputs,
-                locals,
+                &*locals,
                 pos_input,
-                index + (offset[0] as usize * stride_input_dim),
+                index + (offset.extract(0usize) as usize * stride_input_dim),
                 LayoutInfo::IsRef,
                 config,
                 None,
             );
-            result[i] = input[0];
+            result.insert(i, input.extract(0usize));
         }
     } else {
         let stride_input_vector = global_stride(inputs, config.rank - 1, pos_input);
@@ -517,7 +591,7 @@ fn gather<C: Numeric, N: Size>(
         for i in 0..vector_size {
             let offset = read_input::<u32, Const<1>>(
                 inputs,
-                locals,
+                &*locals,
                 pos_indices,
                 index_offset + i * stride_indices_vector,
                 LayoutInfo::IsRef,
@@ -525,12 +599,13 @@ fn gather<C: Numeric, N: Size>(
                 None,
             );
 
-            let current_index =
-                index + (offset[0] as usize * stride_input_dim) + (i * stride_input_vector);
+            let current_index = index
+                + (offset.extract(0usize) as usize * stride_input_dim)
+                + (i * stride_input_vector);
 
             let input = read_input::<C, Const<1>>(
                 inputs,
-                locals,
+                &*locals,
                 pos_input,
                 current_index,
                 LayoutInfo::IsRef,
@@ -538,7 +613,7 @@ fn gather<C: Numeric, N: Size>(
                 None,
             );
 
-            result[i] = input[0];
+            result.insert(i, input.extract(0usize));
         }
     }
 
@@ -587,8 +662,8 @@ fn select_indices<C: Numeric, N: Size>(
         if comptime![dim > 0] {
             let index_before = global_offset(
                 inputs,
-                outputs,
-                locals,
+                &*outputs,
+                &*locals,
                 write_pos,
                 input.clone(),
                 comptime![Some((0, dim))],
@@ -600,8 +675,8 @@ fn select_indices<C: Numeric, N: Size>(
         if comptime![dim + 1 < config.rank] {
             let index_after = global_offset(
                 inputs,
-                outputs,
-                locals,
+                &*outputs,
+                &*locals,
                 write_pos,
                 input.clone(),
                 comptime![Some((dim + 1, config.rank))],
@@ -615,7 +690,7 @@ fn select_indices<C: Numeric, N: Size>(
         let coordinate_dim = write_pos_input / stride_dim_ref % shape_dim_ref;
         let offset_dim = read_input::<u32, Const<1>>(
             inputs,
-            locals,
+            &*locals,
             pos_indices,
             coordinate_dim,
             LayoutInfo::IsRef,
@@ -623,20 +698,20 @@ fn select_indices<C: Numeric, N: Size>(
             None,
         );
 
-        index += offset_dim[0] as usize * stride_input_dim;
+        index += offset_dim.extract(0usize) as usize * stride_input_dim;
 
         #[unroll]
         for i in 0..vector_size_ref {
             let input = read_input::<C, Const<1>>(
                 inputs,
-                locals,
+                &*locals,
                 pos_input,
                 index + i * stride_input_vector,
                 LayoutInfo::IsRef,
                 config,
                 None,
             );
-            result[i] = input[0];
+            result.insert(i, input.extract(0usize));
         }
     } else {
         // In this scenario the select is actually performed on the last dimension we're working on.
@@ -647,8 +722,8 @@ fn select_indices<C: Numeric, N: Size>(
         if comptime![dim > 0] {
             let index_before = global_offset(
                 inputs,
-                outputs,
-                locals,
+                &*outputs,
+                &*locals,
                 write_pos,
                 input.clone(),
                 comptime![Some((0, dim))],
@@ -660,8 +735,8 @@ fn select_indices<C: Numeric, N: Size>(
         if comptime![dim + 1 < config.rank] {
             let index_after = global_offset(
                 inputs,
-                outputs,
-                locals,
+                &*outputs,
+                &*locals,
                 write_pos,
                 input,
                 comptime![Some((dim + 1, config.rank))],
@@ -677,7 +752,7 @@ fn select_indices<C: Numeric, N: Size>(
             let coordinate_dim = (write_pos_indices + i) / stride_dim_ref % shape_dim_ref;
             let offset_dim = read_input::<u32, Const<1>>(
                 inputs,
-                locals,
+                &*locals,
                 pos_indices,
                 coordinate_dim,
                 LayoutInfo::IsRef,
@@ -687,18 +762,189 @@ fn select_indices<C: Numeric, N: Size>(
 
             let input = read_input::<C, Const<1>>(
                 inputs,
-                locals,
+                &*locals,
                 pos_input,
-                index + (offset_dim[0] as usize * stride_input_dim),
+                index + (offset_dim.extract(0usize) as usize * stride_input_dim),
                 LayoutInfo::IsRef,
                 config,
                 None,
             );
-            result[i] = input[0];
+            result.insert(i, input.extract(0usize));
         }
     }
 
     write::<C, N>(inputs, outputs, locals, write_pos, result, output, config);
+}
+
+#[cube]
+fn concat<C: Scalar, N: Size>(
+    inputs: &GlobalArgs,
+    outputs: &mut GlobalArgs,
+    locals: &mut LocalArgs,
+    write_pos: usize,
+    #[comptime] dim: usize,
+    #[comptime] tensors: Vec<FuseArg>,
+    #[comptime] output: FuseArg,
+    #[comptime] config: &FuseBlockConfig,
+) {
+    let (vector_size_ref, stride_dim_ref, shape_dim_ref) = (
+        locals.ref_vector_size,
+        locals.ref_strides[dim],
+        locals.ref_shape[dim],
+    );
+
+    let mut result = Vector::<C, N>::empty();
+    let write_pos_elem = write_pos * vector_size_ref;
+
+    if comptime![dim != config.vector_axis] {
+        // The concatenation axis isn't the vectorization axis, therefore the whole vector is
+        // contained in a single input tensor.
+        let coordinate_dim = write_pos_elem / stride_dim_ref % shape_dim_ref;
+
+        let mut offset_dim_start = 0;
+
+        #[unroll]
+        for t in 0..tensors.len() {
+            let tensor = comptime![tensors.get(t).unwrap().clone()];
+            let pos_tensor = comptime![concat_input_pos(&tensor)];
+
+            let shape_tensor_dim = global_shape(inputs, dim, pos_tensor);
+            let offset_dim_end = offset_dim_start + shape_tensor_dim;
+
+            if coordinate_dim >= offset_dim_start && coordinate_dim < offset_dim_end {
+                let index = concat_input_offset(
+                    inputs,
+                    &*outputs,
+                    &*locals,
+                    write_pos,
+                    coordinate_dim - offset_dim_start,
+                    tensor,
+                    pos_tensor,
+                    dim,
+                    config,
+                );
+
+                let stride_tensor_vector =
+                    global_stride(inputs, comptime![config.vector_axis], pos_tensor);
+
+                #[unroll]
+                for i in 0..vector_size_ref {
+                    let input = read_input::<C, Const<1>>(
+                        inputs,
+                        &*locals,
+                        pos_tensor,
+                        index + i * stride_tensor_vector,
+                        LayoutInfo::IsRef,
+                        config,
+                        None,
+                    );
+                    result.insert(i, input.extract(0usize));
+                }
+            }
+
+            offset_dim_start = offset_dim_end;
+        }
+    } else {
+        // The concatenation happens along the vectorization axis, therefore each element of the
+        // vector may come from a different input tensor.
+        #[unroll]
+        for i in 0..vector_size_ref {
+            let coordinate_dim = (write_pos_elem + i) / stride_dim_ref % shape_dim_ref;
+            let mut offset_dim_start = 0;
+
+            #[unroll]
+            for t in 0..tensors.len() {
+                let tensor = comptime![tensors.get(t).unwrap().clone()];
+                let pos_tensor = comptime![concat_input_pos(&tensor)];
+
+                let shape_tensor_dim = global_shape(inputs, dim, pos_tensor);
+                let offset_dim_end = offset_dim_start + shape_tensor_dim;
+
+                if coordinate_dim >= offset_dim_start && coordinate_dim < offset_dim_end {
+                    let index = concat_input_offset(
+                        inputs,
+                        &*outputs,
+                        &*locals,
+                        write_pos,
+                        coordinate_dim - offset_dim_start,
+                        tensor,
+                        pos_tensor,
+                        dim,
+                        config,
+                    );
+
+                    let input = read_input::<C, Const<1>>(
+                        inputs,
+                        &*locals,
+                        pos_tensor,
+                        index,
+                        LayoutInfo::IsRef,
+                        config,
+                        None,
+                    );
+                    result.insert(i, input.extract(0usize));
+                }
+
+                offset_dim_start = offset_dim_end;
+            }
+        }
+    }
+
+    write::<C, N>(inputs, outputs, locals, write_pos, result, output, config);
+}
+
+fn concat_input_pos(arg: &FuseArg) -> usize {
+    match arg {
+        FuseArg::Input(pos, ..) => *pos,
+        _ => panic!("Cat input isn't a global input"),
+    }
+}
+
+#[cube]
+/// Element index inside a cat input for the vector at `write_pos`, where
+/// `coordinate_dim_tensor` is the coordinate along the concat axis relative to the start of
+/// this input's segment.
+fn concat_input_offset(
+    inputs: &GlobalArgs,
+    outputs: &GlobalArgs,
+    locals: &LocalArgs,
+    write_pos: usize,
+    coordinate_dim_tensor: usize,
+    #[comptime] tensor: FuseArg,
+    #[comptime] pos_tensor: usize,
+    #[comptime] dim: usize,
+    #[comptime] config: &FuseBlockConfig,
+) -> usize {
+    let stride_tensor_dim = global_stride(inputs, dim, pos_tensor);
+    let mut index = coordinate_dim_tensor * stride_tensor_dim;
+
+    if comptime![dim > 0] {
+        let index_before = global_offset(
+            inputs,
+            outputs,
+            locals,
+            write_pos,
+            tensor.clone(),
+            comptime![Some((0, dim))],
+            config,
+        );
+        index += index_before;
+    }
+
+    if comptime![dim + 1 < config.rank] {
+        let index_after = global_offset(
+            inputs,
+            outputs,
+            locals,
+            write_pos,
+            tensor,
+            comptime![Some((dim + 1, config.rank))],
+            config,
+        );
+        index += index_after;
+    }
+
+    index
 }
 
 #[cube]
@@ -713,9 +959,9 @@ fn conditional_assign<C: Scalar, N: Size>(
     #[comptime] out: FuseArg,
     #[comptime] config: &FuseBlockConfig,
 ) {
-    let cond = read::<bool, N>(inputs, outputs, locals, write_pos, cond, config);
-    let lhs = read::<C, N>(inputs, outputs, locals, write_pos, lhs, config);
-    let rhs = read::<C, N>(inputs, outputs, locals, write_pos, rhs, config);
+    let cond = read::<bool, N>(inputs, &*outputs, &*locals, write_pos, cond, config);
+    let lhs = read::<C, N>(inputs, &*outputs, &*locals, write_pos, lhs, config);
+    let rhs = read::<C, N>(inputs, &*outputs, &*locals, write_pos, rhs, config);
     let result = select_many(cond, lhs, rhs);
 
     write::<C, N>(inputs, outputs, locals, write_pos, result, out, config);
@@ -733,10 +979,21 @@ fn clamp<C: Numeric, N: Size>(
     #[comptime] out: FuseArg,
     #[comptime] config: &FuseBlockConfig,
 ) {
-    let input = read::<C, N>(inputs, outputs, locals, write_pos, input, config);
-    let min = read::<C, N>(inputs, outputs, locals, write_pos, min, config);
-    let max = read::<C, N>(inputs, outputs, locals, write_pos, max, config);
-    let result = cubecl::prelude::clamp(input, min, max);
+    let input = read::<C, N>(inputs, &*outputs, &*locals, write_pos, input, config);
+    let min = read::<C, N>(inputs, &*outputs, &*locals, write_pos, min, config);
+    let max = read::<C, N>(inputs, &*outputs, &*locals, write_pos, max, config);
+
+    let elem_type = elem_type_of::<C>();
+    let result = if comptime!(elem_type.is_float()) {
+        let define!(F) = elem_type;
+        Vector::cast_from(clamp_nan(
+            Vector::<F, N>::cast_from(input),
+            Vector::<F, N>::cast_from(min),
+            Vector::<F, N>::cast_from(max),
+        ))
+    } else {
+        cubecl::prelude::clamp(input, min, max)
+    };
 
     write::<C, N>(inputs, outputs, locals, write_pos, result, out, config);
 }
@@ -762,38 +1019,24 @@ fn dequantize<C: Float, N: Size>(
 
     let quant_ty = comptime![match scheme.store {
         QuantStore::Native => match scheme.value {
-            QuantValue::Q8F | QuantValue::Q8S => StorageType::Scalar(ElemType::UInt(UIntKind::U8)),
-            QuantValue::E4M3 => StorageType::Scalar(ElemType::Float(FloatKind::E4M3)),
-            QuantValue::E5M2 => StorageType::Scalar(ElemType::Float(FloatKind::E5M2)),
+            QuantValue::Q8F | QuantValue::Q8S => ElemType::UInt(UIntKind::U8),
+            QuantValue::E4M3 => ElemType::Float(FloatKind::E4M3),
+            QuantValue::E5M2 => ElemType::Float(FloatKind::E5M2),
             QuantValue::Q4F
             | QuantValue::Q4S
             | QuantValue::Q2F
             | QuantValue::Q2S
             | QuantValue::E2M1 => unreachable!("Can't store native sub-byte values"),
         },
-        QuantStore::PackedU32(_) => ElemType::UInt(UIntKind::U32).into(),
+        QuantStore::PackedU32(_) => ElemType::UInt(UIntKind::U32),
         QuantStore::PackedNative(_) => match scheme.value {
-            QuantValue::E2M1 => StorageType::Packed(ElemType::Float(FloatKind::E4M3), 2),
+            QuantValue::E2M1 => ElemType::Float(FloatKind::E2M1x2),
             other => panic!("{other:?} doesn't support native packing"),
         },
     }];
-    let param_ty = comptime![match scheme.param {
-        cubecl::quant::scheme::QuantParam::F32 =>
-            StorageType::Scalar(ElemType::Float(FloatKind::F32)),
-        cubecl::quant::scheme::QuantParam::F16 =>
-            StorageType::Scalar(ElemType::Float(FloatKind::F16)),
-        cubecl::quant::scheme::QuantParam::BF16 =>
-            StorageType::Scalar(ElemType::Float(FloatKind::BF16)),
-        cubecl::quant::scheme::QuantParam::UE8M0 =>
-            StorageType::Scalar(ElemType::Float(FloatKind::UE8M0)),
-        cubecl::quant::scheme::QuantParam::UE4M3 =>
-            StorageType::Scalar(ElemType::Float(FloatKind::E4M3)),
-    }];
-    let q_vector_size = N::value().comptime() / scheme.num_quants();
-
+    let scale_ty = comptime![ElemType::from_scale_dtype(scheme.scale_dtype())];
     let define!(QStoreType) = quant_ty;
-    let size!(QStoreSize) = q_vector_size;
-    let define!(QParamType) = param_ty;
+    let define!(QScaleType) = scale_ty;
     let size!(NumQuant) = scheme.num_quants();
 
     let tensor_pos = comptime!(match input {
@@ -808,30 +1051,81 @@ fn dequantize<C: Float, N: Size>(
     let num_quants = scheme.num_quants();
 
     set_polyfill_typed::<Vector<C, N>, DynElem, DynSize>();
-    let input =
-        read_quantized::<QStoreType, QStoreSize>(inputs, locals, write_pos, input, config, scheme);
-
-    let scales =
-        input_as_scales_view::<QParamType, Const<1>>(inputs, pos, tensor_pos, scheme.level, config);
-
-    let result = dequantize_symmetric_packed_value_at::<
-        C,
-        NumQuant,
-        QParamType,
-        QStoreType,
-        QStoreSize,
-    >(write_pos * num_quants, input, &scales, scheme);
+    let grid =
+        input_as_scales_view::<QScaleType, Const<1>>(inputs, pos, tensor_pos, scheme, config);
+    // A two-level scheme never reaches a fused kernel, so there is no per-tensor scale to apply.
+    let scales = Scales::<QScaleType>::new(&grid, ComptimeOption::new_None());
 
     let mut vector = Vector::empty();
+    let packed_dim = comptime![match scheme.store {
+        QuantStore::Native => 0,
+        QuantStore::PackedU32(dim) | QuantStore::PackedNative(dim) => dim,
+    }];
 
-    #[unroll]
-    for i in 0..q_vector_size {
-        let value = result[i];
+    if comptime![packed_dim == 0] {
+        let q_vector_size = N::value().comptime() / scheme.num_quants();
+        let size!(QStoreSize) = q_vector_size;
+        let input = read_quantized::<QStoreType, QStoreSize>(
+            inputs, &*locals, write_pos, input, config, scheme,
+        );
+        let result = dequantize_symmetric_packed_value_at::<
+            C,
+            NumQuant,
+            QScaleType,
+            QStoreType,
+            QStoreSize,
+        >(write_pos * num_quants, input, &scales, scheme);
 
         #[unroll]
-        for j in 0..num_quants {
-            let index = i * num_quants + j;
-            vector[index] = value[j];
+        for i in 0..q_vector_size {
+            let value = result[i];
+
+            #[unroll]
+            for j in 0..num_quants {
+                let index = i * num_quants + j;
+                vector.insert(index, value.extract(j));
+            }
+        }
+    } else {
+        let packed_axis = comptime![config.rank - packed_dim - 1];
+
+        #[unroll]
+        for i in 0..N::value() {
+            let position = write_pos * locals.ref_vector_size + i;
+            let packed_coord =
+                position / locals.ref_strides[packed_axis] % locals.ref_shape[packed_axis];
+            let packed_index = packed_coord % num_quants;
+
+            // Scale layouts use a row-major logical position, while `position` belongs to the
+            // potentially strided reference layout. Decode its coordinates with the reference
+            // strides, then flatten them in logical order.
+            let mut logical_position = 0;
+            let mut logical_stride = 1;
+            #[unroll]
+            for r in 0..config.rank {
+                let dim = reverse_index(config.rank, r).comptime();
+                let coord = position / locals.ref_strides[dim] % locals.ref_shape[dim];
+                logical_position += coord * logical_stride;
+                logical_stride *= locals.ref_shape[dim];
+            }
+
+            let input = read_quantized_scalar::<QStoreType>(
+                inputs,
+                &*locals,
+                position,
+                input.clone(),
+                config,
+                scheme,
+            );
+            let input = Vector::<QStoreType, Const<1>>::new(input);
+            let result = dequantize_symmetric_packed_value_at::<
+                C,
+                NumQuant,
+                QScaleType,
+                QStoreType,
+                Const<1>,
+            >(logical_position, input, &scales, scheme);
+            vector.insert(i, result[0].extract_dynamic(packed_index));
         }
     }
 
@@ -843,14 +1137,21 @@ binary_op!(mul, *);
 binary_op!(div, /);
 binary_op!(sub, -);
 
-comparison_op!(equal, ==);
-comparison_op!(greater, >);
-comparison_op!(greater_equal, >=);
-comparison_op!(lower, <);
-comparison_op!(lower_equal, <=);
+binary_int_op!(bitwise_and, &);
+binary_int_op!(bitwise_or, |);
+binary_int_op!(bitwise_xor, ^);
+binary_int_op!(bitwise_left_shift, <<);
+binary_int_op!(bitwise_right_shift, >>);
+unary_int_op!(bitwise_not, !);
+
+comparison_op!(equal, Vector::<C, N>::equal);
+comparison_op!(greater, Vector::<C, N>::greater_than);
+comparison_op!(greater_equal, Vector::<C, N>::greater_equal);
+comparison_op!(lower, Vector::<C, N>::less_than);
+comparison_op!(lower_equal, Vector::<C, N>::less_equal);
 
 binary_func!(powf, Vector::<C, N>::powf, Float);
-binary_func!(rem, Vector::<C, N>::rem, Float);
+binary_func!(rem, Vector::<C, N>::mod_floor, Float);
 
 unary_func!(exp, Vector::<C, N>::exp, Float);
 unary_func!(log, Vector::<C, N>::ln, Float);
@@ -862,3 +1163,16 @@ unary_func!(tanh, Vector::<C, N>::tanh, Float);
 unary_func!(erf, Vector::<C, N>::erf, Float);
 unary_func!(recip, Vector::<C, N>::recip, Float);
 unary_func!(abs, Vector::<C, N>::abs, Numeric);
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_reference_stride;
+
+    #[test]
+    fn zero_stride_on_a_singleton_reference_dimension_is_normalized() {
+        assert_eq!(normalize_reference_stride(1, 0), 1);
+        assert_eq!(normalize_reference_stride(1, 48), 48);
+        assert_eq!(normalize_reference_stride(16, 48), 48);
+        assert_eq!(normalize_reference_stride(16, 0), 0);
+    }
+}

@@ -4,10 +4,11 @@ use super::{
     trace::{FuseTrace, TraceFuser, block::QuantInput},
 };
 use crate::engine::{codegen::ir::QuantSchemeFuse, scoring::Scoring};
+use burn_backend::cubecl::dtype_to_elem_type;
 use burn_fusion::{FuserProperties, FuserStatus, OperationFuser};
 use burn_ir::{
-    BaseOperationIr, BinaryOpIr, FloatOperationIr, NumericOperationIr, OperationIr, ScalarOpIr,
-    TensorIr, UnaryOpIr,
+    BaseOperationIr, BinaryOpIr, FloatOperationIr, IntOperationIr, NumericOperationIr, OperationIr,
+    ScalarOpIr, TensorIr, UnaryOpIr,
 };
 use burn_std::{
     DType, Shape,
@@ -19,7 +20,7 @@ use cubecl::ir::ElemType;
 ///
 ///
 /// This fuser doesn't create a ready-to-execute kernel, but rather generates a
-/// [trace](FuseTrace) that be used with a [runner](super::trace::TraceRunner).
+/// [trace](FuseTrace) that be used with a [runner](super::launch::runner::TraceRunner).
 ///
 /// Since this fuser supports fusing multiple blocks, you can fuse any compute-bound operations
 /// with the combination of fuse-on-read and fuse-on-write strategy.
@@ -29,7 +30,7 @@ use cubecl::ir::ElemType;
 /// It is responsible to translate [OperationIr] into [FuseOp] and it uses the [TraceFuser]
 /// to actually fuse the [FuseOp] when possible.
 #[derive(Debug, Clone)]
-pub(crate) struct TraceOperationFuser {
+pub struct TraceOperationFuser {
     pub(crate) fuser: TryTraceFuser,
     scoring: Scoring,
     pub(crate) settings: FuseSettings,
@@ -61,7 +62,7 @@ impl TraceOperationFuser {
     }
 
     /// Checks if the [operation](OperationIr) can be fused with the current fuser.
-    pub(crate) fn can_fuse(&self, op: &OperationIr) -> bool {
+    pub fn can_fuse(&self, op: &OperationIr) -> bool {
         let len_previous = self.len();
         let mut fuser_cloned = self.clone();
 
@@ -110,6 +111,13 @@ impl OperationFuser<FuseTrace> for TraceOperationFuser {
                 if !self.fuse_float(ops) {
                     self.status = FuserStatus::Closed;
                     self.log_closed(op, prev_num_ops, "float fuse rejected");
+                    return;
+                }
+            }
+            OperationIr::Int(ops) => {
+                if !self.fuse_int(ops) {
+                    self.status = FuserStatus::Closed;
+                    self.log_closed(op, prev_num_ops, "int fuse rejected");
                     return;
                 }
             }
@@ -253,7 +261,7 @@ impl TraceOperationFuser {
     /// # Returns
     ///
     /// None if it's impossible to create a next block with the given arguments. Otherwise, the
-    /// corresponding [arguments](Arg) to the given tensors are returned.
+    /// corresponding [arguments](FuseArg) to the given tensors are returned.
     pub fn next_block<const N: usize>(
         &mut self,
         arguments: [&TensorIr; N],
@@ -341,7 +349,7 @@ impl TraceOperationFuser {
                     return false;
                 }
 
-                let elem: ElemType = desc.out.dtype.into();
+                let elem: ElemType = dtype_to_elem_type(desc.out.dtype);
                 let precision = elem.into();
                 let input = FuseArg::Literal(1, precision);
 
@@ -358,7 +366,7 @@ impl TraceOperationFuser {
                     return false;
                 }
 
-                let elem: ElemType = desc.out.dtype.into();
+                let elem: ElemType = dtype_to_elem_type(desc.out.dtype);
                 let precision = elem.into();
                 let input = FuseArg::Literal(0, precision);
 
@@ -403,6 +411,29 @@ impl TraceOperationFuser {
                     build.fuse_operation(FuseOp::Select {
                         input,
                         indices,
+                        output,
+                        dim: desc.dim,
+                    });
+
+                    Some(())
+                })
+            }
+            BaseOperationIr::Cat(desc) => {
+                if !self.output_is_compatible(&desc.out) {
+                    return false;
+                }
+
+                self.fuser.fuse(|build| {
+                    let mut tensors = Vec::with_capacity(desc.tensors.len());
+
+                    for tensor in desc.tensors.iter() {
+                        tensors.push(build.input_indexed(tensor)?);
+                    }
+
+                    let output = build.output(&desc.out)?;
+
+                    build.fuse_operation(FuseOp::Cat {
+                        inputs: tensors,
                         output,
                         dim: desc.dim,
                     });
@@ -523,6 +554,56 @@ impl TraceOperationFuser {
                     Some(())
                 })
             }
+            _ => false,
+        }
+    }
+
+    fn fuse_int(&mut self, ops: &IntOperationIr) -> bool {
+        match ops {
+            IntOperationIr::IntoFloat(desc) => {
+                self.fuse_unary_op(&desc.input, &desc.out, |input, out| {
+                    FuseOp::Assign(UnaryFuseArgs { input, out })
+                })
+            }
+            IntOperationIr::BitwiseAnd(desc) => self.fuse_binary_ops(desc, |lhs, rhs, out| {
+                FuseOp::BitwiseAnd(BinaryFuseArgs { lhs, rhs, out })
+            }),
+            IntOperationIr::BitwiseAndScalar(desc) => self
+                .fuse_scalar_ops(desc, |lhs, rhs, out| {
+                    FuseOp::BitwiseAnd(BinaryFuseArgs { lhs, rhs, out })
+                }),
+            IntOperationIr::BitwiseOr(desc) => self.fuse_binary_ops(desc, |lhs, rhs, out| {
+                FuseOp::BitwiseOr(BinaryFuseArgs { lhs, rhs, out })
+            }),
+            IntOperationIr::BitwiseOrScalar(desc) => self.fuse_scalar_ops(desc, |lhs, rhs, out| {
+                FuseOp::BitwiseOr(BinaryFuseArgs { lhs, rhs, out })
+            }),
+            IntOperationIr::BitwiseXor(desc) => self.fuse_binary_ops(desc, |lhs, rhs, out| {
+                FuseOp::BitwiseXor(BinaryFuseArgs { lhs, rhs, out })
+            }),
+            IntOperationIr::BitwiseXorScalar(desc) => self
+                .fuse_scalar_ops(desc, |lhs, rhs, out| {
+                    FuseOp::BitwiseXor(BinaryFuseArgs { lhs, rhs, out })
+                }),
+            IntOperationIr::BitwiseNot(desc) => self.fuse_unary_ops(desc, |input, out| {
+                FuseOp::BitwiseNot(UnaryFuseArgs { input, out })
+            }),
+            IntOperationIr::BitwiseLeftShift(desc) => self
+                .fuse_binary_ops(desc, |lhs, rhs, out| {
+                    FuseOp::BitwiseLeftShift(BinaryFuseArgs { lhs, rhs, out })
+                }),
+            IntOperationIr::BitwiseLeftShiftScalar(desc) => self
+                .fuse_scalar_ops(desc, |lhs, rhs, out| {
+                    FuseOp::BitwiseLeftShift(BinaryFuseArgs { lhs, rhs, out })
+                }),
+            IntOperationIr::BitwiseRightShift(desc) => self
+                .fuse_binary_ops(desc, |lhs, rhs, out| {
+                    FuseOp::BitwiseRightShift(BinaryFuseArgs { lhs, rhs, out })
+                }),
+            IntOperationIr::BitwiseRightShiftScalar(desc) => self
+                .fuse_scalar_ops(desc, |lhs, rhs, out| {
+                    FuseOp::BitwiseRightShift(BinaryFuseArgs { lhs, rhs, out })
+                }),
             _ => false,
         }
     }
@@ -745,6 +826,15 @@ impl TraceOperationFuser {
         }
 
         true
+    }
+
+    /// Register an output relayout to NHWC.
+    ///
+    /// This will apply the NHWC relayout to the given [tensor](TensorIr).
+    ///
+    /// The relayout will be applied when the tensor is written to global memory.
+    pub fn output_nhwc_layout(&mut self, tensor: &TensorIr, stride_relayout: Shape) {
+        self.fuser.fuser.output_nhwc_layout(tensor, stride_relayout);
     }
 }
 

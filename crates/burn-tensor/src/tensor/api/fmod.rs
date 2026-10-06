@@ -1,9 +1,6 @@
-use crate::{Float, Tensor, backend::Backend};
+use crate::{Float, Tensor};
 
-impl<B, const D: usize> Tensor<B, D, Float>
-where
-    B: Backend,
-{
+impl<const D: usize> Tensor<D, Float> {
     /// Computes the floating-point remainder of dividing `self` by `other`.
     ///
     /// The result has the same sign as `self` and magnitude less than `other`.
@@ -27,17 +24,14 @@ where
     /// # Example
     ///
     /// ```rust
-    /// use burn_tensor::backend::Backend;
     /// use burn_tensor::Tensor;
     ///
-    /// fn example<B: Backend>() {
-    ///     let device = B::Device::default();
-    ///     let dividend = Tensor::<B, 1>::from_data([5.3, -5.3, 5.3, -5.3], &device);
-    ///     let divisor = Tensor::<B, 1>::from_data([2.0, 2.0, -2.0, -2.0], &device);
-    ///     let result = dividend.fmod(divisor);
+    /// let device = Default::default();
+    /// let dividend = Tensor::<1>::from_data([5.3, -5.3, 5.3, -5.3], &device);
+    /// let divisor = Tensor::<1>::from_data([2.0, 2.0, -2.0, -2.0], &device);
+    /// let result = dividend.fmod(divisor);
     ///
-    ///     // Result: [1.3, -1.3, 1.3, -1.3]
-    /// }
+    /// // Result: [1.3, -1.3, 1.3, -1.3]
     /// ```
     pub fn fmod(self, other: Self) -> Self {
         // Normal case: fmod(x, y) = x - y * trunc(x / y)
@@ -51,7 +45,7 @@ where
         // We need to handle this case by replacing NaN with 0 when appropriate
 
         // Check if the product is NaN due to 0 * inf
-        let is_zero_times_inf = truncated.equal_elem(0.0).bool_and(other.is_inf());
+        let is_zero_times_inf = truncated.equal_scalar(0.0).bool_and(other.is_inf());
         let zero_tensor = self.clone().mul_scalar(0.0);
         let corrected_product = product.mask_where(is_zero_times_inf, zero_tensor);
 
@@ -80,16 +74,13 @@ where
     /// # Example
     ///
     /// ```rust
-    /// use burn_tensor::backend::Backend;
     /// use burn_tensor::Tensor;
     ///
-    /// fn example<B: Backend>() {
-    ///     let device = B::Device::default();
-    ///     let tensor = Tensor::<B, 1>::from_data([5.3, -5.3, 7.5, -7.5], &device);
-    ///     let result = tensor.fmod_scalar(2.0);
+    /// let device = Default::default();
+    /// let tensor = Tensor::<1>::from_data([5.3, -5.3, 7.5, -7.5], &device);
+    /// let result = tensor.fmod_scalar(2.0);
     ///
-    ///     // Result: [1.3, -1.3, 1.5, -1.5]
-    /// }
+    /// // Result: [1.3, -1.3, 1.5, -1.5]
     /// ```
     pub fn fmod_scalar(self, scalar: f32) -> Self {
         // Normal case: fmod(x, y) = x - y * trunc(x / y)
@@ -102,8 +93,9 @@ where
         // but 0 * infinity = NaN, which is wrong - it should be 0
         if scalar.is_infinite() {
             // For finite values, fmod(x, ±∞) = x
-            // For infinite values, fmod(±∞, ±∞) = NaN (which is handled by arithmetic)
-            return self;
+            // For infinite values, fmod(±∞, ±∞) = NaN
+            let is_inf = self.clone().is_inf();
+            return self.mask_fill(is_inf, f32::NAN);
         }
 
         self - product

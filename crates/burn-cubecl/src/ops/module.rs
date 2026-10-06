@@ -1,6 +1,5 @@
 use crate::{
-    CubeBackend, CubeRuntime, FloatElement, IntElement,
-    element::BoolElement,
+    CubeBackend,
     kernel::{self, conv::ConvTranspose2dStrategy},
 };
 use burn_backend::tensor::{BoolTensor, FloatTensor, IntTensor};
@@ -11,21 +10,16 @@ use burn_backend::{
         DeformConvOptions, InterpolateOptions, MaxPool2dBackward, MaxPool2dWithIndices, ModuleOps,
     },
 };
+use burn_std::IntDType;
 
-impl<R, F, I, BT> ModuleOps<Self> for CubeBackend<R, F, I, BT>
-where
-    R: CubeRuntime,
-    F: FloatElement,
-    I: IntElement,
-    BT: BoolElement,
-{
+impl ModuleOps<Self> for CubeBackend {
     fn conv1d(
         x: FloatTensor<Self>,
         weight: FloatTensor<Self>,
         bias: Option<FloatTensor<Self>>,
         options: ConvOptions<1>,
     ) -> FloatTensor<Self> {
-        kernel::conv::conv_forward::<R, 1>(x, weight, bias, options, Default::default()).unwrap()
+        kernel::conv::conv_forward::<1>(x, weight, bias, options, Default::default()).unwrap()
     }
 
     fn conv1d_x_backward(
@@ -50,7 +44,7 @@ where
         output_grad: FloatTensor<Self>,
         options: ConvOptions<1>,
     ) -> FloatTensor<Self> {
-        kernel::conv::conv_weight_backward::<R, 1>(
+        kernel::conv::conv_weight_backward::<1>(
             x,
             output_grad,
             weight.shape(),
@@ -66,7 +60,7 @@ where
         bias: Option<FloatTensor<Self>>,
         options: ConvOptions<2>,
     ) -> FloatTensor<Self> {
-        kernel::conv::conv_forward::<R, 2>(x, weight, bias, options, Default::default()).unwrap()
+        kernel::conv::conv_forward::<2>(x, weight, bias, options, Default::default()).unwrap()
     }
 
     fn conv2d_x_backward(
@@ -91,7 +85,7 @@ where
         output_grad: FloatTensor<Self>,
         options: ConvOptions<2>,
     ) -> FloatTensor<Self> {
-        kernel::conv::conv_weight_backward::<R, 2>(
+        kernel::conv::conv_weight_backward::<2>(
             x,
             output_grad,
             weight.shape(),
@@ -140,7 +134,7 @@ where
         bias: Option<FloatTensor<Self>>,
         options: ConvOptions<3>,
     ) -> FloatTensor<Self> {
-        kernel::conv::conv_forward::<R, 3>(x, weight, bias, options, Default::default()).unwrap()
+        kernel::conv::conv_forward::<3>(x, weight, bias, options, Default::default()).unwrap()
     }
 
     fn conv3d_x_backward(
@@ -165,7 +159,7 @@ where
         output_grad: FloatTensor<Self>,
         options: ConvOptions<3>,
     ) -> FloatTensor<Self> {
-        kernel::conv::conv_weight_backward::<R, 3>(
+        kernel::conv::conv_weight_backward::<3>(
             x,
             output_grad,
             weight.shape(),
@@ -250,6 +244,7 @@ where
         padding: [usize; 2],
         dilation: [usize; 2],
         ceil_mode: bool,
+        indices_dtype: IntDType,
     ) -> MaxPool2dWithIndices<Self> {
         let (output, indices) = kernel::pool::max_pool2d_with_indices(
             x,
@@ -258,7 +253,7 @@ where
             padding,
             dilation,
             ceil_mode,
-            I::dtype(),
+            indices_dtype.into(),
         );
 
         MaxPool2dWithIndices::new(output, indices)
@@ -297,12 +292,23 @@ where
         kernel::pool::adaptive_avg_pool2d_backward(x, grad)
     }
 
+    fn adaptive_avg_pool3d(x: FloatTensor<Self>, output_size: [usize; 3]) -> FloatTensor<Self> {
+        kernel::pool::adaptive_avg_pool3d(x, output_size)
+    }
+
+    fn adaptive_avg_pool3d_backward(
+        x: FloatTensor<Self>,
+        grad: FloatTensor<Self>,
+    ) -> FloatTensor<Self> {
+        kernel::pool::adaptive_avg_pool3d_backward(x, grad)
+    }
+
     fn interpolate(
         x: FloatTensor<Self>,
         output_size: [usize; 2],
         options: InterpolateOptions,
     ) -> FloatTensor<Self> {
-        kernel::interpolate::interpolate(x, output_size, options)
+        kernel::interpolate::interpolate(x, output_size, options, Default::default()).unwrap()
     }
 
     fn interpolate_backward(
@@ -380,22 +386,5 @@ where
             nll,
             blank,
         )
-    }
-
-    fn rfft(
-        signal: FloatTensor<Self>,
-        dim: usize,
-        n: Option<usize>,
-    ) -> (FloatTensor<Self>, FloatTensor<Self>) {
-        kernel::fft::rfft(signal, dim, n)
-    }
-
-    fn irfft(
-        spectrum_re: FloatTensor<Self>,
-        spectrum_im: FloatTensor<Self>,
-        dim: usize,
-        n: Option<usize>,
-    ) -> FloatTensor<Self> {
-        kernel::fft::irfft(spectrum_re, spectrum_im, dim, n)
     }
 }

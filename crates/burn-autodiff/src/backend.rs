@@ -3,16 +3,18 @@ use crate::{
     grads::Gradients,
     tensor::AutodiffTensor,
 };
-use alloc::{format, string::String};
+use alloc::{format, string::String, vec::Vec};
 use core::marker::PhantomData;
 
 use burn_backend::{
-    backend::{AutodiffBackend, Backend, BackendTypes, ExecutionError},
+    backend::{
+        AutodiffBackend, Backend, BackendTypes, ExecutionError, MemoryPoolUsage, ProfileDuration,
+        ProfileOptions, ProfileToken, SlicedPoolReport,
+    },
     tensor::{BoolTensor, IntTensor, QuantizedTensor},
 };
 
-#[cfg(feature = "distributed")]
-use burn_backend::distributed::{DistributedBackend, DistributedParamId, DistributedParams};
+use burn_backend::distributed::{DistributedParamId, DistributedParams};
 
 /// Enable auto-differentiation on a backend.
 ///
@@ -24,19 +26,20 @@ pub struct Autodiff<B, C = NoCheckpointing> {
     _checkpoint_strategy: PhantomData<C>,
 }
 
-impl<B: Backend, C: CheckpointStrategy> BackendTypes for Autodiff<B, C> {
+impl<B: BackendTypes, C: CheckpointStrategy> BackendTypes for Autodiff<B, C> {
     type Device = B::Device;
 
     type FloatTensorPrimitive = AutodiffTensor<B>;
-    type FloatElem = B::FloatElem;
 
     type IntTensorPrimitive = B::IntTensorPrimitive;
-    type IntElem = B::IntElem;
 
     type BoolTensorPrimitive = B::BoolTensorPrimitive;
-    type BoolElem = B::BoolElem;
 
     type QuantizedTensorPrimitive = B::QuantizedTensorPrimitive;
+
+    // A replayed graph would skip re-recording the autodiff tape, so capture
+    // is not supported under autodiff.
+    type GraphPrimitive = burn_backend::GraphUnsupported;
 }
 
 impl<B: Backend, C: CheckpointStrategy> Backend for Autodiff<B, C> {
@@ -56,6 +59,30 @@ impl<B: Backend, C: CheckpointStrategy> Backend for Autodiff<B, C> {
         B::sync(device)
     }
 
+    fn profile<O: Send + 'static>(
+        device: &Self::Device,
+        options: ProfileOptions,
+        func: impl FnOnce() -> O + Send,
+    ) -> Result<(O, ProfileDuration), ExecutionError> {
+        B::profile(device, options, func)
+    }
+
+    fn profile_start(device: &Self::Device) -> Result<Option<ProfileToken>, ExecutionError> {
+        B::profile_start(device)
+    }
+
+    fn profile_end(
+        device: &Self::Device,
+        token: ProfileToken,
+        options: ProfileOptions,
+    ) -> Result<ProfileDuration, ExecutionError> {
+        B::profile_end(device, token, options)
+    }
+
+    fn profile_abandon(device: &Self::Device, token: ProfileToken) {
+        B::profile_abandon(device, token)
+    }
+
     fn memory_persistent_allocations<
         Output: Send,
         Input: Send,
@@ -70,6 +97,14 @@ impl<B: Backend, C: CheckpointStrategy> Backend for Autodiff<B, C> {
 
     fn memory_cleanup(device: &Self::Device) {
         B::memory_cleanup(device)
+    }
+
+    fn memory_pool_report(device: &Self::Device) -> Option<Vec<SlicedPoolReport>> {
+        B::memory_pool_report(device)
+    }
+
+    fn memory_pool_usage(device: &Self::Device) -> Option<MemoryPoolUsage> {
+        B::memory_pool_usage(device)
     }
 
     fn staging<'a, Iter>(data: Iter, device: &Self::Device)
@@ -90,70 +125,13 @@ impl<B: Backend, C: CheckpointStrategy> Backend for Autodiff<B, C> {
     fn device_count(type_id: u16) -> usize {
         B::device_count(type_id)
     }
+
+    fn flush(device: &Self::Device) -> Result<(), ExecutionError> {
+        B::flush(device)
+    }
 }
 
-#[cfg(not(feature = "distributed"))]
 impl<B: Backend, C: CheckpointStrategy> AutodiffBackend for Autodiff<B, C> {
-    type InnerBackend = B;
-    type Gradients = Gradients;
-
-    fn backward(tensor: AutodiffTensor<B>) -> Gradients {
-        tensor.backward()
-    }
-
-    fn grad(tensor: &AutodiffTensor<B>, grads: &Gradients) -> Option<B::FloatTensorPrimitive> {
-        tensor.grad(grads)
-    }
-
-    fn grad_remove(
-        tensor: &AutodiffTensor<B>,
-        grads: &mut Gradients,
-    ) -> Option<B::FloatTensorPrimitive> {
-        tensor.grad_remove(grads)
-    }
-    fn inner(tensor: AutodiffTensor<B>) -> B::FloatTensorPrimitive {
-        tensor.primitive
-    }
-
-    fn from_inner(tensor: B::FloatTensorPrimitive) -> AutodiffTensor<B> {
-        AutodiffTensor::new(tensor)
-    }
-
-    fn grad_replace(
-        tensor: &AutodiffTensor<B>,
-        grads: &mut Self::Gradients,
-        grad: B::FloatTensorPrimitive,
-    ) {
-        tensor.grad_replace(grads, grad);
-    }
-
-    fn int_inner(tensor: IntTensor<Self>) -> IntTensor<Self::InnerBackend> {
-        tensor
-    }
-
-    fn bool_inner(tensor: BoolTensor<Self>) -> BoolTensor<Self::InnerBackend> {
-        tensor
-    }
-
-    fn int_from_inner(tensor: IntTensor<Self::InnerBackend>) -> IntTensor<Self> {
-        tensor
-    }
-
-    fn bool_from_inner(tensor: BoolTensor<Self::InnerBackend>) -> BoolTensor<Self> {
-        tensor
-    }
-
-    fn q_inner(tensor: QuantizedTensor<Self>) -> QuantizedTensor<Self::InnerBackend> {
-        tensor
-    }
-
-    fn q_from_inner(tensor: QuantizedTensor<Self::InnerBackend>) -> QuantizedTensor<Self> {
-        tensor
-    }
-}
-
-#[cfg(feature = "distributed")]
-impl<B: DistributedBackend, C: CheckpointStrategy> AutodiffBackend for Autodiff<B, C> {
     type InnerBackend = B;
     type Gradients = Gradients;
 

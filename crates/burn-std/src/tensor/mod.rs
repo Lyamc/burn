@@ -1,9 +1,21 @@
+/// Generic container for storing tensors keyed by an id.
+pub mod container;
+/// Tensor data type definitions.
 pub mod dtype;
+/// The order a tensor's dimensions occupy memory in.
+pub mod layout;
+/// Batched matmul transformation utilities.
+pub mod matmul;
+/// Quantization data representation.
 pub mod quantization;
+/// Tensor shape utilities.
 pub mod shape;
+/// Tensor slicing utilities.
 pub mod slice;
 
 pub use dtype::*;
+pub use layout::*;
+pub use matmul::*;
 pub use quantization::*;
 pub use shape::*;
 pub use slice::*;
@@ -15,18 +27,61 @@ pub use cubecl_zspace::{Strides, metadata::Metadata, strides};
 ///
 /// A tensor is considered contiguous if its elements are stored in memory
 /// such that the stride at position `k` is equal to the product of the shapes
-/// of all dimensions greater than `k`.
+/// of all dimensions greater than `k`, except for dimensions of size one.
 ///
-/// This means that strides increase as you move from the rightmost to the leftmost dimension.
+/// This means that strides increase as you move from the rightmost to the leftmost dimension,
+/// ignoring dimensions of size one.
+///
+/// Dimensions of size one may have any stride, including zero, since their stride is never applied.
 pub fn is_contiguous(shape: &[usize], strides: &[usize]) -> bool {
     if shape.is_empty() {
         return true;
     }
 
-    for (&expected, &stride) in contiguous_strides(shape).iter().zip(strides) {
-        if expected != stride {
+    // A dimension of size one is visited once, so its stride is never applied and can hold
+    // anything: a permute leaves whatever the axis carried before, and broadcast views use 0.
+    // Comparing it would report a contiguous tensor as strided, as [2, 3, 1] with strides
+    // [3, 1, 3] coming out of `permute([0, 2, 1])`.
+    for ((&expected, &stride), &dim) in contiguous_strides(shape)
+        .iter()
+        .zip(strides)
+        .zip(shape.iter())
+    {
+        if dim != 1 && expected != stride {
             return false;
         }
+    }
+
+    true
+}
+
+/// Check if the current tensor fills its buffer without gaps.
+///
+/// Unlike [is_contiguous], this holds for any ordering of the dimensions: a permuted tensor is
+/// dense, a tensor whose rows were padded by a pitched allocator is not. Dimensions of size one
+/// carry no information about the layout and are ignored.
+pub fn is_dense(shape: &[usize], strides: &[usize]) -> bool {
+    if shape.len() != strides.len() {
+        return false;
+    }
+
+    let mut dims: SmallVec<[(usize, usize); 5]> = shape
+        .iter()
+        .zip(strides)
+        .filter(|&(&dim, _)| dim > 1)
+        .map(|(&dim, &stride)| (dim, stride))
+        .collect();
+
+    dims.sort_unstable_by_key(|&(_, stride)| stride);
+
+    let mut expected = 1;
+
+    for (dim, stride) in dims {
+        if stride != expected {
+            return false;
+        }
+
+        expected *= dim;
     }
 
     true
@@ -137,7 +192,20 @@ pub fn broadcast_strides(
 pub fn split_strides(shape: &[usize], strides: &[usize], shape_new: &[usize]) -> Strides {
     let mut strides_new = strides![1; shape_new.len()];
 
-    let mut old_idx = shape.len() - 1;
+    // Unit dims in the old shape never anchor a group of new dims, and their
+    // stride can be arbitrary (0 for broadcast views, pitched values, ...).
+    // Skip them so a real new dim never inherits a unit dim's stride —
+    // e.g. reshaping [26, 1] with strides [1, 0] (a `repeat_dim` broadcast
+    // view) to [26, 1, 1] must keep stride 1 on dim 0; propagating the 0
+    // would make every index along dim 0 alias the first element.
+    let skip_unit_dims = |mut idx: usize| {
+        while idx > 0 && shape[idx] == 1 {
+            idx -= 1;
+        }
+        idx
+    };
+
+    let mut old_idx = skip_unit_dims(shape.len() - 1);
     let mut current_stride = strides[old_idx];
     let mut dim_prod = 1;
 
@@ -147,7 +215,7 @@ pub fn split_strides(shape: &[usize], strides: &[usize], shape_new: &[usize]) ->
         if *dim == 1 {
             continue;
         } else if dim_prod == shape[old_idx] {
-            old_idx = old_idx.saturating_sub(1);
+            old_idx = skip_unit_dims(old_idx.saturating_sub(1));
             current_stride = strides[old_idx];
             dim_prod = 1;
         } else {
@@ -246,13 +314,31 @@ mod tests {
         assert_eq!(analysis, ReshapeAnalysis::IsContiguous)
     }
 
+    // [32, 1, 1, 1] with strides [1, 32, 32, 32] is contiguous: only the first axis is
+    // ever indexed, and it steps by one. The trailing strides belong to axes of size one
+    // and are never applied, so the analysis short-circuits before reaching the batch and
+    // split branches, which the three tests below cover with genuinely strided inputs.
+    #[test]
+    fn test_reshape_analysis_unit_axes_are_contiguous() {
+        for shape_new in [
+            [1, 1, 32, 1, 1, 1].as_slice(),
+            [32, 1, 1, 1, 1].as_slice(),
+            [4, 8, 1, 1, 1].as_slice(),
+        ] {
+            let analysis = reshape_analysis(
+                &[32, 1, 1, 1].into(),
+                Some(&[1, 32, 32, 32].into()),
+                &shape_new.into(),
+            );
+
+            assert_eq!(analysis, ReshapeAnalysis::IsContiguous, "{shape_new:?}")
+        }
+    }
+
     #[test]
     fn test_reshape_analysis_broadcasted_batch() {
-        let analysis = reshape_analysis(
-            &[32, 1, 1, 1].into(),
-            Some(&[1, 32, 32, 32].into()),
-            &[1, 1, 32, 1, 1, 1].into(),
-        );
+        let analysis =
+            reshape_analysis(&[32, 32].into(), Some(&[1, 32].into()), &[1, 32, 32].into());
 
         assert_eq!(analysis, ReshapeAnalysis::Broadcasted)
     }
@@ -260,23 +346,76 @@ mod tests {
     #[test]
     fn test_reshape_analysis_unsqueeze_split() {
         // Unsqueeze
-        let analysis = reshape_analysis(
-            &[32, 1, 1, 1].into(),
-            Some(&[1, 32, 32, 32].into()),
-            &[32, 1, 1, 1, 1].into(),
-        );
+        let analysis =
+            reshape_analysis(&[32, 32].into(), Some(&[1, 32].into()), &[32, 32, 1].into());
 
         assert_eq!(analysis, ReshapeAnalysis::Split)
     }
 
     #[test]
     fn test_reshape_analysis_split() {
-        let analysis = reshape_analysis(
-            &[32, 1, 1, 1].into(),
-            Some(&[1, 32, 32, 32].into()),
-            &[4, 8, 1, 1, 1].into(),
-        );
+        let analysis =
+            reshape_analysis(&[32, 32].into(), Some(&[1, 32].into()), &[4, 8, 32].into());
 
         assert_eq!(analysis, ReshapeAnalysis::Split)
+    }
+
+    #[test]
+    fn test_split_strides_trailing_unit_dim_broadcast_view() {
+        // A `repeat_dim` broadcast view: [26, 1] with strides [1, 0],
+        // unsqueezed to [26, 1, 1]. Dim 0 must keep stride 1 — propagating
+        // the unit dim's stride 0 makes every row alias row 0 (this breaks
+        // e.g. `scatter` index tensors built via unsqueeze + repeat).
+        let strides = split_strides(&[26, 1], &[1, 0], &[26, 1, 1]);
+        assert_eq!(strides.as_ref(), &[1, 1, 1]);
+    }
+
+    #[test]
+    fn test_split_strides_trailing_unit_dims_arbitrary_strides() {
+        // Unit dims can carry arbitrary strides (broadcast 0, pitched
+        // values, ...). They must not anchor the stride walk.
+        let strides = split_strides(&[32, 1, 1, 1], &[1, 32, 32, 32], &[32, 1, 1, 1, 1]);
+        assert_eq!(strides.as_ref(), &[1, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn test_split_strides_split_of_broadcast_dim_keeps_zero() {
+        // Splitting a real broadcast (stride 0) dim keeps 0 on the split
+        // parts; the leading real dim keeps its stride.
+        let strides = split_strides(&[26, 16], &[1, 0], &[26, 4, 4]);
+        assert_eq!(strides.as_ref(), &[1, 0, 0]);
+    }
+
+    #[test]
+    fn test_is_dense_contiguous() {
+        assert!(is_dense(&[2, 2, 2, 2], &[8, 4, 2, 1]));
+    }
+
+    #[test]
+    fn test_is_dense_permuted() {
+        assert!(is_dense(&[2, 2, 2, 2], &[8, 1, 4, 2]));
+    }
+
+    #[test]
+    fn test_is_dense_pitched_row() {
+        assert!(!is_dense(&[2, 2, 2, 2], &[16, 8, 4, 1]));
+        assert!(!is_dense(&[1, 8, 6, 6], &[384, 48, 8, 1]));
+    }
+
+    #[test]
+    fn test_is_dense_unit_dims_carry_no_layout() {
+        // A unit dim can hold any stride, a broadcast 0 included, without leaving a gap.
+        assert!(is_dense(&[1, 4, 1], &[0, 1, 7]));
+    }
+
+    #[test]
+    fn test_is_dense_rank_mismatch() {
+        assert!(!is_dense(&[2, 3], &[1]));
+    }
+
+    #[test]
+    fn test_split_strides_plain_unsqueeze() {
+        let strides = split_strides(&[26, 16], &[16, 1], &[26, 16, 1]);
+        assert_eq!(strides.as_ref(), &[16, 1, 1]);
     }
 }

@@ -1,14 +1,14 @@
 use super::tensor::GlobalTensor;
-use crate::engine::codegen::{DynElem, DynSize};
+use crate::engine::codegen::{DynElem, DynSize, DynVector};
 use burn_std::{
     BoolStore, DType, Shape, Strides, bf16, f16,
-    quantization::{QuantScheme, QuantStore, QuantValue},
+    quantization::{QuantScheme, QuantStore, QuantValue, ScaleDtype, global_scale_dtype},
     strides,
 };
 use core::fmt::Display;
 use cubecl::{
-    ir::{ElemType, FloatKind, IntKind, StorageType, UIntKind},
-    prelude::*,
+    ir::{ElemType, FloatKind, IntKind, UIntKind},
+    prelude::{polyfills::set_polyfill, *},
 };
 use serde::{Deserialize, Serialize};
 
@@ -98,14 +98,40 @@ impl CubeType for FuseArg {
     type ExpandType = Self;
 }
 
+impl IntoExpand for FuseArg {
+    type Expand = Self;
+
+    fn into_expand(self, _: &Scope) -> Self::Expand {
+        self
+    }
+}
+
+impl ExpandTypeClone for FuseArg {
+    fn clone_unchecked(&self) -> Self {
+        self.clone()
+    }
+}
+
+impl AsRefExpand for FuseArg {
+    fn __expand_ref_method(&self, _: &Scope) -> &Self {
+        self
+    }
+}
+
+impl AsMutExpand for FuseArg {
+    fn __expand_ref_mut_method(&mut self, _: &Scope) -> &mut Self {
+        self
+    }
+}
+
 impl IntoMut for FuseArg {
-    fn into_mut(self, _context: &mut Scope) -> Self {
+    fn into_mut(self, _context: &Scope) -> Self {
         self
     }
 }
 
 impl IntoRuntime for FuseArg {
-    fn __expand_runtime_method(self, _context: &mut Scope) -> Self::ExpandType {
+    fn __expand_runtime_method(self, _context: &Scope) -> Self::ExpandType {
         self
     }
 }
@@ -138,6 +164,12 @@ pub enum FuseOp {
     LowerEqual(BinaryFuseArgs),
     Rem(BinaryFuseArgs),
     GreaterEqual(BinaryFuseArgs),
+    BitwiseAnd(BinaryFuseArgs),
+    BitwiseOr(BinaryFuseArgs),
+    BitwiseXor(BinaryFuseArgs),
+    BitwiseLeftShift(BinaryFuseArgs),
+    BitwiseRightShift(BinaryFuseArgs),
+    BitwiseNot(UnaryFuseArgs),
     Clamp {
         input: FuseArg,
         min: FuseArg,
@@ -159,6 +191,11 @@ pub enum FuseOp {
     Select {
         input: FuseArg,
         indices: FuseArg,
+        output: FuseArg,
+        dim: usize,
+    },
+    Cat {
+        inputs: Vec<FuseArg>,
         output: FuseArg,
         dim: usize,
     },
@@ -195,6 +232,16 @@ impl Display for FuseOp {
             FuseOp::LowerEqual(args) => write!(f, "{} = {} <= {}", args.out, args.lhs, args.rhs),
             FuseOp::Rem(args) => write!(f, "{} = {} % {}", args.out, args.lhs, args.rhs),
             FuseOp::GreaterEqual(args) => write!(f, "{} = {} >= {}", args.out, args.lhs, args.rhs),
+            FuseOp::BitwiseAnd(args) => write!(f, "{} = {} & {}", args.out, args.lhs, args.rhs),
+            FuseOp::BitwiseOr(args) => write!(f, "{} = {} | {}", args.out, args.lhs, args.rhs),
+            FuseOp::BitwiseXor(args) => write!(f, "{} = {} ^ {}", args.out, args.lhs, args.rhs),
+            FuseOp::BitwiseLeftShift(args) => {
+                write!(f, "{} = {} << {}", args.out, args.lhs, args.rhs)
+            }
+            FuseOp::BitwiseRightShift(args) => {
+                write!(f, "{} = {} >> {}", args.out, args.lhs, args.rhs)
+            }
+            FuseOp::BitwiseNot(args) => write!(f, "{} = !{}", args.out, args.input),
             FuseOp::Clamp {
                 input,
                 min,
@@ -231,6 +278,20 @@ impl Display for FuseOp {
                 "{} = select(input={}, indices={}, dim={})",
                 output, input, indices, dim
             ),
+            FuseOp::Cat {
+                inputs,
+                output,
+                dim,
+            } => {
+                write!(f, "{output} = cat(inputs=[")?;
+                for (i, input) in inputs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{input}")?;
+                }
+                write!(f, "], dim={dim})")
+            }
             FuseOp::Dequantize {
                 values,
                 params,
@@ -278,22 +339,30 @@ impl FuseOp {
             FuseOp::Greater(op) => op.lhs.precision().into_elem(),
             FuseOp::LowerEqual(op) => op.lhs.precision().into_elem(),
             FuseOp::GreaterEqual(op) => op.lhs.precision().into_elem(),
+            FuseOp::BitwiseAnd(op) => op.lhs.precision().into_elem(),
+            FuseOp::BitwiseOr(op) => op.lhs.precision().into_elem(),
+            FuseOp::BitwiseXor(op) => op.lhs.precision().into_elem(),
+            FuseOp::BitwiseLeftShift(op) => op.lhs.precision().into_elem(),
+            FuseOp::BitwiseRightShift(op) => op.lhs.precision().into_elem(),
+            FuseOp::BitwiseNot(op) => op.out.precision().into_elem(),
             FuseOp::ConditionalAssign { out, .. } => out.precision().into_elem(),
             FuseOp::Gather { output, .. } => output.precision().into_elem(),
             FuseOp::Select { output, .. } => output.precision().into_elem(),
+            FuseOp::Cat { output, .. } => output.precision().into_elem(),
             FuseOp::Dequantize { output, .. } => output.precision().into_elem(),
             FuseOp::Rem(op) => op.out.precision().into_elem(),
             FuseOp::Clamp { out, .. } => out.precision().into_elem(),
         }
     }
 
-    pub(crate) fn cmp_storage_ty(&self) -> StorageType {
-        self.cmp_elem().into()
+    pub(crate) fn cmp_storage_ty(&self) -> ElemType {
+        self.cmp_elem()
     }
 }
 
 #[derive(CubeType, CubeLaunch, Default, Clone)]
-/// Global arguments that are used for fusing [element wise operations](ElemTypewiseOp).
+#[expand(derive(Clone))]
+/// Global arguments that are used for fusing [fuse operations](FuseOp).
 pub struct GlobalArgs {
     /// Tensors that are stored in global memory.
     pub tensors: Sequence<GlobalTensor>,
@@ -308,7 +377,7 @@ pub struct GlobalArgs {
     pub variables: MultiBlockVariables,
 }
 
-impl<R: Runtime> GlobalArgsLaunch<R> {
+impl GlobalArgsLaunch {
     pub fn required_address_type(&self) -> AddressType {
         self.tensors
             .values
@@ -321,8 +390,9 @@ impl<R: Runtime> GlobalArgsLaunch<R> {
 
 /// Variables shared between blocks.
 #[derive(CubeType, Default, Clone)]
+#[expand(derive(Clone))]
 pub struct MultiBlockVariables {
-    variables: Registry<usize, Registry<usize, RuntimeCell<Vector<DynElem, DynSize>>>>,
+    variables: Registry<usize, Registry<usize, RuntimeCell<DynVector>>>,
 }
 
 #[cube]
@@ -331,12 +401,13 @@ impl MultiBlockVariables {
     ///
     /// # Notes
     ///
-    /// The type of [`NumericExpand<DYN_ELEM_ID>`] must be set before calling this function.
+    /// The type of [`DynElem`] must be set before calling this function.
     pub fn init(&mut self, #[comptime] key: MultiBlockPos) {
-        let mut registers = Registry::<
-            usize,
-            Registry<usize, RuntimeCell<Vector<DynElem, DynSize>>>,
-        >::find_or_default::<usize>(&mut self.variables, key.block_pos);
+        let mut registers =
+            Registry::<usize, Registry<usize, RuntimeCell<DynVector>>>::find_or_default::<usize>(
+                &mut self.variables,
+                key.block_pos,
+            );
         let cell = RuntimeCell::new(Vector::empty());
         registers.insert(key.block_local_pos, cell);
     }
@@ -346,7 +417,7 @@ impl MultiBlockVariables {
     /// # Notes
     ///
     /// The variable must be initialized.
-    pub fn read(&self, #[comptime] key: MultiBlockPos) -> Vector<DynElem, DynSize> {
+    pub fn read(&self, #[comptime] key: MultiBlockPos) -> DynVector {
         let registers = self.variables.find(key.block_pos);
         let cell = registers.find(key.block_local_pos);
         cell.read()
@@ -357,7 +428,7 @@ impl MultiBlockVariables {
     /// # Notes
     ///
     /// The variable must be initialized.
-    pub fn write(&mut self, #[comptime] key: MultiBlockPos, value: Vector<DynElem, DynSize>) {
+    pub fn write(&mut self, #[comptime] key: MultiBlockPos, value: DynVector) {
         let registers = self.variables.find(key.block_pos);
         // Try find for local(visibility) registers.
         let cell = registers.find(key.block_local_pos);
@@ -370,10 +441,10 @@ unsafe impl Send for MultiBlockVariables {}
 unsafe impl Sync for MultiBlockVariables {}
 
 impl LaunchArg for MultiBlockVariables {
-    type RuntimeArg<R: Runtime> = ();
+    type RuntimeArg = ();
     type CompilationArg = ();
 
-    fn register<R: Runtime>(_arg: Self::RuntimeArg<R>, _launcher: &mut KernelLauncher<R>) {}
+    fn register(_arg: Self::RuntimeArg, _launcher: &mut KernelLauncher) {}
 
     fn expand(
         _arg: &Self::CompilationArg,
@@ -385,7 +456,10 @@ impl LaunchArg for MultiBlockVariables {
     }
 }
 
-impl<R: Runtime> Default for GlobalArgsLaunch<R> {
+// `GlobalArgsLaunch` is generated by `CubeLaunch`, so a `derive` cannot be
+// attached to it even though every field is now `Default`.
+#[allow(clippy::derivable_impls)]
+impl Default for GlobalArgsLaunch {
     fn default() -> Self {
         Self {
             tensors: Default::default(),
@@ -393,19 +467,18 @@ impl<R: Runtime> Default for GlobalArgsLaunch<R> {
             reshapes: Default::default(),
             variables: Default::default(),
             runtime_layouts: Default::default(),
-            _phantom_runtime: std::marker::PhantomData,
         }
     }
 }
 
-impl<R: Runtime> core::fmt::Debug for GlobalArgsLaunch<R> {
+impl core::fmt::Debug for GlobalArgsLaunch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "({:?})", self.tensors.values)
     }
 }
 
-impl<R: Runtime> GlobalArgsLaunch<R> {
-    /// Get the shape of the given [argument](Arg).
+impl GlobalArgsLaunch {
+    /// Get the shape of the given [argument](FuseArg).
     ///
     /// # Panics
     ///
@@ -413,7 +486,7 @@ impl<R: Runtime> GlobalArgsLaunch<R> {
     pub fn shape(&self, arg: &FuseArg) -> Shape {
         match self.resolve_arg(arg) {
             TensorArg::Handle { handle, .. } => handle.shape.clone(),
-            TensorArg::Alias { .. } => panic!("Unsupported yet"),
+            TensorArg::Alias { shape, .. } => shape.clone(),
         }
     }
 
@@ -445,7 +518,7 @@ impl<R: Runtime> GlobalArgsLaunch<R> {
         }
     }
 
-    /// Get the strides of the given [argument](Arg).
+    /// Get the strides of the given [argument](FuseArg).
     ///
     /// # Panics
     ///
@@ -453,7 +526,7 @@ impl<R: Runtime> GlobalArgsLaunch<R> {
     pub fn strides(&self, arg: &FuseArg) -> Strides {
         match self.resolve_arg(arg) {
             TensorArg::Handle { handle, .. } => handle.strides.clone(),
-            TensorArg::Alias { .. } => panic!("Unsupported yet"),
+            TensorArg::Alias { strides, .. } => strides.clone(),
         }
     }
 
@@ -476,7 +549,7 @@ impl<R: Runtime> GlobalArgsLaunch<R> {
         }
     }
 
-    /// Get the vector size of the given [argument](Arg).
+    /// Get the vector size of the given [argument](FuseArg).
     ///
     /// # Panics
     ///
@@ -489,12 +562,12 @@ impl<R: Runtime> GlobalArgsLaunch<R> {
         }
     }
 
-    /// Resolve the [argument](Arg) to a [tensor argument](TensorArg).
+    /// Resolve the [argument](FuseArg) to a [tensor argument](TensorArg).
     ///
     /// # Panics
     ///
     /// If the argument isn't a global input or output tensor.
-    pub fn resolve_arg(&self, arg: &FuseArg) -> &TensorArg<R> {
+    pub fn resolve_arg(&self, arg: &FuseArg) -> &TensorArg {
         match arg {
             FuseArg::Input(pos, _, _) => &self.tensors.values[*pos].tensor,
             FuseArg::Output(pos, _, _) => &self.tensors.values[*pos].tensor,
@@ -504,8 +577,9 @@ impl<R: Runtime> GlobalArgsLaunch<R> {
 }
 
 #[derive(CubeType, Clone)]
-/// Keep track of all local variables that are used as argument in fused
-/// [element wise operations](ElemwiseOp).
+#[expand(derive(Clone))]
+/// Keep track of all local variables that are used as arguments in fused
+/// [operations](FuseOp).
 pub struct LocalArgs {
     pub l_f64: Registry<usize, Vector<f64, DynSize>>,
     pub l_f32: Registry<usize, Vector<f32, DynSize>>,
@@ -519,8 +593,8 @@ pub struct LocalArgs {
     pub l_u32: Registry<usize, Vector<u32, DynSize>>,
     pub l_u16: Registry<usize, Vector<u16, DynSize>>,
     pub l_u8: Registry<usize, Vector<u8, DynSize>>,
-    pub ref_shape: Slice<usize>,
-    pub ref_strides: Slice<usize>,
+    pub ref_shape: Box<[usize]>,
+    pub ref_strides: Box<[usize]>,
     #[cube(comptime)]
     pub ref_vector_size: VectorSize,
 }
@@ -529,8 +603,8 @@ pub struct LocalArgs {
 impl LocalArgs {
     /// Creates a new [LocalArgs] container.
     pub fn new(
-        ref_shape: Slice<usize>,
-        ref_strides: Slice<usize>,
+        ref_shape: &[usize],
+        ref_strides: &[usize],
         #[comptime] ref_vector_size: VectorSize,
     ) -> LocalArgs {
         LocalArgs {
@@ -546,22 +620,22 @@ impl LocalArgs {
             l_u32: Registry::<usize, Vector<u32, DynSize>>::new(),
             l_u16: Registry::<usize, Vector<u16, DynSize>>::new(),
             l_u8: Registry::<usize, Vector<u8, DynSize>>::new(),
-            ref_shape,
-            ref_strides,
+            ref_shape: unsafe { ref_shape.as_boxed_unchecked() },
+            ref_strides: unsafe { ref_strides.as_boxed_unchecked() },
             ref_vector_size,
         }
     }
 }
 
 #[derive(CubeType, Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
-/// Unary [element wise operation](ElemwiseOp) arguments.
+/// Unary [fuse operation](FuseOp) arguments.
 pub struct UnaryFuseArgs {
     pub input: FuseArg,
     pub out: FuseArg,
 }
 
 #[derive(CubeType, Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
-/// Binary [element wise operation](ElemwiseOp) arguments.
+/// Binary [fuse operation](FuseOp) arguments.
 pub struct BinaryFuseArgs {
     pub lhs: FuseArg,
     pub rhs: FuseArg,
@@ -571,7 +645,7 @@ pub struct BinaryFuseArgs {
 #[derive(
     CubeType, Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
 )]
-/// Precisions supported by [element wise operations](ElemwiseOp).
+/// Precisions supported by [fuse operations](FuseOp).
 ///
 /// This is a custom type instead of [ElemType] so it can implement [CubeType]
 /// and restricts the supported types for fusion.
@@ -598,10 +672,27 @@ pub struct FuseBlockConfig {
     pub ref_layout: RefLayout,
     pub ops: Vec<FuseOp>,
     pub width: VectorSize,
+    /// The axis a vector of [width](Self::width) elements runs along.
+    ///
+    /// This is `rank - 1` while the reference layout is in logical dimension order,
+    /// and the dimension the reference is innermost along when it is permuted. The
+    /// aligned read and write paths walk a vector by stepping a tensor's stride
+    /// along this axis, so taking it to be the last dimension — which it used to be,
+    /// unconditionally — reads and writes the wrong elements as soon as the
+    /// reference is not contiguous.
+    ///
+    /// It only matters at a width above one: a single-element vector never steps.
+    pub vector_axis: usize,
+}
+
+impl AsRefExpand for FuseBlockConfig {
+    fn __expand_ref_method(&self, _: &Scope) -> &Self {
+        self
+    }
 }
 
 impl FuseBlockConfig {
-    pub fn multi_block_variables(&self, registers: &mut Vec<(MultiBlockPos, StorageType)>) {
+    pub fn multi_block_variables(&self, registers: &mut Vec<(MultiBlockPos, ElemType)>) {
         for op in self.ops.iter() {
             op.multi_block_variables(registers);
         }
@@ -609,7 +700,7 @@ impl FuseBlockConfig {
 }
 
 impl FuseArg {
-    pub fn multi_block_variable(&self, registers: &mut Vec<(MultiBlockPos, StorageType)>) {
+    pub fn multi_block_variable(&self, registers: &mut Vec<(MultiBlockPos, ElemType)>) {
         match self {
             FuseArg::MultiBlockGlobal(arg, fuse_type)
                 // TODO: we need to init the multi-block local, but at some point we could avoid
@@ -623,7 +714,7 @@ impl FuseArg {
 }
 
 impl FuseOp {
-    pub fn multi_block_variables(&self, registers: &mut Vec<(MultiBlockPos, StorageType)>) {
+    pub fn multi_block_variables(&self, registers: &mut Vec<(MultiBlockPos, ElemType)>) {
         match self {
             FuseOp::Add(binary_fuse_args)
             | FuseOp::Sub(binary_fuse_args)
@@ -635,7 +726,12 @@ impl FuseOp {
             | FuseOp::Greater(binary_fuse_args)
             | FuseOp::LowerEqual(binary_fuse_args)
             | FuseOp::Rem(binary_fuse_args)
-            | FuseOp::GreaterEqual(binary_fuse_args) => {
+            | FuseOp::GreaterEqual(binary_fuse_args)
+            | FuseOp::BitwiseAnd(binary_fuse_args)
+            | FuseOp::BitwiseOr(binary_fuse_args)
+            | FuseOp::BitwiseXor(binary_fuse_args)
+            | FuseOp::BitwiseLeftShift(binary_fuse_args)
+            | FuseOp::BitwiseRightShift(binary_fuse_args) => {
                 binary_fuse_args.lhs.multi_block_variable(registers);
                 binary_fuse_args.rhs.multi_block_variable(registers);
                 binary_fuse_args.out.multi_block_variable(registers);
@@ -650,7 +746,8 @@ impl FuseOp {
             | FuseOp::Erf(unary_fuse_args)
             | FuseOp::Sqrt(unary_fuse_args)
             | FuseOp::Recip(unary_fuse_args)
-            | FuseOp::Assign(unary_fuse_args) => {
+            | FuseOp::Assign(unary_fuse_args)
+            | FuseOp::BitwiseNot(unary_fuse_args) => {
                 unary_fuse_args.input.multi_block_variable(registers);
                 unary_fuse_args.out.multi_block_variable(registers);
             }
@@ -696,6 +793,16 @@ impl FuseOp {
                 indices.multi_block_variable(registers);
                 output.multi_block_variable(registers);
             }
+            FuseOp::Cat {
+                inputs,
+                output,
+                dim: _,
+            } => {
+                for input in inputs {
+                    input.multi_block_variable(registers);
+                }
+                output.multi_block_variable(registers);
+            }
             FuseOp::Dequantize {
                 values,
                 params,
@@ -717,7 +824,7 @@ pub fn multi_block_variables_init(
     variables: &mut MultiBlockVariables,
 ) {
     let output = comptime! {
-        let mut output = Vec::<(MultiBlockPos, StorageType)>::new();
+        let mut output = Vec::<(MultiBlockPos, ElemType)>::new();
         block.multi_block_variables(&mut output);
         output
     };
@@ -783,6 +890,7 @@ impl From<ElemType> for FuseType {
                 FloatKind::F16 => Self::F16,
                 FloatKind::BF16 => Self::BF16,
                 FloatKind::F32 => Self::F32,
+                FloatKind::F64 => Self::F64,
                 FloatKind::Flex32 => Self::Flex32,
                 _ => panic!("Unsupported precision for fusion: {value}"),
             },
@@ -798,18 +906,56 @@ impl From<ElemType> for FuseType {
                 UIntKind::U16 => Self::U16,
                 UIntKind::U8 => Self::U8,
             },
-            ElemType::Bool => panic!("Bool should be encoded as u8 or u32"),
+            ElemType::Bool => Self::U32,
+            ElemType::Index => Self::U32,
+            ElemType::Complex(_) => panic!("Unsupported type for fusion: {value}"),
         }
     }
 }
 
-impl From<StorageType> for FuseType {
-    fn from(value: StorageType) -> Self {
-        value.elem_type().into()
-    }
-}
-
 impl FuseType {
+    /// The type quantization scales are read as, or `None` when fusion can't read that dtype.
+    ///
+    /// Callers must decline to fuse on `None` rather than fail: an unsupported dtype is only a
+    /// missing feature here, and the unfused path still handles it.
+    pub fn from_scale_dtype(dtype: ScaleDtype) -> Option<Self> {
+        match dtype {
+            ScaleDtype::F32 => Some(Self::F32),
+            ScaleDtype::F16 => Some(Self::F16),
+            ScaleDtype::BF16 => Some(Self::BF16),
+            ScaleDtype::UE8M0 | ScaleDtype::UE4M3 => None,
+        }
+    }
+
+    /// The type quantized values are read as, or `None` when fusion can't read that scheme.
+    ///
+    /// Same contract as [Self::from_scale_dtype]: callers must decline to fuse on `None`.
+    pub fn from_quant_scheme(scheme: QuantScheme) -> Option<Self> {
+        // No fused kernel applies a per-tensor scale.
+        if global_scale_dtype(&scheme).is_some() {
+            return None;
+        }
+
+        match scheme.store {
+            QuantStore::Native => match scheme.value {
+                QuantValue::Q8F | QuantValue::Q8S => Some(Self::I8),
+                QuantValue::E4M3 | QuantValue::E5M2 => None,
+                QuantValue::Q4F
+                | QuantValue::Q4S
+                | QuantValue::Q2F
+                | QuantValue::Q2S
+                | QuantValue::E2M1 => {
+                    panic!("Can't store native sub-byte values")
+                }
+            },
+            QuantStore::PackedU32(_) => Some(Self::U32),
+            QuantStore::PackedNative(_) => match scheme.value {
+                QuantValue::E2M1 => None,
+                other => panic!("{other:?} doesn't support native packing"),
+            },
+        }
+    }
+
     /// Converts the [fused element type](FuseType) into the [cubecl element type](ElemType).
     pub fn into_elem(self) -> ElemType {
         match self {
@@ -829,9 +975,9 @@ impl FuseType {
         }
     }
 
-    /// Convert the [fused element type](FuseType) into the [cubecl storage type](StorageType).
-    pub fn into_storage_type(self) -> StorageType {
-        self.into_elem().into()
+    /// Convert the [fused element type](FuseType) into the [cubecl storage type](ElemType).
+    pub fn into_storage_type(self) -> ElemType {
+        self.into_elem()
     }
 
     /// Convert the [fused element type](FuseType) into the [cubecl type](Type)
@@ -855,30 +1001,12 @@ impl From<DType> for FuseType {
             DType::U32 => Self::U32,
             DType::U16 => Self::U16,
             DType::U8 => Self::U8,
-            DType::Bool(BoolStore::Native) => unimplemented!("Bool should be U8 or U32"),
+            DType::Bool(BoolStore::Native) => Self::U32,
             DType::Bool(BoolStore::U8) => Self::U8,
             DType::Bool(BoolStore::U32) => Self::U32,
             DType::F64 => Self::F64,
-            DType::QFloat(scheme) => match scheme.store {
-                QuantStore::Native => match scheme.value {
-                    QuantValue::Q8F | QuantValue::Q8S => Self::I8,
-                    QuantValue::E4M3 | QuantValue::E5M2 => {
-                        unimplemented!("Unsupported precision for fusion")
-                    }
-                    QuantValue::Q4F
-                    | QuantValue::Q4S
-                    | QuantValue::Q2F
-                    | QuantValue::Q2S
-                    | QuantValue::E2M1 => {
-                        panic!("Can't store native sub-byte values")
-                    }
-                },
-                QuantStore::PackedU32(_) => Self::U32,
-                QuantStore::PackedNative(_) => match scheme.value {
-                    QuantValue::E2M1 => unimplemented!("Unsupported precision for fusion"),
-                    other => panic!("{other:?} doesn't support native packing"),
-                },
-            },
+            DType::QFloat(scheme) => Self::from_quant_scheme(scheme)
+                .unwrap_or_else(|| unimplemented!("Unsupported precision for fusion")),
         }
     }
 }
@@ -907,5 +1035,36 @@ impl Display for MultiBlockPos {
             "block_local({}-{})",
             self.block_pos, self.block_local_pos
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuse_type_roundtrips_through_elem_type() {
+        let all = [
+            FuseType::F64,
+            FuseType::F32,
+            FuseType::Flex32,
+            FuseType::F16,
+            FuseType::BF16,
+            FuseType::I64,
+            FuseType::I32,
+            FuseType::I16,
+            FuseType::I8,
+            FuseType::U64,
+            FuseType::U32,
+            FuseType::U16,
+            FuseType::U8,
+        ];
+        for ft in all {
+            assert_eq!(
+                FuseType::from(ft.into_elem()),
+                ft,
+                "round-trip failed for {ft:?}",
+            );
+        }
     }
 }

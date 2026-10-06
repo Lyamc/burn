@@ -1,5 +1,3 @@
-mod backend;
-
 mod batch_norm;
 mod boolean;
 mod buffer;
@@ -13,6 +11,7 @@ mod embedding;
 mod enum_module;
 mod group_norm;
 mod integer;
+mod keep_indices;
 mod key_remap;
 mod key_remap_chained;
 mod layer_norm;

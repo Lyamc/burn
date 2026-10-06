@@ -4,8 +4,27 @@
 
 //! # Burn Standard Library
 //!
-//! This library contains core types and utilities shared across Burn, including shapes, indexing,
-//! and data types.
+//! Core types and utilities shared across the Burn crates.
+//!
+//! - [`Shape`], slicing ([`s!`]) and indexing helpers.
+//! - [`DType`], the element traits and conversions, and [`TensorData`], the backend-independent
+//!   representation of tensor contents.
+//! - [`Distribution`] for random tensor initialization.
+//! - [`DeviceSettings`], per-device defaults such as dtypes.
+//! - Quantization schemes, [`Bytes`], identifiers and errors.
+//! - [`config`]: runtime configuration read from `burn.toml`.
+//! - `network`: file downloads with a progress bar (`network` feature).
+//!
+//! Applications use these through `burn::tensor`. The crate supports `no_std` with `alloc`.
+//!
+//! # Feature flags
+//!
+//! - `std` (default): standard library support.
+//! - `network`: file downloads.
+//! - `tracing`: instrument operations with the `tracing` crate.
+
+#[macro_use]
+extern crate derive_new;
 
 extern crate alloc;
 
@@ -15,6 +34,32 @@ pub mod id;
 /// Tensor utilities.
 pub mod tensor;
 pub use tensor::*;
+
+/// Tensor data representation and helpers.
+pub mod data;
+pub use data::*;
+
+/// Random value distributions.
+pub mod distribution;
+pub use distribution::*;
+
+/// Traits for tensor element types and conversions.
+pub mod element;
+pub use element::*;
+
+mod device_settings;
+pub use device_settings::*;
+
+/// Runtime kind of the host program (async / sync / no-std).
+pub mod runtime_kind;
+pub use runtime_kind::*;
+
+/// Distributed configurations.
+pub mod distributed;
+
+/// Configuration types for tensor operations (conv, pool, interpolate, pad, etc).
+pub mod ops;
+pub use ops::*;
 
 /// Burn runtime configurations.
 pub mod config;
@@ -26,82 +71,40 @@ pub use cubecl_zspace::errors::{self, *};
 #[cfg(feature = "network")]
 pub mod network;
 
-// Re-exported types
-#[cfg(feature = "cubecl")]
-pub use cubecl::server::CommunicationId;
-pub use cubecl_common::bytes::*;
-pub use cubecl_common::device_handle::DeviceHandle;
-pub use cubecl_common::*;
-pub use half::{bf16, f16};
+/// An ID unique to any unordered combination of devices, used by collective /
+/// communication primitives (distributed training etc.).
+///
+/// Mirrors `cubecl_runtime::server::CommunicationId` so that the
+/// `burn_fusion::FusionUtilities::initialized_comms` set (and other consumers)
+/// can be reused without depending on cubecl directly.
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub struct CommunicationId {
+    /// Stable hash of the (sorted) set of device ids that participate.
+    pub id: u64,
+}
 
-#[cfg(feature = "cubecl")]
-pub use cubecl::flex32;
-
-#[cfg(feature = "cubecl")]
-mod cube {
-    use cubecl::ir::{ElemType, FloatKind, IntKind, StorageType, UIntKind};
-    use cubecl_common::quant::scheme::QuantScheme;
-
-    use crate::tensor::DType;
-    use crate::tensor::quantization::{QuantStore, QuantValue};
-
-    impl From<DType> for cubecl::ir::ElemType {
-        fn from(dtype: DType) -> Self {
-            match dtype {
-                DType::F64 => ElemType::Float(FloatKind::F64),
-                DType::F32 => ElemType::Float(FloatKind::F32),
-                DType::Flex32 => ElemType::Float(FloatKind::Flex32),
-                DType::F16 => ElemType::Float(FloatKind::F16),
-                DType::BF16 => ElemType::Float(FloatKind::BF16),
-                DType::I64 => ElemType::Int(IntKind::I64),
-                DType::I32 => ElemType::Int(IntKind::I32),
-                DType::I16 => ElemType::Int(IntKind::I16),
-                DType::I8 => ElemType::Int(IntKind::I8),
-                DType::U64 => ElemType::UInt(UIntKind::U64),
-                DType::U32 => ElemType::UInt(UIntKind::U32),
-                DType::U16 => ElemType::UInt(UIntKind::U16),
-                DType::U8 => ElemType::UInt(UIntKind::U8),
-                DType::Bool(store) => match store {
-                    crate::BoolStore::Native => ElemType::Bool,
-                    crate::BoolStore::U8 => ElemType::UInt(UIntKind::U8),
-                    crate::BoolStore::U32 => ElemType::UInt(UIntKind::U32),
-                },
-                DType::QFloat(scheme) => match scheme.store {
-                    QuantStore::Native => match scheme.value {
-                        QuantValue::Q8F | QuantValue::Q8S => Self::Int(IntKind::I8),
-                        QuantValue::E4M3 => Self::Float(FloatKind::E4M3),
-                        QuantValue::E5M2 => Self::Float(FloatKind::E5M2),
-                        QuantValue::Q4F
-                        | QuantValue::Q4S
-                        | QuantValue::Q2F
-                        | QuantValue::Q2S
-                        | QuantValue::E2M1 => {
-                            panic!("Can't store native sub-byte values")
-                        }
-                    },
-                    QuantStore::PackedU32(_) => Self::UInt(UIntKind::U32),
-                    QuantStore::PackedNative(_) => match scheme.value {
-                        QuantValue::E2M1 => panic!("Can't store native sub-byte values"),
-                        other => panic!("{other:?} doesn't support native packing"),
-                    },
-                },
-            }
-        }
-    }
-
-    impl From<DType> for cubecl::ir::StorageType {
-        fn from(dtype: DType) -> cubecl::ir::StorageType {
-            match dtype {
-                DType::QFloat(QuantScheme {
-                    store: QuantStore::PackedNative(_),
-                    value: QuantValue::E2M1,
-                    ..
-                }) => StorageType::Packed(ElemType::Float(FloatKind::E2M1), 2),
-                _ => {
-                    let elem: ElemType = dtype.into();
-                    elem.into()
-                }
-            }
+impl From<alloc::vec::Vec<cubecl_common::device::DeviceId>> for CommunicationId {
+    fn from(mut value: alloc::vec::Vec<cubecl_common::device::DeviceId>) -> Self {
+        use core::hash::{Hash, Hasher};
+        // Sort so any permutation of the same devices yields the same id.
+        value.sort();
+        let mut hasher = ahash::AHasher::default();
+        value.hash(&mut hasher);
+        CommunicationId {
+            id: hasher.finish(),
         }
     }
 }
+
+pub use cubecl_common::device_handle::DeviceHandle;
+pub use cubecl_common::*;
+pub use cubecl_environment::bytes::*;
+
+// Environment shims live in `cubecl-environment`. They are re-exported here so
+// backends and other burn crates don't have to depend on it directly.
+pub use cubecl_environment::future::reader;
+pub use cubecl_environment::{backtrace, future, rand, stream, sync};
+
+pub use half::{bf16, f16};
+
+pub use cubecl_common::flex32;
