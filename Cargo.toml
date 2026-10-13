@@ -32,7 +32,6 @@ broken_intra_doc_links = "deny"
 invalid_html_tags = "deny"
 
 [workspace.dependencies]
-atomic_float = "1"
 axum = "0.8.9"
 blake3 = "1.8"
 bytemuck = "1.25.2"
@@ -41,7 +40,6 @@ ciborium = { version = "0.2", default-features = false }
 clap = { version = "4.6.7", features = ["derive"] }
 colored = "3.1.1"
 console_error_panic_hook = "0.1.7"
-const-random = "0.1"
 crc32fast = "1.5.2"
 csv = "1.4.0"
 dashmap = "6.2.1"
@@ -145,7 +143,6 @@ text_placeholder = "0.5.1"
 cfg-if = "1.0.5"
 derive-new = { version = "0.7.0", default-features = false }
 
-blas-src = { version = "0.14.0", default-features = false }
 bon = "3.10.1"
 half = { version = "2.7.1", features = [
     "alloc",
@@ -153,12 +150,10 @@ half = { version = "2.7.1", features = [
     "serde",
 ], default-features = false }
 macerator = { version = "0.5.1" }
-matrixmultiply = { version = "0.3.11", default-features = false }
 ndarray = { version = "0.17.2", default-features = false }
 num-traits = { version = "0.2.19", default-features = false, features = [
     "libm",
 ] } # libm is for no_std
-openblas-src = "0.10.16"
 rand = { version = "0.10.3", default-features = false, features = ["std_rng"] }
 rand_distr = { version = "0.6.0", default-features = false }
 serde = { version = "1.0.229", default-features = false, features = [
@@ -175,8 +170,6 @@ libc = "0.2.189"
 nvml-wrapper = "0.13.0"
 sysinfo = "0.39.6"
 systemstat = "0.2.7"
-tch = "0.22.0"
-torch-sys = "0.22.0"                                        # matches what tch is using, required for lib detection
 
 ahash = { version = "0.8.12", default-features = false }
 aligned-vec = { version = "0.6", default-features = false }
@@ -207,7 +200,6 @@ burn-flex = { path = "crates/burn-flex", version = "0.22.0", default-features = 
 burn-fusion = { path = "crates/burn-fusion", version = "0.22.0", default-features = false }
 burn-ir = { path = "crates/burn-ir", version = "0.22.0", default-features = false }
 burn-linalg = { path = "crates/burn-linalg", version = "0.22.0", default-features = false }
-burn-ndarray = { path = "crates/burn-ndarray", version = "0.22.0", default-features = false }
 burn-nn = { path = "crates/burn-nn", version = "0.22.0", default-features = false }
 burn-optim = { path = "crates/burn-optim", version = "0.22.0", default-features = false }
 burn-pack = { path = "crates/burn-pack", version = "0.22.0", default-features = false }
@@ -218,7 +210,6 @@ burn-router = { path = "crates/burn-router", version = "0.22.0", default-feature
 burn-signal = { path = "crates/burn-signal", version = "0.22.0", default-features = false }
 burn-std = { path = "crates/burn-std", version = "0.22.0", default-features = false }
 burn-store = { path = "crates/burn-store", version = "0.22.0", default-features = false }
-burn-tch = { path = "crates/burn-tch", version = "0.22.0", default-features = false }
 burn-tensor = { path = "crates/burn-tensor", version = "0.22.0", default-features = false }
 burn-tensor-testgen = { path = "crates/burn-tensor-testgen", version = "0.22.0", default-features = false }
 burn-train = { path = "crates/burn-train", version = "0.22.0", default-features = false }
@@ -227,11 +218,11 @@ burn-wgpu = { path = "crates/burn-wgpu", version = "0.22.0", default-features = 
 pytorch-reader = { path = "crates/pytorch-reader", version = "0.22.0" }
 
 ### For the main burn branch. ###
-# cubecl = { git = "https://github.com/tracel-ai/cubecl", default-features = false, rev = "eb98a977d3c509a228dfefc46c3e40bbba44ef50" }
-# cubecl-common = { git = "https://github.com/tracel-ai/cubecl", default-features = false, rev = "eb98a977d3c509a228dfefc46c3e40bbba44ef50" }
-# cubecl-environment = { git = "https://github.com/tracel-ai/cubecl", default-features = false, rev = "eb98a977d3c509a228dfefc46c3e40bbba44ef50" }
-# cubecl-zspace = { git = "https://github.com/tracel-ai/cubecl", default-features = false, rev = "eb98a977d3c509a228dfefc46c3e40bbba44ef50" }
-# cubek = { git = "https://github.com/tracel-ai/cubek", default-features = false, rev = "51c43a1af7eb07a904b8a13568e953d377d20bb4" }
+cubecl = { git = "https://github.com/tracel-ai/cubecl", default-features = false, rev = "92f9afec75a03fd0806c34332039ae87d6cdd5da" }
+cubecl-common = { git = "https://github.com/tracel-ai/cubecl", default-features = false, rev = "92f9afec75a03fd0806c34332039ae87d6cdd5da" }
+cubecl-environment = { git = "https://github.com/tracel-ai/cubecl", default-features = false, rev = "92f9afec75a03fd0806c34332039ae87d6cdd5da" }
+cubecl-zspace = { git = "https://github.com/tracel-ai/cubecl", default-features = false, rev = "92f9afec75a03fd0806c34332039ae87d6cdd5da" }
+cubek = { git = "https://github.com/tracel-ai/cubek", default-features = false, rev = "a680b7012088537f3ed8573693746493d273c78a" }
 ### For local development. ###
 # cubecl = { path = "../cubecl/crates/cubecl", default-features = false }
 # cubecl-common = { path = "../cubecl/crates/cubecl-common", default-features = false }
@@ -239,11 +230,11 @@ pytorch-reader = { path = "crates/pytorch-reader", version = "0.22.0" }
 # cubecl-zspace = { path = "../cubecl/crates/cubecl-zspace", default-features = false }
 # cubek = { path = "../cubek/crates/cubek", default-features = false }
 ### For the release. ###
-cubecl = { version = "0.11.0", default-features = false }
-cubecl-common = { version = "0.11.0", default-features = false }
-cubecl-environment = { version = "0.11.0", default-features = false }
-cubecl-zspace = { version = "0.11.0", default-features = false }
-cubek = { version = "0.3.0", default-features = false }
+# cubecl = { version = "0.11.0", default-features = false }
+# cubecl-common = { version = "0.11.0", default-features = false }
+# cubecl-environment = { version = "0.11.0", default-features = false }
+# cubecl-zspace = { version = "0.11.0", default-features = false }
+# cubek = { version = "0.3.0", default-features = false }
 
 [profile.dev]
 debug = 1 # Speed up compilation time and not necessary.
